@@ -15099,8 +15099,8 @@ def render_home():
         )
         st.caption({
             "debutant": "Débutant : joue des coups simples, souvent au hasard. Idéal pour apprendre.",
-            "intermediaire": "Intermédiaire : attaque quand c'est rentable, gère son économie et ses âges.",
-            "expert": "Expert : attaques groupées, évite les pièges, défend ses bases, colonies et améliorations.",
+            "intermediaire": "Intermédiaire : produit beaucoup, bâtiments vers le front, économise pour les âges.",
+            "expert": "Expert : dépense tout son or, unités fortes de son âge, vise les bases et anticipe 3 coups.",
         }[level])
         first_col, mode_col = st.columns(2)
         with first_col:
@@ -15200,6 +15200,390 @@ def main():
     auto_piece_move_mode()
     _lw_automove_previous_main()
 
+# ============================================================
+# IA (version 2) : production plus forte et anticipation
+# Intermédiaire : produit beaucoup, bâtiments vers le front, économise
+#   pour l'âge suivant tout en continuant à produire.
+# Expert : dépense tout (bâtiments au maximum, accélérés s'il est riche,
+#   unités de son âge en priorité, améliorations, colonies), vise les
+#   bases par les vrais chemins et anticipe 3 coups (son coup, la
+#   riposte adverse, sa réponse).
+# ============================================================
+
+AI_PROFILES["intermediaire"].update({
+    "front": True, "save_floor": 0.4, "build_target": "age", "tier_first": False,
+    "accelerate_at": 0, "depth": 1,
+})
+AI_PROFILES["expert"].update({
+    "front": True, "save_floor": 0.25, "build_target": "limit", "tier_first": True,
+    "accelerate_at": 1500, "depth": 3,
+})
+AI_PROFILES["debutant"].update({
+    "front": False, "save_floor": 1.0, "build_target": "one", "tier_first": False,
+    "accelerate_at": 0, "depth": 1,
+})
+
+# Améliorations prioritaires (production des Vagabonds).
+AI_PRIORITY_UPGRADES = ["Étroite communication I", "Multitâches", "Étroite communication II"]
+
+
+def ai_level_of(profile):
+    return next((lvl for lvl, prof in AI_PROFILES.items() if prof is profile), "intermediaire")
+
+
+def ai_age_ready(g, me):
+    """Vrai si l'âge suivant est atteignable (prérequis présents)."""
+    age = g["players"][me]["age"]
+    if age >= 3:
+        return False
+    needed = AGE_PREREQUISITES.get((faction_id(g, me), age + 1))
+    if needed and not building_is_completed(g, me, needed):
+        return False
+    return True
+
+
+def ai_reserve(g, me, profile):
+    """Or mis de côté pour l'âge suivant (jamais tout : la production continue)."""
+    age = g["players"][me]["age"]
+    if age >= 3 or g["turn"] < profile["age_turn"] or not ai_age_ready(g, me):
+        return 0
+    cost = AGE_COSTS[age + 1]["gold"]
+    if is_vagabond(g, me):
+        needed = VAG_AGE_UPGRADES.get(age + 1)
+        if needed and not owns_upgrade(g, me, needed):
+            cost += UPGRADES[needed]["cost"]
+    gold = g["players"][me]["gold"]
+    level = ai_level_of(profile)
+    if level == "expert" and gold < 0.6 * cost:
+        # L'Expert ne bloque pas son or tant que l'âge est encore loin.
+        return 0
+    floor = profile.get("save_floor", 1.0)
+    return max(0, min(cost, int(gold * (1 - floor))))
+
+
+def ai_unit_order(g, me, options, profile, rng, budget):
+    level = ai_level_of(profile)
+    age = g["players"][me]["age"]
+    if level == "debutant":
+        rng.shuffle(options)
+        return options
+
+    def strength(n):
+        data = UNITS[n]
+        value = data["pf"] * (1.3 if data["range"] else 1.0) + 0.1 * data["move"]
+        if n in NO_ATTACK_UNITS or n in MAGES or n in ("Décimant", "Kamikaze", "Gobelin", "Voyant"):
+            value *= 0.35
+        return value
+
+    if profile.get("tier_first"):
+        # Expert : unités de son âge d'abord, les plus fortes en tête.
+        options.sort(key=lambda n: (-min(UNIT_AGES.get(n, 1), age), -strength(n), rng.random()))
+    elif budget >= 1200:
+        options.sort(key=lambda n: (-strength(n), rng.random()))
+    else:
+        options.sort(key=lambda n: -ai_unit_rating(n, level) - rng.uniform(0, 0.5))
+    return options
+
+
+def ai_try_recruit(g, me, producer, profile, rng, level, budget):
+    options = [n for n in ai_recruit_options(g, me, producer) if n != WORKER and n in UNITS]
+    if not options:
+        return None
+    options = ai_unit_order(g, me, options, profile, rng, budget)
+    for name in options:
+        data = UNITS[name]
+        mana_left = g["players"][me]["mana"] - ai_mana_reserve(g, me, level)
+        if data["cost"] > budget or (data["mana"] and data["mana"] > mana_left):
+            continue
+        batch = 1 if is_hero(producer) else recruitment_batch(g, me, name)
+        cells = ai_recruit_positions(g, me, producer, batch)
+        if len(cells) < batch:
+            continue
+        new = ai_try_draft(g, recruit, me, producer["id"], name, cells[:batch])
+        if new is not None:
+            return new
+    return None
+
+
+def ai_mana_reserve(g, me, level):
+    """Mana gardé pour l'âge III, seulement quand il est proche."""
+    if level == "debutant" or g["players"][me]["age"] != 2 or not ai_age_ready(g, me):
+        return 0
+    need = AGE_COSTS[3]["mana"]
+    if is_vagabond(g, me) and not owns_upgrade(g, me, VAG_AGE_UPGRADES[3]):
+        need += UPGRADES[VAG_AGE_UPGRADES[3]]["mana"]
+    return need
+
+
+def ai_wanted_buildings(g, me, profile):
+    faction = faction_of(g, me)
+    age = g["players"][me]["age"]
+    target = profile.get("build_target", "one")
+    wanted = []
+    prerequisite = AGE_PREREQUISITES.get((faction_id(g, me), age + 1))
+    if prerequisite and not any(e["owner"] == me and e["name"] == prerequisite for e in g["entities"]):
+        wanted.append(prerequisite)
+    producers = [
+        (name, data) for name, data in faction["buildings"].items()
+        if data.get("units") and building_is_available(g, me, name)
+    ]
+    producers.sort(key=lambda item: -BUILDING_AGES.get((faction_id(g, me), item[0]), 1))
+    for name, data in producers:
+        count = sum(e["owner"] == me and e["name"] == name for e in g["entities"])
+        if target == "limit":
+            goal = data["limit"]
+        elif target == "age":
+            goal = min(data["limit"], age + 1)
+        else:
+            goal = min(data["limit"], 2 if age > 1 else 1)
+        if count < goal:
+            wanted.append(name)
+    tech = TECH_BUILDINGS.get(faction_id(g, me))
+    if profile["upgrades"] and tech and building_is_available(g, me, tech):
+        if not any(e["owner"] == me and e["name"] == tech for e in g["entities"]):
+            wanted.append(tech)
+    return list(dict.fromkeys(wanted))
+
+
+def ai_enemy_reach_cells(g, me):
+    """Cases que les unités ennemies visibles peuvent frapper au prochain tour."""
+    return [
+        (tuple(e["pos"]), ai_threat_reach(e))
+        for e in ai_enemy_pieces(g, me)
+        if e["kind"] == "unit" and e["name"] not in NO_ATTACK_UNITS
+    ]
+
+
+def ai_build_positions(g, me, source, name):
+    if name == TECH_BUILDINGS.get(faction_id(g, me)) and me in TECH_CELLS:
+        return [tech_cell(me)]
+    enemy = ai_enemy_home(g, me)
+    if source["name"] == WORKER:
+        cells = worker_build_slots(g, source, name)
+    else:
+        cells = ai_free_cells_near(g, tuple(source["pos"]), 1, 4)
+    profile = g.get("_ai_profile")
+    if profile and profile.get("front"):
+        # Bâtiments de production vers le front, mais hors de portée immédiate.
+        reach = ai_enemy_reach_cells(g, me)
+
+        def exposed(p):
+            return any(distance(p, w) <= r for w, r in reach)
+
+        cells.sort(key=lambda p: (exposed(p), distance(p, enemy), distance(p, tuple(source["pos"]))))
+    else:
+        cells.sort(key=lambda p: (-distance(p, enemy), distance(p, tuple(source["pos"]))))
+    return cells[:6]
+
+
+def ai_try_build(g, me, name, rng, accelerated=False):
+    for source in ai_build_sources(g, me):
+        for pos in ai_build_positions(g, me, source, name):
+            new = ai_try_draft(g, build, me, source["id"], name, pos, accelerated)
+            if new is not None:
+                return new
+    return None
+
+
+def ai_try_upgrades(g, me, profile, rng):
+    if not profile["upgrades"]:
+        return g
+    level = ai_level_of(profile)
+    names = list(available_upgrades(g, me))
+    rng.shuffle(names)
+    names.sort(key=lambda n: (
+        n not in AI_PRIORITY_UPGRADES,
+        AI_PRIORITY_UPGRADES.index(n) if n in AI_PRIORITY_UPGRADES else 0,
+        n not in PF_UPGRADES,
+        UPGRADES[n]["cost"],
+    ))
+    keep = 0 if level == "expert" else 300
+    for name in names:
+        upgrade = UPGRADES[name]
+        if g["players"][me]["gold"] - upgrade["cost"] < keep + ai_reserve(g, me, profile):
+            continue
+        if upgrade["mana"] and g["players"][me]["mana"] - upgrade["mana"] < ai_mana_reserve(g, me, level):
+            continue
+        new = ai_try_draft(g, purchase_upgrade, me, name)
+        if new is not None:
+            g = new
+    return g
+
+
+def ai_recruit_all(g, me, profile, rng, level, passes=3):
+    producers = [
+        e for e in g["entities"]
+        if e["owner"] == me and (e["kind"] == "building" or is_hero(e)) and not e["wait"]
+    ]
+    rng.shuffle(producers)
+    for _ in range(passes):
+        progress = False
+        for producer in producers:
+            current = next((e for e in g["entities"] if e["id"] == producer["id"]), None)
+            if current is None:
+                continue
+            budget = g["players"][me]["gold"] - ai_reserve(g, me, profile)
+            new = ai_try_recruit(g, me, current, profile, rng, level, budget)
+            if new is not None:
+                g, progress = new, True
+        if not progress:
+            break
+    return g
+
+
+def ai_production(draft, me, level):
+    """Construit, recrute et améliore dans le brouillon privé de l'IA."""
+    profile = ai_profile(level)
+    rng = ai_rng(draft, 17 + me)
+    g = draft
+    g["_ai_profile"] = profile
+    try:
+        g = ai_try_age(g, me, profile, rng)
+        g["_ai_profile"] = profile
+        g = ai_scout_mana(g, me, profile)
+        g = ai_workers(g, me, profile)
+        g = ai_heroes(g, me, profile, rng)
+        if is_vagabond(g, me) and level != "debutant":
+            # Les héros produisent davantage avec ces améliorations.
+            g = ai_try_upgrades(g, me, profile, rng)
+        if not ai_has_mana_base(g, me):
+            g = ai_try_colony(g, me, profile)
+
+        wanted = ai_wanted_buildings(g, me, profile)
+        if level == "debutant":
+            rng.shuffle(wanted)
+            wanted = wanted[:1]
+        rich = bool(profile.get("accelerate_at")) and g["players"][me]["gold"] >= profile["accelerate_at"]
+        for name in wanted[: (len(wanted) if level == "expert" else 3)]:
+            new = ai_try_build(g, me, name, rng, accelerated=rich)
+            if new is None and rich:
+                new = ai_try_build(g, me, name, rng)
+            if new is not None:
+                g = new
+
+        g = ai_fusions(g, me, profile)
+        g = ai_recruit_all(g, me, profile, rng, level)
+        g = ai_try_upgrades(g, me, profile, rng)
+        g = ai_try_colony(g, me, profile)
+        if level == "expert":
+            # Rien ne dort en banque : un dernier passage de production.
+            g = ai_recruit_all(g, me, profile, rng, level, passes=2)
+    finally:
+        g.pop("_ai_profile", None)
+    return g
+
+
+# ------------------------------------------------------------
+# Manœuvres : vrais chemins vers les bases, anticipation sur 3 coups
+# ------------------------------------------------------------
+
+def ai_goal_distances(g, goals, base_goals):
+    """Distance de marche (montagnes = 2, mer infranchissable) vers les objectifs.
+    Les bases ennemies sont prioritaires sur les bâtiments."""
+    dist = {}
+    queue = []
+    for pos in goals:
+        start = 0 if pos in base_goals else 3
+        if start < dist.get(pos, math.inf):
+            dist[pos] = start
+            heapq.heappush(queue, (start, pos))
+    while queue:
+        cost, pos = heapq.heappop(queue)
+        if cost != dist.get(pos):
+            continue
+        for nxt in neighbors(pos):
+            kind = terrain(g, nxt)
+            if kind == "sea":
+                continue
+            new = cost + (2 if kind == "mountain" else 1)
+            if new < dist.get(nxt, math.inf):
+                dist[nxt] = new
+                heapq.heappush(queue, (new, nxt))
+    return dist
+
+
+_lw_ai2_previous_ai_context = ai_context
+
+
+def ai_context(g, me, profile):
+    ctx = _lw_ai2_previous_ai_context(g, me, profile)
+    if profile.get("depth", 1) > 1 or profile.get("front"):
+        enemies = ai_enemy_pieces(g, me)
+        bases = {tuple(e["pos"]) for e in enemies if e["kind"] == "base"}
+        buildings = {tuple(e["pos"]) for e in enemies if e["kind"] == "building"}
+        if bases or buildings:
+            ctx["goal_dist"] = ai_goal_distances(g, bases | buildings, bases)
+    return ctx
+
+
+_lw_ai2_previous_ai_place_score = ai_place_score
+
+
+def ai_place_score(ctx, unit, pos):
+    dist = ctx.get("goal_dist")
+    if not dist or is_flying(unit):
+        return _lw_ai2_previous_ai_place_score(ctx, unit, pos)
+    # Même calcul, mais la distance aux objectifs suit les vrais chemins.
+    saved = ctx["goals"]
+    ctx["goals"] = []
+    try:
+        score = _lw_ai2_previous_ai_place_score(ctx, unit, pos)
+    finally:
+        ctx["goals"] = saved
+    far = max(dist.values(), default=0) + 5
+    return score - ctx["profile"]["advance"] * dist.get(pos, far)
+
+
+def ai_best_attack(g, side, me):
+    """Meilleure attaque immédiate du camp « side », mesurée du point de vue de « me »."""
+    if g.get("winner") is not None or g.get("phase") != "move" or g.get("active") != side:
+        return 0.0, None
+    base = ai_material(g, me)
+    best, best_state = 0.0, None
+    for candidate in ai_attack_candidates(g, side, AI_PROFILES["intermediaire"])[:AI_REPLY_LIMIT]:
+        fn, args = ai_resolve(g, candidate)
+        if fn is None:
+            continue
+        after = ai_simulate(g, fn, *args)
+        if after is None:
+            continue
+        delta = ai_material(after, me) - base
+        gain = delta if side == me else -delta
+        if gain > best:
+            best, best_state = gain, after
+    return best, best_state
+
+
+def ai_lookahead(g, me, options, profile):
+    """Coup de l'IA → meilleure riposte adverse → meilleure réponse de l'IA."""
+    opponent = 1 - me
+    if opponent in g.get("passed", []):
+        return options
+    now = ai_clone(g)
+    now["active"] = opponent
+    now.pop("moving_unit_id", None)
+    baseline, _ = ai_best_attack(now, opponent, me)
+    depth = profile.get("depth", 2)
+    checked = []
+    for gain, after, move in options[:AI_LOOKAHEAD]:
+        if after is None:
+            after = ai_simulate(g, move_unit, *move)
+            if after is None:
+                continue
+        loss, reply_state = ai_best_attack(after, opponent, me)
+        value = gain - profile["lookahead"] * (loss - baseline)
+        if depth >= 3:
+            follow_from = reply_state if reply_state is not None else after
+            if follow_from.get("active") == me:
+                follow, _ = ai_best_attack(follow_from, me, me)
+                value += 0.5 * profile["lookahead"] * follow
+        checked.append((value, after, move))
+    checked.sort(key=lambda item: -item[0])
+    return checked + options[AI_LOOKAHEAD:]
+
+
+AI_LOOKAHEAD = 6
+AI_REPLY_LIMIT = 12
 
 
 if __name__ == "__main__":
