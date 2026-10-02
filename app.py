@@ -9845,7 +9845,7 @@ def render_victory_screen(g):
     title = f"Le joueur des {faction} a gagné la partie !"
     image = victory_image_data()
     background = (
-        f"url('data:image/jpeg;base64,{image}') center / cover no-repeat"
+        f"url('data:image/jpeg;base64,{image}') center 15% / cover no-repeat"
         if image
         else "linear-gradient(135deg, #1e3a8a, #111827)"
     )
@@ -14671,6 +14671,9 @@ def ai_try_colony(g, me, profile):
     cost = base_cost_for_age(g, me)
     need_mana = not ai_has_mana_base(g, me)
     margin = 0 if need_mana else 300
+    if ai_level_of(profile) == "expert" and g["turn"] <= 6:
+        # Début de partie : l'Expert investit dans des colonies (plus de revenus).
+        margin = 0
     if g["players"][me]["gold"] < cost + margin or g["turn"] < 2:
         return g
     options = [
@@ -15622,6 +15625,583 @@ def ai_lookahead(g, me, options, profile):
 
 AI_LOOKAHEAD = 6
 AI_REPLY_LIMIT = 12
+
+# ============================================================
+# IA (version 3) : améliorations choisies selon la partie,
+# passage d'âge planifié, défense des passages vers ses bases.
+# ============================================================
+
+# Unités concernées par chaque amélioration.
+AI_UPGRADE_UNITS = {
+    "2 pattes en plus": ("Déferlant",),
+    "Dents acérées": ("Déferlant",),
+    "Dents acérées volants": ("Volant",),
+    "Instinct elfique": ("Elfe",),
+    "Développement musculaire": ("Mammouth dompté",),
+    "Meute de tigres": ("Tigre des forêts",),
+    "Marteau foudroyant": ("Guerrier",),
+    "Esquive": ("Éclaireur",),
+    "Flèches enflammées": ("Archer",),
+    "Pierres enflammées": ("Catapulte", "Catapulte de l'enfer"),
+    "Invisibilité griffons": ("Griffon",),
+    "Mutation imminente": ("Agile",),
+    "Endurance": ("Barbare",),
+}
+# Améliorations rarement utiles à l'IA (mécaniques qu'elle n'exploite pas).
+AI_MINOR_UPGRADES = {"Mutation kamikaze", "Rampants", "Trébuchet", "Aramil le sorcier élu", "Solidarité"}
+AI_UPGRADE_URGENT = 500
+AI_UPGRADE_DECISIVE = 2000
+# Âge visé à partir de ce tour (Expert).
+AI_AGE_DUE = {2: 3, 3: 6}
+
+
+def ai_upgrade_value(g, me, name):
+    """Intérêt d'une amélioration pour l'IA, selon la partie en cours."""
+    if name in AI_PRIORITY_UPGRADES:
+        return 3000
+    if name in AI_MINOR_UPGRADES:
+        return 60
+    mine = [e for e in g["entities"] if e["owner"] == me and e["kind"] == "unit"]
+    enemies = [e for e in ai_enemy_pieces(g, me) if e["kind"] == "unit"]
+    concerned = AI_UPGRADE_UNITS.get(name, ())
+    owned = sum(e["name"] in concerned for e in mine)
+    producible = any(
+        n in concerned
+        for data in faction_of(g, me)["buildings"].values()
+        for n in data.get("units", [])
+    )
+    value = 150 + 130 * owned + (120 if producible else 0)
+    if name == "Meute de tigres":
+        # Contre une marée d'unités d'âge I (ex. 10 Déferlants), les Tigres piétinent.
+        weak = sum(UNIT_AGES.get(e["name"], 1) == 1 for e in enemies)
+        swarm = sum(e["name"] == "Déferlant" for e in enemies)
+        value += 70 * weak + (2500 if swarm >= 10 or weak >= 12 else 0)
+    elif name == "Vengeance":
+        value += 25 * len(enemies)
+    elif name in PF_UPGRADES or name in ATTACK_UPGRADES:
+        value += 80 * owned
+    return value
+
+
+def ai_buy_upgrades(g, me, profile, rng, minimum):
+    """Achète les améliorations dont l'intérêt dépasse « minimum », les plus utiles d'abord."""
+    if not profile["upgrades"]:
+        return g
+    level = ai_level_of(profile)
+    names = sorted(available_upgrades(g, me), key=lambda n: -ai_upgrade_value(g, me, n))
+    for name in names:
+        value = ai_upgrade_value(g, me, name)
+        if value < minimum:
+            break
+        upgrade = UPGRADES[name]
+        if upgrade["mana"] and g["players"][me]["mana"] - upgrade["mana"] < ai_mana_reserve(g, me, level):
+            continue
+        if value < AI_UPGRADE_DECISIVE and g["players"][me]["gold"] - upgrade["cost"] < ai_reserve(g, me, profile):
+            continue
+        new = ai_try_draft(g, purchase_upgrade, me, name)
+        if new is not None:
+            g = new
+    return g
+
+
+def ai_try_upgrades(g, me, profile, rng):
+    """Améliorations restantes avec l'or qui reste (après le recrutement)."""
+    keep = 0 if ai_level_of(profile) == "expert" else 300
+    if g["players"][me]["gold"] <= keep:
+        return g
+    return ai_buy_upgrades(g, me, profile, rng, minimum=100)
+
+
+def ai_age_due(g, me, profile):
+    age = g["players"][me]["age"]
+    if age >= 3 or not ai_age_ready(g, me):
+        return False
+    return g["turn"] >= AI_AGE_DUE.get(age + 1, 99) if ai_level_of(profile) == "expert" else g["turn"] >= profile["age_turn"]
+
+
+_lw_ai3_previous_ai_reserve = ai_reserve
+
+
+def ai_reserve(g, me, profile):
+    if ai_level_of(profile) != "expert":
+        return _lw_ai3_previous_ai_reserve(g, me, profile)
+    if not ai_age_due(g, me, profile):
+        return 0
+    # Âge dû : l'Expert met l'or de côté (il passe l'âge au tour suivant au plus tard).
+    age = g["players"][me]["age"]
+    cost = AGE_COSTS[age + 1]["gold"]
+    if is_vagabond(g, me):
+        needed = VAG_AGE_UPGRADES.get(age + 1)
+        if needed and not owns_upgrade(g, me, needed):
+            cost += UPGRADES[needed]["cost"]
+    return min(cost, g["players"][me]["gold"])
+
+
+_lw_ai3_previous_ai_unit_order = ai_unit_order
+
+
+def ai_unit_order(g, me, options, profile, rng, budget):
+    options = _lw_ai3_previous_ai_unit_order(g, me, options, profile, rng, budget)
+    if ai_level_of(profile) == "debutant":
+        return options
+    # Unités renforcées par une amélioration achetée : priorité.
+    boosted = {
+        unit for name, units in AI_UPGRADE_UNITS.items()
+        if owns_upgrade(g, me, name) for unit in units
+    }
+    return sorted(options, key=lambda n: n not in boosted)
+
+
+_lw_ai3_previous_ai_wanted_buildings = ai_wanted_buildings
+
+
+def ai_wanted_buildings(g, me, profile):
+    wanted = _lw_ai3_previous_ai_wanted_buildings(g, me, profile)
+    tech = TECH_BUILDINGS.get(faction_id(g, me))
+    if tech in wanted and ai_level_of(profile) != "debutant":
+        # Le bâtiment technique (améliorations) passe juste après le prérequis d'âge.
+        wanted.remove(tech)
+        wanted.insert(1 if wanted and wanted[0] == AGE_PREREQUISITES.get((faction_id(g, me), g["players"][me]["age"] + 1)) else 0, tech)
+    return wanted
+
+
+def ai_production(draft, me, level):
+    """Production : améliorations utiles, âge dû, unités militaires, bâtiments."""
+    profile = ai_profile(level)
+    rng = ai_rng(draft, 17 + me)
+    g = draft
+    g["_ai_profile"] = profile
+    try:
+        g = ai_scout_mana(g, me, profile)
+        g = ai_workers(g, me, profile)
+        g = ai_heroes(g, me, profile, rng)
+
+        # 0. Améliorations décisives (contre-mesure, production des héros) : avant tout.
+        urgent = False
+        if level != "debutant":
+            owned = len(g["players"][me].get("upgrades", []))
+            g = ai_buy_upgrades(g, me, profile, rng, minimum=AI_UPGRADE_DECISIVE)
+            urgent = len(g["players"][me].get("upgrades", [])) > owned or bool(g.pop("_ai_urgent", False))
+            # Menacé (armée plus faible) : les unités passent avant l'âge.
+            urgent = urgent or bool(ai_context(g, me, profile).get("defensive"))
+
+        # 1. Âge : tout de suite s'il est dû et payable (ou si l'or abonde).
+        age = g["players"][me]["age"]
+        if level == "debutant" or (ai_age_due(g, me, profile) and not urgent) or (
+            age < 3 and g["players"][me]["gold"] >= 1.6 * AGE_COSTS[age + 1]["gold"]
+        ):
+            g = ai_try_age(g, me, profile, rng)
+            g["_ai_profile"] = profile
+
+        # 2. Améliorations importantes pour la partie en cours.
+        if level != "debutant":
+            g = ai_buy_upgrades(g, me, profile, rng, minimum=AI_UPGRADE_URGENT)
+
+        # 3. Tous les bâtiments prêts produisent des unités militaires.
+        g = ai_fusions(g, me, profile)
+        g = ai_recruit_all(g, me, profile, rng, level, passes=1, keep_reserve=not urgent)
+
+        # 4. Nouveaux bâtiments (prérequis d'âge et bâtiment technique d'abord).
+        if not ai_has_mana_base(g, me):
+            g = ai_try_colony(g, me, profile)
+        wanted = ai_wanted_buildings(g, me, profile)
+        if level == "debutant":
+            rng.shuffle(wanted)
+            wanted = wanted[:1]
+        rich = bool(profile.get("accelerate_at")) and g["players"][me]["gold"] >= profile["accelerate_at"]
+        for name in wanted[: (len(wanted) if level == "expert" else 3)]:
+            # L'or mis de côté pour l'âge n'est pas dépensé en bâtiments.
+            cost = faction_of(g, me)["buildings"].get(name, {}).get("cost", 0)
+            if g["players"][me]["gold"] - cost * (1.5 if rich else 1) < ai_reserve(g, me, profile):
+                continue
+            new = ai_try_build(g, me, name, rng, accelerated=rich)
+            if new is None and rich:
+                new = ai_try_build(g, me, name, rng)
+            if new is not None:
+                g = new
+
+        # 5. Le reste : unités, autres améliorations, colonies.
+        g = ai_recruit_all(g, me, profile, rng, level, passes=3)
+        g = ai_try_upgrades(g, me, profile, rng)
+        g = ai_try_colony(g, me, profile)
+        g = ai_recruit_all(g, me, profile, rng, level, passes=2)
+    finally:
+        g.pop("_ai_profile", None)
+    return g
+
+
+# ------------------------------------------------------------
+# Défense : tenir les passages entre l'ennemi et ses bases
+# ------------------------------------------------------------
+
+AI_GUARD_VALUE = 70.0
+
+
+def ai_walk_distances(g, sources):
+    dist, queue = {}, []
+    for pos in sources:
+        dist[pos] = 0
+        heapq.heappush(queue, (0, pos))
+    while queue:
+        cost, pos = heapq.heappop(queue)
+        if cost != dist.get(pos):
+            continue
+        for nxt in neighbors(pos):
+            kind = terrain(g, nxt)
+            if kind == "sea":
+                continue
+            new = cost + (2 if kind == "mountain" else 1)
+            if new < dist.get(nxt, math.inf):
+                dist[nxt] = new
+                heapq.heappush(queue, (new, nxt))
+    return dist
+
+
+_lw_ai3_previous_ai_context = ai_context
+
+
+def ai_context(g, me, profile):
+    ctx = _lw_ai3_previous_ai_context(g, me, profile)
+    if profile.get("defend", 0) <= 0 or ai_level_of(profile) == "debutant":
+        return ctx
+    bases = [tuple(e["pos"]) for e in g["entities"] if e["owner"] == me and e["kind"] == "base" and not is_hero(e)]
+    if not bases:
+        return ctx
+    home = ai_walk_distances(g, bases)
+    enemies = [
+        e for e in ai_enemy_pieces(g, me)
+        if e["kind"] == "unit" and e["name"] not in NO_ATTACK_UNITS
+    ]
+    # Ennemis qui peuvent atteindre une base en 2 tours environ.
+    approaching = [
+        (tuple(e["pos"]), home.get(tuple(e["pos"]), 99))
+        for e in enemies
+        if home.get(tuple(e["pos"]), 99) <= 2 * UNITS.get(e["name"], {}).get("move", 3) + 2
+    ]
+    mine = sum(ai_unit_value(e) for e in g["entities"] if e["owner"] == me and e["kind"] == "unit" and e["name"] != WORKER)
+    theirs = sum(ai_unit_value(e) for e in enemies) or 1.0
+    ctx["home_dist"] = home
+    ctx["approaching"] = approaching
+    # Armée plus faible : on tient les passages plutôt que d'attaquer.
+    ctx["defensive"] = mine < 0.9 * theirs
+    return ctx
+
+
+_lw_ai3_previous_ai_place_score = ai_place_score
+
+
+def ai_place_score(ctx, unit, pos):
+    score = _lw_ai3_previous_ai_place_score(ctx, unit, pos)
+    home = ctx.get("home_dist")
+    if not home:
+        return score
+    here = home.get(pos, 99)
+    if ctx.get("defensive"):
+        # Moins d'avance vers l'ennemi, rester près de ses bases.
+        dist = ctx.get("goal_dist")
+        if dist:
+            far = max(dist.values(), default=0) + 5
+            score += 0.7 * ctx["profile"]["advance"] * dist.get(pos, far)
+        if here > 4:
+            score -= 12 * (here - 4)
+    guard = 0.0
+    for where, their_home in ctx.get("approaching", []):
+        # Case sur le chemin de cet ennemi vers nos bases, devant elles.
+        if here <= 4 and here + distance(pos, where) <= their_home + 1:
+            guard = max(guard, 1.0 if here >= 1 else 0.5)
+    return score + AI_GUARD_VALUE * guard * (1.5 if ctx.get("defensive") else 1.0)
+
+# ============================================================
+# IA (version 4) : ouvriers des Derniers nés envoyés sur les chantiers
+# clés (Forge en case technique, colonie près du mana), et ces
+# constructions passent avant le recrutement.
+# ============================================================
+
+def ai_worker_to_site(g, me, sites, reserved=()):
+    """Envoie un ouvrier libre à côté d'une des cases « sites » ; renvoie (état, ouvrier)."""
+    sites = [p for p in sites if at(g, p) is None]
+    if not sites:
+        return g, None
+    workers = [
+        e for e in g["entities"]
+        if e["owner"] == me and e["name"] == WORKER and not e["wait"] and not e["used"]
+        and e["id"] not in reserved
+    ]
+    # Déjà à côté d'un chantier : il construit tout de suite.
+    for worker in workers:
+        if any(distance(tuple(worker["pos"]), p) == 1 for p in sites):
+            return g, worker
+    workers.sort(key=lambda w: (
+        key(tuple(w["pos"])) in g["resources"],
+        min(distance(tuple(w["pos"]), p) for p in sites),
+    ))
+    for worker in workers[:2]:
+        options = list(worker_destinations(g, worker))
+        if not options:
+            continue
+        best = min(options, key=lambda p: (min(abs(distance(p, q) - 1) for q in sites), p))
+        new = ai_try_draft(g, move_worker, me, worker["id"], best)
+        if new is not None:
+            moved = entity(new, worker["id"])
+            if any(distance(tuple(moved["pos"]), p) == 1 for p in sites):
+                return new, moved
+            return new, None
+    return g, None
+
+
+def ai_mana_sites(g, me):
+    bases = [tuple(e["pos"]) for e in g["entities"] if e["owner"] == me and e["kind"] == "base"]
+    return [
+        p for k, v in g["resources"].items() if v[0] == "mana"
+        for p in neighbors(tuple(int(x) for x in k.split(",")))
+        if valid_position(p) and at(g, p) is None and not blocked(g, p)
+        and key(p) not in g["resources"]
+        and min((distance(p, b) for b in bases), default=9) >= 2
+    ]
+
+
+def ai_key_constructions(g, me, profile, rng):
+    """Colonie près du mana, prérequis d'âge et bâtiment technique, avant les unités."""
+    if ai_level_of(profile) == "debutant":
+        return g
+    faction = faction_of(g, me)
+    dn = faction_id(g, me) == DERNIERS_NES
+    used = set()
+
+    # 1. Colonie au bord du mana (indispensable pour l'âge III et les unités fortes).
+    if profile["colonies"] and not is_vagabond(g, me) and not ai_has_mana_base(g, me):
+        if dn:
+            sites = ai_mana_sites(g, me)
+            g, worker = ai_worker_to_site(g, me, sites)
+            if worker is not None:
+                used.add(worker["id"])
+                for pos in sorted(
+                    (p for p in sites if distance(p, tuple(worker["pos"])) == 1),
+                    key=lambda p: -ai_colony_value(g, p),
+                ):
+                    new = ai_try_draft(g, build, me, worker["id"], faction["base"], pos, False)
+                    if new is not None:
+                        g = new
+                        break
+        else:
+            g = ai_try_colony(g, me, dict(profile, colonies=True))
+
+    # 2. Prérequis d'âge et bâtiment technique (améliorations).
+    age = g["players"][me]["age"]
+    key_buildings = [
+        name for name in (
+            AGE_PREREQUISITES.get((faction_id(g, me), age + 1)),
+            TECH_BUILDINGS.get(faction_id(g, me)),
+        )
+        if name and building_is_available(g, me, name)
+        and not any(e["owner"] == me and e["name"] == name for e in g["entities"])
+    ]
+    for name in key_buildings:
+        if dn and name == TECH_BUILDINGS.get(DERNIERS_NES) and me in TECH_CELLS:
+            cell = tech_cell(me)
+            g, worker = ai_worker_to_site(g, me, [cell], reserved=used)
+            if worker is not None:
+                new = ai_try_draft(g, build, me, worker["id"], name, cell, False)
+                if new is not None:
+                    g = new
+                    used.add(worker["id"])
+            continue
+        new = ai_try_build(g, me, name, rng)
+        if new is not None:
+            g = new
+    return g
+
+
+_lw_ai4_previous_ai_production = ai_production
+
+
+def ai_production(draft, me, level):
+    profile = ai_profile(level)
+    rng = ai_rng(draft, 29 + me)
+    draft["_ai_profile"] = profile
+    try:
+        urgent = False
+        if level != "debutant":
+            # Contre-mesures décisives d'abord (ex. Meute de tigres contre une marée).
+            owned = len(draft["players"][me].get("upgrades", []))
+            draft = ai_buy_upgrades(draft, me, profile, rng, minimum=AI_UPGRADE_DECISIVE)
+            urgent = len(draft["players"][me].get("upgrades", [])) > owned
+        if not urgent:
+            draft = ai_key_constructions(draft, me, profile, rng)
+        draft["_ai_urgent"] = urgent
+    finally:
+        draft.pop("_ai_profile", None)
+    result = _lw_ai4_previous_ai_production(draft, me, level)
+    result.pop("_ai_urgent", None)
+    return result
+
+_lw_ai5_previous_ai_build_sources = ai_build_sources
+
+
+def ai_build_sources(g, me):
+    if faction_id(g, me) != EXILES:
+        return _lw_ai5_previous_ai_build_sources(g, me)
+    # Les Habitations des Exilés peuvent construire plusieurs fois par tour.
+    return [
+        e for e in g["entities"]
+        if e["owner"] == me and e["kind"] == "base" and not e["wait"]
+    ]
+
+# ============================================================
+# ABANDON DE LA PARTIE
+# À tout moment, le joueur peut abandonner : l'autre joueur gagne.
+# - Partie locale : abandon du joueur qui a la main.
+# - Contre l'IA : abandon du joueur humain.
+# - En ligne : abandon du joueur de ce navigateur (même hors de son tour).
+# ============================================================
+
+def forfeit_game(bundle, loser):
+    g = bundle["game"]
+    if g["winner"] is not None:
+        raise ValueError("La partie est déjà terminée.")
+    g["winner"] = 1 - loser
+    log(g, f"{faction_of(g, loser)['name']} abandonne la partie : victoire des {faction_of(g, 1 - loser)['name']}.")
+    g["_ui_message"] = f"🏳️ Les {faction_of(g, loser)['name']} ont abandonné la partie."
+
+
+def forfeit_loser(bundle):
+    """Siège du joueur qui abandonne depuis cet écran."""
+    if st.session_state.get("online_code") and online_seat() in (0, 1):
+        return online_seat()
+    config = ai_config(bundle)
+    if config is not None:
+        return 1 - config["seat"]
+    return bundle["game"]["active"]
+
+
+def forfeit_online(loser):
+    room = online_active_room()
+    if room is None:
+        return
+    with online_lock():
+        shared = copy.deepcopy(room["bundle"])
+        try:
+            forfeit_game(shared, loser)
+        except ValueError:
+            return
+        shared["game"].pop("_ui_message", None)
+        room["bundle"] = shared
+        room["version"] += 1
+    st.session_state.online_handed = None
+    st.session_state.ui_message = "🏳️ Tu as abandonné la partie."
+    bump_ui(clear_selection=True)
+    st.rerun()
+
+
+def render_forfeit(bundle):
+    g = bundle["game"]
+    if g["winner"] is not None:
+        return
+    loser = forfeit_loser(bundle)
+    name = faction_of(g, loser)["name"]
+    with st.expander("🏳️ Abandonner la partie"):
+        st.caption(f"Les {name} abandonnent : les {faction_of(g, 1 - loser)['name']} gagnent aussitôt.")
+        sure = st.checkbox("Je confirme vouloir abandonner", key="forfeit_confirm")
+        if st.button(f"🏳️ Abandonner ({name})", type="primary", disabled=not sure, key="forfeit_go"):
+            if st.session_state.get("online_code"):
+                forfeit_online(loser)
+            else:
+                perform(forfeit_game, loser)
+
+
+_lw_forfeit_previous_render_sidebar = render_sidebar
+
+
+def render_sidebar(bundle):
+    _lw_forfeit_previous_render_sidebar(bundle)
+    with st.sidebar:
+        render_forfeit(bundle)
+
+# --- IA : distances de marche mises en cache (la carte ne change pas en cours de partie).
+_AI_DIST_CACHE = {}
+
+
+def ai_terrain_key(g):
+    return hash(tuple(sorted(g["terrain"].items())))
+
+
+_lw_cache_previous_ai_walk_distances = ai_walk_distances
+
+
+def ai_walk_distances(g, sources):
+    cache_key = ("walk", ai_terrain_key(g), frozenset(sources))
+    if cache_key not in _AI_DIST_CACHE:
+        if len(_AI_DIST_CACHE) > 400:
+            _AI_DIST_CACHE.clear()
+        _AI_DIST_CACHE[cache_key] = _lw_cache_previous_ai_walk_distances(g, sources)
+    return _AI_DIST_CACHE[cache_key]
+
+
+_lw_cache_previous_ai_goal_distances = ai_goal_distances
+
+
+def ai_goal_distances(g, goals, base_goals):
+    cache_key = ("goal", ai_terrain_key(g), frozenset(goals), frozenset(base_goals))
+    if cache_key not in _AI_DIST_CACHE:
+        if len(_AI_DIST_CACHE) > 400:
+            _AI_DIST_CACHE.clear()
+        _AI_DIST_CACHE[cache_key] = _lw_cache_previous_ai_goal_distances(g, goals, base_goals)
+    return _AI_DIST_CACHE[cache_key]
+
+# --- Écran de fin après un abandon : image dédiée.
+ABANDON_IMAGE = Path(__file__).parent / "assets" / "abandon.jpg"
+
+
+@st.cache_data
+def abandon_image_data():
+    import base64
+    try:
+        return base64.b64encode(ABANDON_IMAGE.read_bytes()).decode("ascii")
+    except OSError:
+        return None
+
+
+def game_forfeiter(g):
+    """Siège du joueur qui a abandonné, sinon None."""
+    if g.get("winner") not in (0, 1):
+        return None
+    loser = 1 - g["winner"]
+    marker = f"{faction_of(g, loser)['name']} abandonne la partie"
+    return loser if any(marker in line for line in g.get("log", [])[-5:]) else None
+
+
+_lw_abandon_previous_render_victory_screen = render_victory_screen
+
+
+def render_victory_screen(g):
+    loser = game_forfeiter(g)
+    image = abandon_image_data() if loser is not None else None
+    if image is None:
+        return _lw_abandon_previous_render_victory_screen(g)
+    title = (
+        f"Les {faction_of(g, loser)['name']} abandonnent : "
+        f"victoire des {faction_of(g, g['winner'])['name']} !"
+    )
+    st.markdown(
+        f"""
+        <div style="position: relative; width: 100%; aspect-ratio: 4 / 3;
+                    border-radius: 14px; overflow: hidden;
+                    background: url('data:image/jpeg;base64,{image}') center 45% / cover no-repeat;
+                    box-shadow: 0 8px 28px #00000066;">
+          <div style="position: absolute; inset: 0;
+                      background: linear-gradient(180deg, #00000099 0%, #00000022 45%, #00000000 70%);"></div>
+          <div style="position: absolute; top: 6%; left: 0; right: 0;
+                      text-align: center; padding: 0 4%;
+                      color: #ffffff; font-weight: 900;
+                      font-size: clamp(26px, 4.2vw, 66px); line-height: 1.1;
+                      text-shadow: 0 3px 12px #000000, 0 0 4px #000000;">
+            🏳️ {escape(title)}
+          </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
 
 
 if __name__ == "__main__":
