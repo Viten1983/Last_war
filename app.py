@@ -4410,6 +4410,9 @@ def render_board(g, view, readonly=False):
     if g["phase"] == "move" and st.session_state.get("_lw_spell_targets"):
         # Cibles alliées d'un sort (Dirigeable) : surlignées sur le plateau.
         targets = {tuple(int(v) for v in k.split(",")): d for k, d in st.session_state["_lw_spell_targets"].items()}
+    if g["phase"] == "move" and st.session_state.get("_lw_siege_targets"):
+        # Aperçu des cases touchées par un tir de siège.
+        targets = {tuple(int(v) for v in k.split(",")): d for k, d in st.session_state["_lw_siege_targets"].items()}
 
     slots = (
         set(planning_slots(g, view))
@@ -4769,23 +4772,32 @@ def render_build_controls(g, view, local=False, on_board=False):
                         st.caption(  
                             f"{data['cost']} or · {data['pf']:g} PF · "
                             + building_limit_text(view, owner, name)
-                        )  
+                            + ("" if is_base else f" · ⚡ immédiat : {int(data['cost'] * 1.5)} or")
+                        )    
   
-                        if st.button(  
-                            f"Construire : {name}",  
-                            key=f"{prefix}_choose_build_{source['id']}_{name}",  
-                            disabled=building_limit_reached(view, owner, name),  
-                            type=(  
-                                "primary"  
-                                if (  
-                                    st.session_state.ui_plan_mode == "build"  
-                                    and st.session_state.ui_plan_name == name  
-                                )  
-                                else "secondary"  
-                            ),  
-                        ):  
-                            start_placement("build", name)
-                            st.rerun()
+                        # Deux façons de construire : normale, ou accélérée (+50 %).
+                        limit_hit = building_limit_reached(view, owner, name)
+                        normal_col, fast_col = st.columns(2)
+                        with normal_col:
+                            if st.button(
+                                "🔨 Construire",
+                                key=f"{prefix}_choose_build_{source['id']}_{name}",
+                                disabled=limit_hit,
+                                use_container_width=True,
+                                type=build_button_type(name, False),
+                            ):
+                                start_build(name, False)
+                        if not is_base:
+                            with fast_col:
+                                if st.button(
+                                    "⚡ Immédiat",
+                                    key=f"{prefix}_choose_fast_{source['id']}_{name}",
+                                    disabled=limit_hit,
+                                    use_container_width=True,
+                                    help="Disponible immédiatement, pour +50 % du prix.",
+                                    type=build_button_type(name, True),
+                                ):
+                                    start_build(name, True)
   
         elif source["kind"] == "building":  
             st.markdown("#### Recruter")  
@@ -4957,17 +4969,20 @@ def render_build_controls(g, view, local=False, on_board=False):
         if name == faction["base"]:  
             st.caption("Disponible après 2 fins de tour.")  
         else:  
-            accelerated = st.checkbox(  
-                "Disponibilité immédiate : +50 % du prix",  
-                value=st.session_state.ui_plan_accelerated,  
-                key=f"{prefix}_accelerated_{source['id']}_{name}",  
-            )  
-  
-            st.caption(  
-                "Disponible immédiatement."  
-                if accelerated  
-                else "Disponible au tour suivant."  
-            )  
+            accelerated = bool(st.session_state.ui_plan_accelerated)
+            if accelerated:
+                st.success("⚡ Construction accélérée : disponible immédiatement (+50 % du prix).")
+            else:
+                st.caption("Construction normale : disponible au tour suivant.")
+            if st.button(
+                "Repasser en construction normale" if accelerated else "⚡ Accélérer cette construction (+50 %)",
+                key=f"{prefix}_toggle_fast_{source['id']}_{name}",
+                use_container_width=True,
+                type="secondary" if accelerated else "primary",
+            ):
+                st.session_state.ui_plan_accelerated = not accelerated
+                bump_ui()
+                st.rerun()  
   
         st.session_state.ui_plan_accelerated = accelerated  
         st.info("Clique sur une case verte du plateau.")  
@@ -8874,7 +8889,7 @@ def ranged_attack_values(g, attacker, target):
 def siege_attack(g, attacker, target):
     values = siege_values(g, attacker, target)
     target_pos = tuple(target["pos"])
-    flanks = flank_cells(target_pos, tuple(attacker["pos"]))
+    flanks = siege_side_cells(tuple(attacker["pos"]), target_pos)
 
     report = {
         "turn": turn_label(g),
@@ -9181,19 +9196,29 @@ def render_worker_controls(view, worker, prefix):
         )
         card = st.container(border=True)
         card.write(f"**{label}**")
-        card.caption(f"{cost} or · {pf:g} PF · " + building_limit_text(view, worker["owner"], name))
-        if card.button(
-            f"Construire : {label}",
-            disabled=building_limit_reached(view, worker["owner"], name),
+        card.caption(
+            f"{cost} or · {pf:g} PF · " + building_limit_text(view, worker["owner"], name)
+            + ("" if is_base else f" · ⚡ immédiat : {int(cost * 1.5)} or")
+        )
+        limit_hit = building_limit_reached(view, worker["owner"], name)
+        normal_col, fast_col = card.columns(2)
+        if normal_col.button(
+            "🔨 Construire",
+            disabled=limit_hit,
             key=f"{prefix}_worker_build_{worker['id']}_{name}",
-            type=(
-                "primary"
-                if plan_mode == "build" and st.session_state.ui_plan_name == name
-                else "secondary"
-            ),
+            use_container_width=True,
+            type=build_button_type(name, False),
         ):
-            start_placement("build", name)
-            st.rerun()
+            start_build(name, False)
+        if not is_base and fast_col.button(
+            "⚡ Immédiat",
+            disabled=limit_hit,
+            key=f"{prefix}_worker_fast_{worker['id']}_{name}",
+            use_container_width=True,
+            help="Disponible immédiatement, pour +50 % du prix.",
+            type=build_button_type(name, True),
+        ):
+            start_build(name, True)
 
 
 def render_colony_controls(view, base, prefix):
@@ -11709,7 +11734,7 @@ def siege_attack(g, attacker, target):
     origin = tuple(attacker["pos"])
     target_pos = tuple(target["pos"])
     behind = cell_behind(origin, target_pos)
-    flanks = flank_cells(target_pos, origin)
+    flanks = siege_side_cells(origin, target_pos)
 
     report = {
         "turn": turn_label(g),
@@ -13026,7 +13051,7 @@ def trebuchet_auto_fire(g, mover, route):
         }
         log(g, f"Trébuchet #{treb['id']} tire automatiquement sur {mover['name']} en {coord(target_pos)}.")
         apply_damage(g, mover, TREBUCHET_AUTO_DAMAGE, treb, report, "Cible du tir automatique")
-        for pos in flank_cells(target_pos, origin):
+        for pos in siege_side_cells(origin, target_pos):
             for victim in list(pieces_at(g, pos)):
                 apply_damage(g, victim, TREBUCHET_AUTO_SIDE, treb, report, "Case voisine du tir automatique")
         g["_combat_report"] = report
@@ -13929,6 +13954,111 @@ def move_hero(g, owner, hero_id, destination):
             + ", ".join(h["name"] for h in others)
             + " : cette case ne rapportera qu'une seule fois."
         )
+
+
+# ============================================================
+# CONSTRUCTION ACCÉLÉRÉE : boutons « Construire » et « ⚡ Accélérée »
+# côte à côte dans chaque fiche de bâtiment (+50 % du prix,
+# disponible immédiatement). Les bases ne s'accélèrent pas.
+# ============================================================
+
+def build_button_type(name, fast):
+    chosen = (
+        st.session_state.ui_plan_mode == "build"
+        and st.session_state.ui_plan_name == name
+        and bool(st.session_state.ui_plan_accelerated) == fast
+    )
+    return "primary" if chosen else "secondary"
+
+
+def start_build(name, fast):
+    start_placement("build", name)
+    st.session_state.ui_plan_accelerated = bool(fast)
+    st.session_state.ui_message = (
+        f"⚡ {name} en construction accélérée : clique sur une case verte."
+        if fast else f"{name} : clique sur une case verte."
+    )
+    st.rerun()
+
+
+# ============================================================
+# ARMES DE SIÈGE : CASES TOUCHÉES (gauche, droite, derrière)
+# Vu depuis la catapulte, « gauche » et « droite » sont les deux voisines
+# de la cible situées de part et d'autre du tir, du côté de la case de
+# derrière : avec la cible et la case de derrière, elles forment un bloc
+# de 4 cases. Les cases touchées s'affichent en rouge avant le tir.
+# ============================================================
+
+def siege_side_cells(origin, target_pos):
+    origin, target_pos = tuple(origin), tuple(target_pos)
+    ox, oy = flat_center(origin, 1, 0, 0)
+    tx, ty = flat_center(target_pos, 1, 0, 0)
+    ux, uy = tx - ox, ty - oy
+    norm = math.hypot(ux, uy) or 1.0
+    ux, uy = ux / norm, uy / norm
+    left, right = [], []
+    for n in neighbors(target_pos):
+        nx, ny = flat_center(n, 1, 0, 0)
+        vx, vy = nx - tx, ny - ty
+        vnorm = math.hypot(vx, vy) or 1.0
+        angle = math.degrees(math.acos(max(-1.0, min(1.0, (ux * vx + uy * vy) / vnorm))))
+        cross = ux * vy - uy * vx
+        # Voisines à environ 60° de l'axe du tir (côté arrière).
+        (left if cross < 0 else right).append((abs(angle - 60), n))
+    picks = [min(side)[1] for side in (left, right) if side]
+    return [p for p in picks if p in CELL_SET]
+
+
+def cell_behind(origin, target_pos):
+    """Voisine de la cible dans le prolongement exact du tir."""
+    origin, target_pos = tuple(origin), tuple(target_pos)
+    ox, oy = flat_center(origin, 1, 0, 0)
+    tx, ty = flat_center(target_pos, 1, 0, 0)
+    ux, uy = tx - ox, ty - oy
+    best = None
+    for n in neighbors(target_pos):
+        nx, ny = flat_center(n, 1, 0, 0)
+        vx, vy = nx - tx, ny - ty
+        score = (ux * vx + uy * vy) / ((math.hypot(ux, uy) or 1) * (math.hypot(vx, vy) or 1))
+        if best is None or score > best[0]:
+            best = (score, n)
+    return best[1] if best and best[1] in CELL_SET else None
+
+
+def siege_impact_cells(attacker, target_pos):
+    """{case: dégâts} d'un tir de siège sur cette case."""
+    origin = tuple(attacker["pos"])
+    target_pos = tuple(target_pos)
+    if attacker["name"] == HELL_CATAPULT:
+        cells = {target_pos: HELL_MAIN_DAMAGE}
+        behind = cell_behind(origin, target_pos)
+        if behind is not None:
+            cells[behind] = HELL_MAIN_DAMAGE
+        for p in siege_side_cells(origin, target_pos):
+            cells[p] = HELL_SIDE_DAMAGE
+        return cells
+    cells = {target_pos: SIEGE_DAMAGE}
+    for p in siege_side_cells(origin, target_pos):
+        cells[p] = SIEGE_SIDE_DAMAGE
+    return cells
+
+
+_lw_impact_previous_render_board = render_board
+
+
+def render_board(g, view, readonly=False):
+    if g["phase"] == "move" and not readonly:
+        attackers = selected_attackers(g)
+        target = current_target(g) if attackers else None
+        if len(attackers) == 1 and attackers[0]["name"] in SIEGE_RANGES and target is not None:
+            # Aperçu : toutes les cases que le tir va toucher, en rouge.
+            st.session_state["_lw_siege_targets"] = {
+                key(p): {"target_id": target["id"]}
+                for p in siege_impact_cells(attackers[0], target["pos"])
+            }
+            return _lw_impact_previous_render_board(g, view, readonly)
+    st.session_state.pop("_lw_siege_targets", None)
+    return _lw_impact_previous_render_board(g, view, readonly)
 
 
 
