@@ -9853,7 +9853,8 @@ def render_victory_screen(g):
 
     st.markdown(
         f"""
-        <div style="position: relative; width: 100%; aspect-ratio: 4 / 3;
+        <div style="position: relative; width: min(100%, 560px); margin: 0 auto;
+                    aspect-ratio: 4 / 3;
                     border-radius: 14px; overflow: hidden;
                     background: {background};
                     box-shadow: 0 8px 28px #00000066;">
@@ -9862,7 +9863,7 @@ def render_victory_screen(g):
           <div style="position: absolute; top: 6%; left: 0; right: 0;
                       text-align: center; padding: 0 4%;
                       color: #ffffff; font-weight: 900;
-                      font-size: clamp(28px, 4.6vw, 72px); line-height: 1.1;
+                      font-size: clamp(17px, 2.5vw, 30px); line-height: 1.15;
                       text-shadow: 0 3px 12px #000000, 0 0 4px #000000;">
             🏆 {escape(title)}
           </div>
@@ -14278,7 +14279,8 @@ def render_victory_screen(g):
     )
     st.markdown(
         f"""
-        <div style="position: relative; width: 100%; aspect-ratio: 4 / 3;
+        <div style="position: relative; width: min(100%, 560px); margin: 0 auto;
+                    aspect-ratio: 4 / 3;
                     border-radius: 14px; overflow: hidden;
                     background: url('data:image/jpeg;base64,{image}') center 45% / cover no-repeat;
                     box-shadow: 0 8px 28px #00000066;">
@@ -14287,7 +14289,7 @@ def render_victory_screen(g):
           <div style="position: absolute; top: 6%; left: 0; right: 0;
                       text-align: center; padding: 0 4%;
                       color: #ffffff; font-weight: 900;
-                      font-size: clamp(26px, 4.2vw, 66px); line-height: 1.1;
+                      font-size: clamp(16px, 2.3vw, 27px); line-height: 1.15;
                       text-shadow: 0 3px 12px #000000, 0 0 4px #000000;">
             🏳️ {escape(title)}
           </div>
