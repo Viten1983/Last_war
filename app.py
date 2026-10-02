@@ -4407,6 +4407,9 @@ def render_board(g, view, readonly=False):
     if g["phase"] == "build" and st.session_state.get("_lw_hero_targets"):
         # Cibles d'un héros vagabond sélectionné (attaque en production).
         targets = {tuple(int(v) for v in k.split(",")): d for k, d in st.session_state["_lw_hero_targets"].items()}
+    if g["phase"] == "move" and st.session_state.get("_lw_spell_targets"):
+        # Cibles alliées d'un sort (Dirigeable) : surlignées sur le plateau.
+        targets = {tuple(int(v) for v in k.split(",")): d for k, d in st.session_state["_lw_spell_targets"].items()}
 
     slots = (
         set(planning_slots(g, view))
@@ -13545,6 +13548,164 @@ def render_home():
             st.query_params["p"] = room["tokens"][0]
             st.rerun()
     _lw_online_previous_render_home()
+
+
+# ============================================================
+# DIRIGEABLE : SORTS UTILISABLES DEPUIS LE PLATEAU
+# - Choix du sort mémorisé (il ne revient plus à zéro à chaque clic).
+# - Clic sur une cible alliée surlignée :
+#   • +2 PF : l'unité centrale et ses 2 voisines (gauche/droite) : immédiat ;
+#   • Doubler la récolte : la base est choisie, puis bouton de confirmation.
+# - Doubler la récolte : base à portée qui récolte vraiment
+#   (Derniers nés : au moins un ouvrier sur une ressource voisine).
+# ============================================================
+
+def base_can_harvest(g, base):
+    owner = base["owner"]
+    cells = [p for p in neighbors(tuple(base["pos"])) if key(p) in g["resources"]]
+    if faction_id(g, owner) == DERNIERS_NES:
+        return any(
+            piece["owner"] == owner and piece["name"] == WORKER
+            for p in cells for piece in pieces_at(g, p)
+        )
+    return bool(cells)
+
+
+_lw_ship_previous_airship_targets = airship_targets
+
+
+def airship_targets(g, airship, spell):
+    targets = _lw_ship_previous_airship_targets(g, airship, spell)
+    if spell == "harvest":
+        targets = [b for b in targets if base_can_harvest(g, b) and not b.get("double_harvest")]
+    return targets
+
+
+def airship_spell_key(airship):
+    return f"airship_spell_{airship['id']}"
+
+
+def selected_airship(g):
+    attackers = selected_attackers(g)
+    if len(attackers) == 1 and attackers[0]["name"] == AIRSHIP and attackers[0]["owner"] == g["active"]:
+        return attackers[0]
+    return None
+
+
+def current_airship_spell(airship):
+    spell = st.session_state.get(airship_spell_key(airship), "boost")
+    return spell if spell in AIRSHIP_SPELLS else "boost"
+
+
+def render_airship_controls(g, airship, prefix):
+    st.subheader("🎈 Dirigeable")
+    cargo = airship.get("cargo", [])
+    st.caption(
+        f"À bord ({len(cargo)}/{AIRSHIP_CAPACITY}) : "
+        + (", ".join(f"{u['name']} #{u['id']}" for u in cargo) or "personne")
+        + f". Pas d'attaque. Détecte les invisibles à {AIRSHIP_RANGE} cases."
+    )
+    if not can_move(g, airship):
+        st.info("Ce Dirigeable a déjà agi ce tour.")
+        return
+
+    candidates = {u["id"]: u for u in boarding_candidates(g, airship)}
+    if candidates and len(cargo) < AIRSHIP_CAPACITY:
+        unit_id = st.selectbox(
+            "Unité voisine à embarquer",
+            options=list(candidates),
+            format_func=lambda eid: describe(candidates[eid]),
+            key=f"airship_board_{airship['id']}",
+        )
+        if st.button("⬆️ Embarquer", key=f"{prefix}_board_ok_{airship['id']}"):
+            perform(game_action, board_airship, airship["id"], unit_id)
+    if cargo and st.button(
+        "⬇️ Débarquer tout le monde (termine son activation)",
+        key=f"{prefix}_unload_{airship['id']}",
+    ):
+        perform(game_action, unload_airship, airship["id"])
+
+    st.markdown("##### Sorts")
+    spell = st.radio(
+        "Sort",
+        options=list(AIRSHIP_SPELLS),
+        format_func=AIRSHIP_SPELLS.get,
+        key=airship_spell_key(airship),
+    )
+    targets = {e["id"]: e for e in airship_targets(g, airship, spell)}
+    if not targets:
+        st.caption(
+            "Aucune unité alliée à portée."
+            if spell == "boost"
+            else "Aucune de tes bases à portée ne récolte (Derniers nés : il faut un ouvrier sur la ressource)."
+        )
+        return
+
+    if spell == "boost":
+        st.caption(
+            f"Clique sur l'unité centrale surlignée (à {AIRSHIP_RANGE} cases maximum) : "
+            "elle et ses voisines de gauche et de droite gagnent +2 PF pour ce tour."
+        )
+        return
+
+    chosen = st.session_state.get("ui_airship_target")
+    if chosen not in targets:
+        st.caption("Clique sur la base surlignée dont tu veux doubler la prochaine récolte.")
+        return
+    base = targets[chosen]
+    st.info(f"Base choisie : {base['name']} en {coord(base['pos'])}.")
+    if st.button(
+        "💰 Doubler la récolte de cette base au prochain tour",
+        type="primary",
+        key=f"{prefix}_harvest_ok_{airship['id']}_{chosen}",
+    ):
+        st.session_state.ui_airship_target = None
+        perform(game_action, cast_airship_spell, airship["id"], "harvest", chosen)
+
+
+_lw_ship_previous_board_event = board_event
+
+
+def board_event(event, g, view):
+    airship = selected_airship(g) if isinstance(event, dict) and g["phase"] == "move" else None
+    if airship is None or event.get("event_id") == st.session_state.ui_last_event or g["curtain"]:
+        return _lw_ship_previous_board_event(event, g, view)
+    try:
+        pos = require_position(event.get("pos"))
+    except ValueError:
+        return _lw_ship_previous_board_event(event, g, view)
+
+    spell = current_airship_spell(airship)
+    target = next((e for e in airship_targets(g, airship, spell) if tuple(e["pos"]) == pos), None)
+    if target is None or target["id"] == airship["id"]:
+        return _lw_ship_previous_board_event(event, g, view)
+
+    st.session_state.ui_last_event = event["event_id"]
+    if spell == "boost":
+        perform(game_action, cast_airship_spell, airship["id"], "boost", target["id"])
+    st.session_state.ui_airship_target = target["id"]
+    st.session_state.ui_message = (
+        f"{target['name']} choisie : confirme avec le bouton « Doubler la récolte »."
+    )
+    bump_ui()
+    st.rerun()
+
+
+_lw_ship_previous_render_board = render_board
+
+
+def render_board(g, view, readonly=False):
+    airship = selected_airship(g) if g["phase"] == "move" and not readonly else None
+    if airship is not None and can_move(g, airship):
+        spell = current_airship_spell(airship)
+        st.session_state["_lw_spell_targets"] = {
+            key(tuple(e["pos"])): {"target_id": e["id"], "spell": True}
+            for e in airship_targets(g, airship, spell)
+            if e["id"] != airship["id"]
+        }
+    else:
+        st.session_state.pop("_lw_spell_targets", None)
+    return _lw_ship_previous_render_board(g, view, readonly)
 
 
 
