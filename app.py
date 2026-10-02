@@ -11322,22 +11322,7 @@ def render_hero_controls(view, hero, prefix):
 
     # Sorts d'Aalongue
     if hero["name"] == "Aalongue":
-        st.markdown("##### Sorts d'Aalongue")
-        if aalongue_spell_used(view, hero):
-            st.caption("Sort déjà lancé ce tour.")
-        else:
-            if st.button("💨 Motivation : +1 déplacement à toutes tes unités ce tour", key=f"{prefix}_motivation_{hero['id']}"):
-                perform(draft_action, cast_motivation, hero["id"])
-            own_units = {u["id"]: u for u in view["entities"] if u["owner"] == owner and u["kind"] == "unit"}
-            chosen = st.multiselect(
-                f"Téléportation : jusqu'à {AALONGUE_TELEPORT} unités autour d'Aalongue",
-                options=list(own_units),
-                format_func=lambda eid: describe(own_units[eid]),
-                max_selections=AALONGUE_TELEPORT,
-                key=f"{prefix}_teleport_{hero['id']}",
-            )
-            if chosen and st.button("✨ Téléporter", key=f"{prefix}_teleport_go_{hero['id']}"):
-                perform(draft_action, cast_teleport, hero["id"], chosen)
+        render_aalongue_spells(view, hero, prefix)
 
     # Production
     capacity = hero_capacity(view, owner)
@@ -13706,6 +13691,164 @@ def render_board(g, view, readonly=False):
     else:
         st.session_state.pop("_lw_spell_targets", None)
     return _lw_ship_previous_render_board(g, view, readonly)
+
+
+# ============================================================
+# AALONGUE : SORTS (TÉLÉPORTATION, MOTIVATION)
+# - Un sort tous les 2 tours ; Aalongue peut quand même se déplacer.
+# - Téléportation : clique jusqu'à 4 de tes unités sur le plateau (en
+#   jaune), puis « Téléporter » : elles arrivent autour d'Aalongue.
+# ============================================================
+
+AALONGUE_COOLDOWN = 2
+
+
+def aalongue_spell_used(g, hero):
+    """Vrai tant que le prochain sort n'est pas disponible."""
+    return g["turn"] < hero.get("next_spell_turn", 1)
+
+
+def aalongue_mark_spell(g, hero):
+    hero["spell_turn"] = g["turn"]
+    hero["next_spell_turn"] = g["turn"] + AALONGUE_COOLDOWN
+
+
+def cast_motivation(g, owner, hero_id):
+    require_phase(g, "build", owner)
+    hero = require_own_hero(g, owner, hero_id)
+    if hero["name"] != "Aalongue":
+        raise ValueError("Seul Aalongue lance ce sort.")
+    if aalongue_spell_used(g, hero):
+        raise ValueError(f"Prochain sort d'Aalongue au tour {hero['next_spell_turn']}.")
+    aalongue_mark_spell(g, hero)
+    g["players"][owner]["motivation_turn"] = g["turn"]
+    log(g, "Motivation : +1 déplacement pour toutes les unités ce tour.")
+
+
+def cast_teleport(g, owner, hero_id, unit_ids):
+    require_phase(g, "build", owner)
+    hero = require_own_hero(g, owner, hero_id)
+    if hero["name"] != "Aalongue":
+        raise ValueError("Seul Aalongue lance ce sort.")
+    if aalongue_spell_used(g, hero):
+        raise ValueError(f"Prochain sort d'Aalongue au tour {hero['next_spell_turn']}.")
+    if not 1 <= len(unit_ids) <= AALONGUE_TELEPORT or len(set(unit_ids)) != len(unit_ids):
+        raise ValueError(f"Choisis de 1 à {AALONGUE_TELEPORT} unités différentes.")
+    units = [entity(g, uid) for uid in unit_ids]
+    if any(u["owner"] != owner or u["kind"] != "unit" for u in units):
+        raise ValueError("Choisis tes propres unités.")
+    cells = teleport_cells(g, hero)
+    if len(cells) < len(units):
+        raise ValueError(f"Pas assez de cases libres autour d'Aalongue ({len(cells)}).")
+    for unit, pos in zip(units, cells):
+        origin = coord(unit["pos"])
+        unit["pos"] = list(pos)
+        log(g, f"Téléportation : {unit['name']} {origin} → {coord(pos)}.")
+    aalongue_mark_spell(g, hero)
+    g["_ui_message"] = f"🌀 Téléportation : {len(units)} unité(s) autour d'Aalongue."
+
+
+def teleport_choice():
+    return [int(i) for i in st.session_state.get("ui_teleport_ids", [])]
+
+
+def selected_aalongue(view):
+    source = selected_entity(view)
+    if (
+        source is not None
+        and source["name"] == "Aalongue"
+        and source["owner"] == view["active"]
+        and view["phase"] == "build"
+        and st.session_state.get("ui_teleport_mode")
+    ):
+        return source
+    return None
+
+
+_lw_tp_previous_board_event = board_event
+
+
+def board_event(event, g, view):
+    hero = selected_aalongue(view) if isinstance(event, dict) and event.get("type") == "cell_click" else None
+    if hero is None or event.get("event_id") == st.session_state.ui_last_event or g["curtain"]:
+        return _lw_tp_previous_board_event(event, g, view)
+    try:
+        pos = require_position(event.get("pos"))
+    except ValueError:
+        return _lw_tp_previous_board_event(event, g, view)
+    unit = next(
+        (e for e in pieces_at(view, pos) if e["owner"] == hero["owner"] and e["kind"] == "unit"),
+        None,
+    )
+    if unit is None:
+        return _lw_tp_previous_board_event(event, g, view)
+
+    st.session_state.ui_last_event = event["event_id"]
+    chosen = teleport_choice()
+    if unit["id"] in chosen:
+        chosen.remove(unit["id"])
+    elif len(chosen) < AALONGUE_TELEPORT:
+        chosen.append(unit["id"])
+    else:
+        st.session_state.ui_message = f"Maximum {AALONGUE_TELEPORT} unités pour la téléportation."
+    st.session_state.ui_teleport_ids = chosen
+    bump_ui()
+    st.rerun()
+
+
+_lw_tp_previous_render_board = render_board
+
+
+def render_board(g, view, readonly=False):
+    hero = selected_aalongue(view) if not readonly else None
+    if hero is not None:
+        ids = set(teleport_choice())
+        st.session_state.ui_plan_positions = [
+            list(e["pos"]) for e in view["entities"] if e["id"] in ids
+        ]
+    return _lw_tp_previous_render_board(g, view, readonly)
+
+
+def render_aalongue_spells(view, hero, prefix):
+    st.markdown("##### ✨ Sorts d'Aalongue (un sort tous les 2 tours)")
+    if aalongue_spell_used(view, hero):
+        st.caption(f"Prochain sort disponible au tour {hero['next_spell_turn']}. Aalongue peut quand même se déplacer.")
+        st.session_state["_tp_reset"] = True
+        return
+    if st.button("💨 Motivation : +1 déplacement à toutes tes unités ce tour", key=f"{prefix}_motivation_{hero['id']}"):
+        perform(draft_action, cast_motivation, hero["id"])
+
+    if st.session_state.pop("_tp_reset", False):
+        st.session_state.ui_teleport_mode = False
+    mode = st.toggle(
+        f"🌀 Téléportation : choisir jusqu'à {AALONGUE_TELEPORT} unités sur le plateau",
+        key="ui_teleport_mode",
+    )
+    if not mode:
+        if st.session_state.get("ui_teleport_ids"):
+            st.session_state.ui_teleport_ids = []
+            if st.session_state.ui_plan_mode is None:
+                st.session_state.ui_plan_positions = []
+        return
+    chosen = [e for e in view["entities"] if e["id"] in teleport_choice()]
+    free = len(teleport_cells(view, hero))
+    st.caption(
+        f"Clique tes unités sur le plateau (elles passent en jaune) : {len(chosen)}/{AALONGUE_TELEPORT}. "
+        f"Cases libres autour d'Aalongue : {free}."
+    )
+    if chosen:
+        st.write(", ".join(f"{e['name']} ({coord(e['pos'])})" for e in chosen))
+        if st.button(
+            f"🌀 Téléporter {len(chosen)} unité(s) autour d'Aalongue",
+            type="primary",
+            disabled=free < len(chosen),
+            key=f"{prefix}_teleport_go_{hero['id']}",
+        ):
+            ids = [e["id"] for e in chosen]
+            st.session_state.ui_teleport_ids = []
+            st.session_state.ui_plan_positions = []
+            st.session_state["_tp_reset"] = True
+            perform(draft_action, cast_teleport, hero["id"], ids)
 
 
 
