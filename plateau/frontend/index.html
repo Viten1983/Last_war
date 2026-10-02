@@ -1,0 +1,983 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <style>
+    * { box-sizing: border-box; }
+    body { margin: 0; font-family: ui-sans-serif, system-ui, sans-serif; color: #172033; }
+    #wrapper { width: 100%; overflow: visible; border: 1px solid #3f4a33; border-radius: 10px; background: radial-gradient(ellipse at 50% 40%, #56663f 0%, #3d4a2e 70%, #2c3622 100%); padding: 10px; }
+    #board { display: block; width: 100%; height: auto; }
+    #info { min-height: 30px; padding: 8px 4px 0; color: #f4efd8; font-size: 13px; font-weight: 700; }
+    .cell { cursor: pointer; outline: none; }
+    .readonly .cell { cursor: default; }
+    .cell:focus-visible .ground { stroke: #ffffff; stroke-width: 4; }
+    .coord, .label, .token, .highlight { pointer-events: none; user-select: none; }
+    .shadow { filter: drop-shadow(0 2px 4px rgba(0,0,0,0.35)); }
+    .locked { opacity: 0.72; }
+    #wrapper.illustrated { background: #16324a; border-color: #0f2233; padding: 6px; }
+    .illustrated .coord { opacity: 0; transition: opacity 0.12s; }
+    .illustrated .cell:hover .coord, .illustrated .cell:focus-visible .coord { opacity: 1; }
+    .illustrated .cell:hover .ground { fill: rgba(255, 255, 255, 0.22); stroke: #ffffff; stroke-width: 2.5; }
+    .illustrated .cell:focus-visible .ground { stroke: #ffffff; stroke-width: 4; }
+    #wrapper { position: relative; }
+    #zoom { position: absolute; top: 14px; right: 14px; z-index: 5; display: flex; gap: 4px; align-items: center; background: rgba(10, 18, 28, 0.72); padding: 4px; border-radius: 9px; }
+    #zoom button { width: 30px; height: 30px; border: 0; border-radius: 6px; background: #f4efd8; color: #172033; font-size: 18px; font-weight: 900; cursor: pointer; line-height: 1; }
+    #zoom button:hover { background: #ffffff; }
+    #zoom span { min-width: 42px; text-align: center; color: #f4efd8; font-size: 12px; font-weight: 800; }
+    #board.zoomed { cursor: grab; }
+    #board.dragging, #board.dragging .cell { cursor: grabbing; }
+  </style>
+</head>
+<body>
+  <div id="wrapper">
+    <div id="zoom" aria-label="Zoom du plateau">
+      <button type="button" id="zoom-out" title="Dézoomer">−</button>
+      <span id="zoom-level">100 %</span>
+      <button type="button" id="zoom-in" title="Zoomer">+</button>
+      <button type="button" id="zoom-reset" title="Vue entière">⟲</button>
+    </div>
+    <svg id="board" xmlns="http://www.w3.org/2000/svg" aria-label="Plateau Last War"></svg>
+    <div id="info" aria-live="polite">Clique sur une case ou une pièce.</div>
+  </div>
+
+  <script>
+    "use strict";
+
+    const NS = "http://www.w3.org/2000/svg";
+    const SIZE = 44;
+    const MARGIN = 58;
+    const SQRT3 = Math.sqrt(3);
+    const board = document.getElementById("board");
+    const wrapper = document.getElementById("wrapper");
+    const info = document.getElementById("info");
+    let args = null;
+    let locked = false;
+    let renderedRevision = null;
+    // Animation des déplacements : chaque mouvement n'est joué qu'une fois.
+    let animatedMoves = new Set();
+    try { animatedMoves = new Set(JSON.parse(sessionStorage.getItem("lw_animated_moves") || "[]")); } catch (error) { /* ignoré */ }
+    const STEP_MS = 140;
+    let pieceGroups = {};
+    let offsetX = 0;
+    let offsetY = 0;
+
+    // Image de fond du plateau, calée sur la grille du jeu :
+    // rayon d'un hexagone et centre de la case A1, en pixels de l'image.
+    const BACKGROUND = {
+      href: "assets/plateau.jpg",
+      width: 4096,
+      height: 3072,
+      radius: 104,
+      a1x: 155.5,
+      a1y: 89.5,
+    };
+    let backgroundFailed = false;
+    // Nœud conservé d'un rendu à l'autre : l'image n'est pas rechargée.
+    const backgroundNode = svgNode("image", { href: BACKGROUND.href, preserveAspectRatio: "none", "pointer-events": "none" });
+    backgroundNode.addEventListener("error", () => {
+      // Image absente : retour aux cases dessinées.
+      backgroundFailed = true;
+      if (args) render(args);
+    });
+    function useBackground() { return !backgroundFailed; }
+
+    // Illustrations des pièces (assets/<dossier>/<fichier>.jpg).
+    const PIECE_IMAGES = {
+      // Bâtiments (toutes factions)
+      "Incubateur": "buildings/b_incubateur",
+      "Mare": "buildings/b_mare",
+      "Bassin de mutation": "buildings/b_bassin",
+      "Grotte à molosse": "buildings/b_grotte",
+      "Galerie d'enragés": "buildings/b_galerie",
+      "Nid": "buildings/b_nid",
+      "Marais d'aspergeurs": "buildings/b_marais",
+      "Colonie": "buildings/b_colonie",
+      "Ville": "buildings/b_colonie",
+      "Forteresse": "buildings/b_colonie",
+      "Forge": "buildings/b_forge",
+      "Caserne": "buildings/b_caserne",
+      "Écurie": "buildings/b_ecurie",
+      "Archerie": "buildings/b_archerie",
+      "Atelier de siège": "buildings/b_atelier",
+      "Réserve naturelle": "buildings/b_reserve",
+      "Habitations": "buildings/b_habitations",
+      "Petite grotte": "buildings/b_petite_grotte",
+      "Forêt enchantée": "buildings/b_foret",
+      "Terre des Exilés": "buildings/b_terre",
+      "Grande grotte": "buildings/b_grande_grotte",
+      "Repère elfique": "buildings/b_repere",
+      "Marché": "buildings/b_marche",
+      // Unités (toutes factions)
+      "Déferlant": "units/u_deferlant",
+      "Aspergeur": "units/u_aspergeur",
+      "Rampant": "units/u_rampant",
+      "Costaud": "units/u_costaud",
+      "Décimant": "units/u_decimant",
+      "Enragé": "units/u_enrage",
+      "Kamikaze": "units/u_kamikaze",
+      "Molosse": "units/u_molosse",
+      "Volant": "units/u_volant",
+      "Tigre des forêts": "units/u_tigre",
+      "Elfe": "units/u_elfe",
+      "Dragon": "units/u_dragon",
+      "Daeron et Finwe": "units/u_daeron",
+      "Daeron": "units/u_daeron",
+      "Finwe": "units/u_finwe",
+      "Gobelin": "units/u_gobelin",
+      "Golem de pierre": "units/u_golem",
+      "Mammouth dompté": "units/u_mammouth",
+      "Nain des montagnes": "units/u_nain",
+      "Réveil des morts": "units/u_reveil",
+      "Mage des montagnes": "units/u_mage",
+      "Aramil": "units/u_aramil",
+      "Titan Aragnak": "units/u_titan",
+      "Ouvrier": "units/u_ouvrier",
+      "Guerrier": "units/u_guerrier",
+      "Éclaireur": "units/u_eclaireur",
+      "Chevalier": "units/u_chevalier",
+      "Archer": "units/u_archer",
+      "Catapulte": "units/u_catapulte",
+      "Trébuchet": "units/u_trebuchet",
+      "Catapulte de l'enfer": "units/u_trebuchet",
+      "Dirigeable": "units/u_dirigeable",
+      "Griffon": "units/u_griffon",
+      "Roi Théobald": "units/u_roi",
+      "De Marbourg": "units/u_marbourg",
+      "Sayn": "units/u_sayn",
+      "Wulfoad": "units/u_wulfoad",
+      "Campbell": "units/u_campbell",
+      "Aalongue": "units/u_aalongue",
+      "Errant": "units/u_errant",
+      "Super Errant": "units/u_errant",
+      "Ravageur": "units/u_ravageur",
+      "Super Ravageur": "units/u_ravageur",
+      "Sorcier": "units/u_sorcier",
+      "Agile": "units/u_agile",
+      "Barbare": "units/u_barbare",
+      "Voyant": "units/u_voyant",
+      "Silencieux": "units/u_silencieux",
+      "Destruction": "units/u_destruction",
+      "Parfait": "units/u_parfait",
+      // Unités déferlantes
+      // Bâtiments déferlants
+      // Derniers nés
+      // La base garde la même image en devenant Ville puis Forteresse.
+      // Exilés
+      // Vagabonds : héros et esprits
+      // Les super-esprits gardent l'image de base, avec un badge « S ».
+    };
+    const IMAGE_RADIUS = 36;
+    // Identifiant de faction envoyé par le jeu (DERNIERS_NES = 2).
+    const DERNIERS_NES = 2;
+    // Couleur des pions par faction (toujours la même, quel que soit le côté).
+    const FACTION_COLORS = {
+      0: { fill: "#23945a", stroke: "#1f5139", ink: "#061411" },  // Déferlants : vert
+      1: { fill: "#2d6cc4", stroke: "#244878", ink: "#061411" },  // Exilés : bleu
+      2: { fill: "#c62828", stroke: "#7f1d1d", ink: "#ffffff" },  // Derniers nés : rouge
+      3: { fill: "#f5f5f4", stroke: "#57534e", ink: "#1c1917" },  // Vagabonds : blanc
+    };
+
+    // ------------------------------------------------------------
+    // ZOOM ET DÉPLACEMENT DE LA VUE
+    // Boutons + et − pour zoomer, glisser = déplacer la vue.
+    // ------------------------------------------------------------
+    const MIN_ZOOM = 1;
+    const MAX_ZOOM = 4;
+    let zoom = 1;
+    let viewX = 0;
+    let viewY = 0;
+    let baseW = 0;
+    let baseH = 0;
+    try {
+      const saved = JSON.parse(sessionStorage.getItem("lw_board_view") || "null");
+      if (saved) { zoom = saved.zoom; viewX = saved.x; viewY = saved.y; }
+    } catch (error) { /* stockage indisponible : vue par défaut */ }
+
+    function clamp(value, low, high) { return Math.max(low, Math.min(high, value)); }
+
+    function applyView() {
+      if (!baseW || !baseH) return;
+      zoom = clamp(Number(zoom) || 1, MIN_ZOOM, MAX_ZOOM);
+      const w = baseW / zoom;
+      const h = baseH / zoom;
+      viewX = clamp(Number(viewX) || 0, 0, baseW - w);
+      viewY = clamp(Number(viewY) || 0, 0, baseH - h);
+      board.setAttribute("viewBox", `${viewX} ${viewY} ${w} ${h}`);
+      board.classList.toggle("zoomed", zoom > 1.001);
+      document.getElementById("zoom-level").textContent = `${Math.round(zoom * 100)} %`;
+      try { sessionStorage.setItem("lw_board_view", JSON.stringify({ zoom, x: viewX, y: viewY })); } catch (error) { /* ignoré */ }
+    }
+
+    function zoomAt(factor, fx = 0.5, fy = 0.5) {
+      const px = viewX + fx * baseW / zoom;
+      const py = viewY + fy * baseH / zoom;
+      zoom = clamp(zoom * factor, MIN_ZOOM, MAX_ZOOM);
+      viewX = px - fx * baseW / zoom;
+      viewY = py - fy * baseH / zoom;
+      applyView();
+    }
+
+    document.getElementById("zoom-in").addEventListener("click", () => zoomAt(1.25));
+    document.getElementById("zoom-out").addEventListener("click", () => zoomAt(1 / 1.25));
+    document.getElementById("zoom-reset").addEventListener("click", () => { zoom = 1; viewX = 0; viewY = 0; applyView(); });
+
+    let drag = null;
+    let suppressClick = false;
+    board.addEventListener("pointerdown", event => {
+      if (event.button !== 0 || zoom <= 1.001) return;
+      drag = { id: event.pointerId, x: event.clientX, y: event.clientY, viewX, viewY, moved: false };
+    });
+    board.addEventListener("pointermove", event => {
+      if (!drag || event.pointerId !== drag.id) return;
+      const dx = event.clientX - drag.x;
+      const dy = event.clientY - drag.y;
+      if (!drag.moved && Math.hypot(dx, dy) < 6) return;
+      if (!drag.moved) {
+        drag.moved = true;
+        board.classList.add("dragging");
+        board.setPointerCapture(event.pointerId);
+      }
+      const rect = board.getBoundingClientRect();
+      viewX = drag.viewX - dx * (baseW / zoom) / rect.width;
+      viewY = drag.viewY - dy * (baseH / zoom) / rect.height;
+      applyView();
+    });
+    function endDrag(event) {
+      if (!drag || event.pointerId !== drag.id) return;
+      if (drag.moved) {
+        // Un glisser ne doit pas être pris pour un clic sur une case.
+        suppressClick = true;
+        setTimeout(() => { suppressClick = false; }, 0);
+      }
+      board.classList.remove("dragging");
+      drag = null;
+    }
+    board.addEventListener("pointerup", endDrag);
+    board.addEventListener("pointercancel", endDrag);
+    board.addEventListener("click", event => {
+      if (suppressClick) { event.stopPropagation(); event.preventDefault(); suppressClick = false; }
+    }, true);
+
+    function sendToStreamlit(type, extra = {}) {
+      window.parent.postMessage({ isStreamlitMessage: true, type, ...extra }, "*");
+    }
+
+    function resizeFrame() {
+      sendToStreamlit("streamlit:setFrameHeight", { height: Math.ceil(wrapper.getBoundingClientRect().height) + 8 });
+    }
+
+    function svgNode(tag, attrs = {}, text = null) {
+      const node = document.createElementNS(NS, tag);
+      for (const [name, value] of Object.entries(attrs)) node.setAttribute(name, String(value));
+      if (text !== null) node.textContent = String(text);
+      return node;
+    }
+
+    function keyOf(q, r) { return `${q},${r}`; }
+    function boardRow(q, r) { return r + Math.floor(q / 2); }
+    function columnName(q) {
+      let value = q + 1;
+      let result = "";
+      while (value > 0) {
+        value -= 1;
+        result = String.fromCharCode(65 + (value % 26)) + result;
+        value = Math.floor(value / 26);
+      }
+      return result;
+    }
+    function coord(q, r) { return `${columnName(q)}${boardRow(q, r) + 1}`; }
+    function rawCenter(q, r) { return { x: 1.5 * SIZE * q, y: SQRT3 * SIZE * (r + q / 2) }; }
+    function center(q, r) { const raw = rawCenter(q, r); return { x: raw.x + offsetX, y: raw.y + offsetY }; }
+    function hexPoints(x, y, radius = SIZE) {  
+      return Array.from({ length: 6 }, (_, index) => {  
+        const angle = (60 * index) * Math.PI / 180;  
+      
+        return (  
+          `${x + radius * Math.cos(angle)},` +  
+          `${y + radius * Math.sin(angle)}`  
+        );  
+      }).join(" ");  
+    }  
+
+    // Déverrouillage de secours : si la réponse du jeu se perd
+    // (clic pendant un rechargement), le plateau ne reste jamais grisé.
+    const UNLOCK_AFTER_MS = 2500;
+    let lockedAt = 0;
+    let unlockTimer = null;
+
+    function unlockBoard() {
+      locked = false;
+      lockedAt = 0;
+      if (unlockTimer) { clearTimeout(unlockTimer); unlockTimer = null; }
+      wrapper.classList.remove("locked");
+      info.textContent = "Clique sur une case ou une pièce.";
+    }
+
+    function emitCellClick(q, r) {
+      if (!args || args.readonly) return;
+      // Verrou bloqué depuis trop longtemps : on l'ignore.
+      if (locked && Date.now() - lockedAt < UNLOCK_AFTER_MS) return;
+      locked = true;
+      lockedAt = Date.now();
+      if (unlockTimer) clearTimeout(unlockTimer);
+      unlockTimer = setTimeout(unlockBoard, UNLOCK_AFTER_MS);
+      wrapper.classList.add("locked");
+      info.textContent = "Traitement de l'action...";
+      const eventId = (window.crypto && window.crypto.randomUUID) ? window.crypto.randomUUID() : `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+      sendToStreamlit("streamlit:setComponentValue", { dataType: "json", value: { type: "cell_click", pos: [q, r], event_id: eventId } });
+    }
+
+    function addText(parent, x, y, text, size, fill = "#172033", weight = 900) {
+      parent.appendChild(svgNode("text", { x, y, "text-anchor": "middle", "dominant-baseline": "middle", "font-size": size, "font-weight": weight, fill }, text));
+    }
+
+    // ------------------------------------------------------------
+    // ILLUSTRATION DES CASES
+    // ------------------------------------------------------------
+    function el(parent, tag, attrs = {}, text = null) {
+      const node = svgNode(tag, attrs, text);
+      parent.appendChild(node);
+      return node;
+    }
+
+    // Pseudo-aléatoire stable : une case garde toujours le même dessin.
+    function rand(q, r, i) {
+      let h = (Math.imul(q + 97, 374761393) ^ Math.imul(r + 131, 668265263) ^ Math.imul(i + 7, 1274126177)) | 0;
+      h = Math.imul(h ^ (h >>> 13), 1274126177);
+      return ((h ^ (h >>> 16)) >>> 0) / 4294967295;
+    }
+
+    function linear(defs, id, stops, x2 = 0, y2 = 1) {
+      const gradient = el(defs, "linearGradient", { id, x1: 0, y1: 0, x2, y2 });
+      stops.forEach(([offset, color]) => el(gradient, "stop", { offset, "stop-color": color }));
+    }
+    function radial(defs, id, stops, cx = 0.5, cy = 0.5, r = 0.6) {
+      const gradient = el(defs, "radialGradient", { id, cx, cy, r });
+      stops.forEach(([offset, color]) => el(gradient, "stop", { offset, "stop-color": color }));
+    }
+
+    function buildDefs() {
+      const defs = el(board, "defs");
+      radial(defs, "g-plain", [[0, "#c3dc86"], [0.7, "#9dbd62"], [1, "#7fa04a"]], 0.45, 0.35, 0.75);
+      radial(defs, "g-forest", [[0, "#5e9a4c"], [1, "#2c5a2c"]], 0.45, 0.35, 0.8);
+      radial(defs, "g-mountain", [[0, "#b9ae98"], [1, "#857a68"]], 0.45, 0.3, 0.8);
+      radial(defs, "g-sea", [[0, "#6cc3e8"], [0.6, "#3d95c6"], [1, "#236e9e"]], 0.45, 0.35, 0.8);
+      radial(defs, "g-gold", [[0, "#f1d18a"], [0.65, "#d6a94e"], [1, "#a8782a"]], 0.45, 0.35, 0.8);
+      radial(defs, "g-mana", [[0, "#8a5a44"], [0.6, "#5e3a2e"], [1, "#3a211b"]], 0.45, 0.35, 0.8);
+      linear(defs, "g-peak", [[0, "#8d857a"], [1, "#5d564d"]]);
+      linear(defs, "g-peak2", [[0, "#a39a8c"], [1, "#6f675c"]]);
+      linear(defs, "g-hill", [[0, "#9c7a48"], [1, "#6d5130"]]);
+      linear(defs, "g-volcano", [[0, "#4a3029"], [1, "#2a1a16"]]);
+      radial(defs, "g-lava", [[0, "#fff1a8"], [0.45, "#ffae33"], [1, "#e8520c"]]);
+      radial(defs, "g-flask", [[0, "#ffe0a3"], [0.35, "#ffa033"], [1, "#d9480f"]], 0.38, 0.35, 0.75);
+      radial(defs, "g-glow", [[0, "#ffb347"], [1, "rgba(255,140,40,0)"]], 0.5, 0.5, 0.5);
+      radial(defs, "g-coin", [[0, "#fffbe0"], [0.3, "#ffe066"], [0.75, "#f2b705"], [1, "#c98a00"]], 0.35, 0.3, 0.85);
+      radial(defs, "g-nugget", [[0, "#fff4b0"], [0.45, "#ffd23f"], [1, "#b8860b"]], 0.35, 0.3, 0.8);
+      const clip = el(defs, "clipPath", { id: "hex-clip" });
+      el(clip, "polygon", { points: hexPoints(0, 0, SIZE - 1) });
+      // Découpe ronde des illustrations d'unités.
+      const pieceClip = el(defs, "clipPath", { id: "piece-clip", clipPathUnits: "objectBoundingBox" });
+      el(pieceClip, "circle", { cx: 0.5, cy: 0.5, r: 0.5 });
+      // Découpe carrée (coins arrondis) des bâtiments et des bases.
+      const squareClip = el(defs, "clipPath", { id: "square-clip", clipPathUnits: "objectBoundingBox" });
+      el(squareClip, "rect", { x: 0, y: 0, width: 1, height: 1, rx: 0.1, ry: 0.1 });
+      // Bande sombre à gauche : le nom vertical reste lisible.
+      linear(defs, "side-shade", [[0, "rgba(0,0,0,0.75)"], [0.3, "rgba(0,0,0,0)"]], 1, 0);
+      // Ombre en haut et en bas du médaillon : le texte blanc reste lisible.
+      linear(defs, "piece-shade", [[0, "rgba(0,0,0,0.72)"], [0.34, "rgba(0,0,0,0)"], [0.66, "rgba(0,0,0,0)"], [1, "rgba(0,0,0,0.72)"]]);
+    }
+
+    const CELL_STYLE = {
+      plain:    { fill: "url(#g-plain)",    stroke: "#5b6e3c", width: 1.5, name: "Prairie" },
+      forest:   { fill: "url(#g-forest)",   stroke: "#1f4220", width: 1.5, name: "Forêt" },
+      mountain: { fill: "url(#g-mountain)", stroke: "#4f483f", width: 2,   name: "Montagne" },
+      sea:      { fill: "url(#g-sea)",      stroke: "#1b5a82", width: 1.5, name: "Mer" },
+      gold:     { fill: "url(#g-gold)",     stroke: "#8a5a00", width: 3.5, name: "Mine d'or" },
+      mana:     { fill: "url(#g-mana)",     stroke: "#ea580c", width: 3.5, name: "Volcan de mana" },
+    };
+    function cellStyle(terrain, resource) {
+      return CELL_STYLE[resource ? resource[0] : terrain] || CELL_STYLE.plain;
+    }
+
+    function drawGrass(g, q, r, count, color = "#5d7f35") {
+      for (let i = 0; i < count; i++) {
+        const a = rand(q, r, i) * Math.PI * 2;
+        const d = 8 + rand(q, r, i + 20) * 24;
+        const x = Math.cos(a) * d, y = Math.sin(a) * d * 0.85;
+        el(g, "path", { d: `M${x - 3} ${y + 2} L${x - 1.5} ${y - 3} M${x} ${y + 2} L${x + 0.5} ${y - 4.5} M${x + 3} ${y + 2} L${x + 2} ${y - 2.5}`, stroke: color, "stroke-width": 1.2, "stroke-linecap": "round", fill: "none" });
+      }
+    }
+
+    // Prairie : couleur unie, sans décor.
+    function drawPlain() {}
+
+    function pine(g, x, y, s) {
+      el(g, "ellipse", { cx: x + 2 * s, cy: y + 13 * s, rx: 8 * s, ry: 2.5 * s, fill: "rgba(0,0,0,0.25)" });
+      el(g, "rect", { x: x - 1.6 * s, y: y + 7 * s, width: 3.2 * s, height: 6 * s, fill: "#5b3a1e" });
+      const tiers = [[7, -3, 11], [2, -9, 9], [-3, -15, 7]];
+      tiers.forEach(([base, top, half]) => {
+        el(g, "polygon", { points: `${x - half * s},${y + base * s} ${x},${y + top * s} ${x + half * s},${y + base * s}`, fill: "#1f5a2a", stroke: "#123d1b", "stroke-width": 0.8, "stroke-linejoin": "round" });
+        el(g, "polygon", { points: `${x - half * s * 0.9},${y + base * s} ${x},${y + top * s} ${x - 1 * s},${y + base * s}`, fill: "#3f8a45", opacity: 0.8 });
+      });
+    }
+
+    function drawForest(g, q, r) {
+      drawGrass(g, q, r, 4, "#224a22");
+      const flip = rand(q, r, 1) > 0.5 ? 1 : -1;
+      pine(g, -18 * flip, 0, 1.05);
+      pine(g, 16 * flip, -6, 0.95);
+      pine(g, 2, 8, 1.2);
+      pine(g, 22 * flip, 14, 0.75);
+    }
+
+    function drawMountain(g, q, r) {
+      el(g, "ellipse", { cx: 2, cy: 24, rx: 34, ry: 5, fill: "rgba(0,0,0,0.18)" });
+      // Pic arrière
+      el(g, "polygon", { points: "4,24 20,-12 38,24", fill: "url(#g-peak2)", stroke: "#4a443c", "stroke-width": 1, "stroke-linejoin": "round" });
+      el(g, "polygon", { points: "20,-12 38,24 26,24", fill: "rgba(0,0,0,0.18)" });
+      el(g, "polygon", { points: "20,-12 14,-1 18,-3 21,1 24,-3 27,-1", fill: "#f4f7fb", stroke: "#cfd8e3", "stroke-width": 0.6 });
+      // Pic principal
+      el(g, "polygon", { points: "-36,24 -8,-22 20,24", fill: "url(#g-peak)", stroke: "#3f3a33", "stroke-width": 1.2, "stroke-linejoin": "round" });
+      el(g, "polygon", { points: "-8,-22 20,24 2,24 -4,4", fill: "rgba(0,0,0,0.22)" });
+      el(g, "polygon", { points: "-8,-22 -16,-8 -12,-10 -9,-5 -5,-10 -1,-8", fill: "#ffffff", stroke: "#cfd8e3", "stroke-width": 0.6, "stroke-linejoin": "round" });
+      // Éboulis
+      [[-28, 20, 3], [24, 20, 2.5], [-18, 22, 2]].forEach(([x, y, s]) => {
+        el(g, "ellipse", { cx: x, cy: y, rx: s * 1.4, ry: s, fill: "#6d665c", stroke: "#4a443c", "stroke-width": 0.6 });
+      });
+      void q; void r;
+    }
+
+    function drawSea(g, q, r) {
+      el(g, "ellipse", { cx: -10, cy: -12, rx: 16, ry: 6, fill: "rgba(255,255,255,0.12)" });
+      for (let i = 0; i < 5; i++) {
+        const x = -26 + rand(q, r, i) * 36;
+        const y = -20 + i * 10 + rand(q, r, i + 10) * 4;
+        el(g, "path", { d: `M${x} ${y} q4 -4 8 0 t8 0`, stroke: "rgba(255,255,255,0.75)", "stroke-width": 1.6, "stroke-linecap": "round", fill: "none" });
+      }
+      for (let i = 0; i < 3; i++) {
+        el(g, "circle", { cx: -24 + rand(q, r, i + 30) * 48, cy: -20 + rand(q, r, i + 50) * 40, r: 0.9, fill: "rgba(255,255,255,0.8)" });
+      }
+    }
+
+    function sparkle(g, x, y, s, color = "#fffbe6") {
+      el(g, "path", { d: `M${x} ${y - s} L${x + s * 0.25} ${y - s * 0.25} L${x + s} ${y} L${x + s * 0.25} ${y + s * 0.25} L${x} ${y + s} L${x - s * 0.25} ${y + s * 0.25} L${x - s} ${y} L${x - s * 0.25} ${y - s * 0.25} Z`, fill: color });
+    }
+
+    function drawGoldMine(g, q, r) {
+      drawGrass(g, q, r, 2, "#8a6a2a");
+      // Colline rocheuse (partie haute : le bas de la case accueille les pièces)
+      el(g, "path", { d: "M-38 12 Q-28 -22 -2 -25 Q26 -25 38 12 Z", fill: "url(#g-hill)", stroke: "#4f3a1f", "stroke-width": 1 });
+      el(g, "path", { d: "M-2 -25 Q26 -25 38 12 L16 12 Q18 -8 -2 -25 Z", fill: "rgba(0,0,0,0.15)" });
+      // Veines d'or dans la roche
+      el(g, "path", { d: "M-27 0 l5 -3 l4 2 M20 -6 l5 2 l3 -3 M-16 -14 l4 2 M24 6 l4 -2", stroke: "#ffd23f", "stroke-width": 1.6, "stroke-linecap": "round", fill: "none" });
+      // Entrée de la mine
+      el(g, "path", { d: "M-11 12 L-11 -6 Q0 -18 11 -6 L11 12 Z", fill: "#1d120a" });
+      el(g, "rect", { x: -14, y: -8, width: 4, height: 20, rx: 1, fill: "#8b5a2b", stroke: "#4a2c12", "stroke-width": 0.8 });
+      el(g, "rect", { x: 10, y: -8, width: 4, height: 20, rx: 1, fill: "#8b5a2b", stroke: "#4a2c12", "stroke-width": 0.8 });
+      el(g, "rect", { x: -16, y: -12, width: 32, height: 5, rx: 1.5, fill: "#9a6532", stroke: "#4a2c12", "stroke-width": 0.8 });
+      el(g, "circle", { cx: 0, cy: 0, r: 5, fill: "#ffcf5a", opacity: 0.25 });
+      el(g, "circle", { cx: 0, cy: 0, r: 2.2, fill: "#ffcf5a" });
+      sparkle(g, -26, -8, 3);
+      sparkle(g, 24, -14, 2.5);
+    }
+
+    function drawFlask(g, x, y, s, glow = true) {
+      if (glow) el(g, "circle", { cx: x, cy: y, r: 11 * s, fill: "url(#g-glow)", opacity: 0.8 });
+      el(g, "rect", { x: x - 2.8 * s, y: y - 11 * s, width: 5.6 * s, height: 7 * s, fill: "#fbe3cf", stroke: "#5a1f06", "stroke-width": 0.9 });
+      el(g, "rect", { x: x - 3.6 * s, y: y - 14 * s, width: 7.2 * s, height: 3.6 * s, rx: 1, fill: "#8b5a2b", stroke: "#3a1f0a", "stroke-width": 0.8 });
+      el(g, "circle", { cx: x, cy: y + 1 * s, r: 7.5 * s, fill: "url(#g-flask)", stroke: "#5a1f06", "stroke-width": 1.2 });
+      el(g, "path", { d: `M${x - 7 * s} ${y} Q${x} ${y - 2.5 * s} ${x + 7 * s} ${y}`, stroke: "#fff1c2", "stroke-width": 0.8, fill: "none", opacity: 0.8 });
+      el(g, "ellipse", { cx: x - 3 * s, cy: y - 1.5 * s, rx: 1.6 * s, ry: 2.6 * s, fill: "#ffffff", opacity: 0.75, transform: `rotate(25 ${x - 3 * s} ${y - 1.5 * s})` });
+      el(g, "circle", { cx: x + 2 * s, cy: y + 3 * s, r: 0.9 * s, fill: "#fff4d6", opacity: 0.9 });
+      el(g, "circle", { cx: x + 3.5 * s, cy: y + 0.5 * s, r: 0.6 * s, fill: "#fff4d6", opacity: 0.9 });
+    }
+
+    function drawCoin(g, x, y, s) {
+      el(g, "ellipse", { cx: x + 1 * s, cy: y + 8 * s, rx: 7 * s, ry: 1.8 * s, fill: "rgba(0,0,0,0.35)" });
+      // Tranche puis face
+      el(g, "circle", { cx: x, cy: y + 1.2 * s, r: 8 * s, fill: "#9a6a00" });
+      el(g, "circle", { cx: x, cy: y, r: 8 * s, fill: "url(#g-coin)", stroke: "#6b4400", "stroke-width": 1.1 });
+      el(g, "circle", { cx: x, cy: y, r: 6.2 * s, fill: "none", stroke: "#b8860b", "stroke-width": 0.9 });
+      el(g, "circle", { cx: x, cy: y, r: 6.2 * s, fill: "none", stroke: "#fff3b0", "stroke-width": 0.5, "stroke-dasharray": `${0.8 * s} ${1.1 * s}`, opacity: 0.8 });
+      // Couronne en relief
+      const c = (dx, dy) => `${x + dx * s},${y + dy * s}`;
+      el(g, "polygon", { points: [c(-3.8, 2.6), c(-3.8, -2.2), c(-1.9, 0), c(0, -3.4), c(1.9, 0), c(3.8, -2.2), c(3.8, 2.6)].join(" "), fill: "#e0a100", stroke: "#7a4f00", "stroke-width": 0.6, "stroke-linejoin": "round" });
+      el(g, "line", { x1: x - 3.8 * s, y1: y + 1.4 * s, x2: x + 3.8 * s, y2: y + 1.4 * s, stroke: "#7a4f00", "stroke-width": 0.5 });
+      // Reflet
+      el(g, "path", { d: `M${x - 5.6 * s} ${y - 1 * s} A${6 * s} ${6 * s} 0 0 1 ${x - 1 * s} ${y - 5.8 * s}`, stroke: "#ffffff", "stroke-width": 1.2 * s, "stroke-linecap": "round", fill: "none", opacity: 0.75 });
+      sparkle(g, x + 5 * s, y - 5 * s, 2.2 * s, "#ffffff");
+    }
+
+    function drawManaVolcano(g) {
+      // Sol volcanique craquelé de lave
+      el(g, "path", { d: "M-36 4 l6 3 l4 -2 M28 8 l5 -3 l4 3", stroke: "#ff7a1a", "stroke-width": 1.2, "stroke-linecap": "round", fill: "none", opacity: 0.85 });
+      // Fumée
+      [[3, -24, 3.6], [9, -27, 3], [-3, -27, 2.4]].forEach(([x, y, s]) => el(g, "circle", { cx: x, cy: y, r: s, fill: "#9e9290", opacity: 0.55 }));
+      // Cône (partie haute : le bas de la case accueille les fioles)
+      el(g, "path", { d: "M-34 14 L-9 -17 Q0 -20 9 -17 L34 14 Z", fill: "url(#g-volcano)", stroke: "#1a0f0c", "stroke-width": 1.2, "stroke-linejoin": "round" });
+      el(g, "path", { d: "M-9 -17 L-34 14 L-20 14 Z", fill: "rgba(255,255,255,0.07)" });
+      // Cratère et coulées
+      el(g, "ellipse", { cx: 0, cy: -17, rx: 9, ry: 3, fill: "url(#g-lava)", stroke: "#b33a06", "stroke-width": 0.8 });
+      el(g, "path", { d: "M-4 -15 Q-7 -6 -13 0 Q-17 5 -17 11", stroke: "#ff7a1a", "stroke-width": 2.6, "stroke-linecap": "round", fill: "none" });
+      el(g, "path", { d: "M4 -15 Q6 -7 10 -1 Q14 4 19 9", stroke: "#ffa033", "stroke-width": 2, "stroke-linecap": "round", fill: "none" });
+      el(g, "path", { d: "M-4 -15 Q-7 -6 -13 0", stroke: "#ffe08a", "stroke-width": 0.9, "stroke-linecap": "round", fill: "none" });
+      [[-6, -22], [6, -21]].forEach(([x, y]) => el(g, "circle", { cx: x, cy: y, r: 1.1, fill: "#ffb347" }));
+    }
+
+    function drawTerrainArt(group, q, r, x, y, terrain, resource) {
+      const art = el(group, "g", { class: "art", transform: `translate(${x},${y})`, "clip-path": "url(#hex-clip)", "pointer-events": "none" });
+      if (resource && resource[0] === "gold") drawGoldMine(art, q, r);
+      else if (resource) drawManaVolcano(art);
+      else if (terrain === "forest") drawForest(art, q, r);
+      else if (terrain === "mountain") drawMountain(art, q, r);
+      else if (terrain === "sea") drawSea(art, q, r);
+      else drawPlain(art, q, r);
+      // Léger relief sur le bord de la case
+      el(art, "polygon", { points: hexPoints(0, 0, SIZE - 2.5), fill: "none", stroke: "rgba(255,255,255,0.22)", "stroke-width": 1.5 });
+    }
+
+    // Quantité : une pièce d'or ou une fiole par unité de ressource,
+    // alignées en bas de la case et dessinées par-dessus les pièces du jeu.
+    function drawResourceCount(group, x, y, resource) {
+      const gold = resource[0] === "gold";
+      const count = Math.max(1, Math.min(4, resource[1]));
+      const step = count === 4 ? 13 : 16;
+      const scale = count === 4 ? 0.8 : 0.95;
+      const row = el(group, "g", { class: "label" });
+      const width = (count - 1) * step + 18;
+      el(row, "rect", { x: x - width / 2, y: y + 19, width, height: 17, rx: 8.5, fill: "rgba(25,12,4,0.55)" });
+      for (let i = 0; i < count; i++) {
+        const cx = x + (i - (count - 1) / 2) * step;
+        if (gold) drawCoin(row, cx, y + 27.5, scale);
+        else drawFlask(row, cx, y + 28, scale * 0.82, false);
+      }
+    }
+
+    function drawCoord(group, x, y, text, dark) {
+      el(group, "text", { class: "coord", x, y, "text-anchor": "middle", "dominant-baseline": "middle", "font-size": 9, "font-weight": 900, fill: dark ? "#fff3e0" : "#172033", stroke: dark ? "rgba(0,0,0,0.65)" : "rgba(255,255,255,0.75)", "stroke-width": 2.5, "paint-order": "stroke" }, text);
+    }
+    function shortName(name) {
+      return { Incubateur: "INC", Habitations: "HAB", Déferlant: "DEF", "Tigre des forêts": "TIGRE", Elfe: "ELFE", Mare: "MARE", "Petite grotte": "GROTTE", "Forêt enchantée": "FORET", Kamikaze: "KAMIKZ", "Nain des montagnes": "NAIN", "Mage des montagnes": "MAGE", "Golem de pierre": "GOLEM", "Mammouth dompté": "MAMMTH", Ouvrier: "OUVR", Colonie: "COLONIE", Forteresse: "FORT", Chevalier: "CHEVAL", Catapulte: "CATAP", "Catapulte de l'enfer": "ENFER", Trébuchet: "TRÉBU", Dirigeable: "DIRIG", "Roi Théobald": "ROI", "Réserve naturelle": "RÉSERVE", "Atelier de siège": "ATELIER", "De Marbourg": "MARBRG", Wulfoad: "WULFOAD", Campbell: "CAMPBL", Aalongue: "AALONG", Errant: "ERRANT", Ravageur: "RAVAG", "Super Errant": "S.ERR", "Super Ravageur": "S.RAV", Sorcier: "SORC", Barbare: "BARB", Voyant: "VOYANT", Silencieux: "SILENC", Destruction: "DESTR", Parfait: "PARFAIT" }[name] || name.slice(0, 6).toUpperCase();
+    }
+
+    function drawPiece(group, piece, x, y) {
+      const selected = piece.id === args.selected_id || (args.selected_ids || []).includes(piece.id);
+      const colors = FACTION_COLORS[piece.faction] || FACTION_COLORS[piece.owner === 0 ? 0 : 1];
+      let fill = colors.fill;
+      let stroke = colors.stroke;
+      if (piece.dimmed) { fill = "#9ca3af"; stroke = "#6b7280"; }
+      if (selected) stroke = "#facc15";
+      const ink = piece.dimmed ? "#061411" : colors.ink;
+      const image = PIECE_IMAGES[piece.name] || null;
+      if (image) {
+        drawIllustratedPiece(group, piece, x, y, image, selected ? "#facc15" : (piece.dimmed ? "#9ca3af" : fill), selected);
+        return;
+      }
+      if (piece.hero) {
+        // Héros vagabond : grand pion rond à double anneau (il remplace une base).
+        group.appendChild(svgNode("circle", { class: "token shadow", cx: x, cy: y, r: 27, fill, stroke, "stroke-width": selected ? 5 : 3 }));
+        group.appendChild(svgNode("circle", { class: "token", cx: x, cy: y, r: 22, fill: "none", stroke: colors.stroke, "stroke-width": 1.2 }));
+        addText(group, x, y - 15, "★", 9, "#b45309");
+      } else if (piece.kind === "unit") {
+        group.appendChild(svgNode("circle", { class: "token shadow", cx: x, cy: y, r: 23, fill, stroke, "stroke-width": selected ? 5 : 3 }));
+      } else {
+        group.appendChild(svgNode("rect", { class: "token shadow", x: x - 23, y: y - 23, width: 46, height: 46, rx: 5, fill, stroke, "stroke-width": selected ? 5 : 3 }));
+        if (piece.kind === "base") baseStar(group, x + 21, y - 21);
+      }
+      addText(group, x, y - 5, shortName(piece.name), 9, ink);
+      addText(group, x, y + 8, `${piece.pf} PF` + (piece.attack_bonus ? ` ⚔+${String(piece.attack_bonus).replace(".", ",")}` : ""), 8, ink);
+      if (piece.name === "Super Errant" || piece.name === "Super Ravageur") {
+        // Super-esprit sans image : même badge « S » jaune.
+        group.appendChild(svgNode("circle", { class: "token", cx: x - 19, cy: y - 17, r: 9, fill: "#facc15", stroke: "#713f12", "stroke-width": 2 }));
+        addText(group, x - 19, y - 16.5, "S", 10, "#713f12");
+      }
+      if (piece.stack > 1) {
+        // Pile d'ouvriers sur la même case.
+        group.appendChild(svgNode("circle", { class: "token", cx: x + 19, cy: y - 17, r: 9, fill: "#facc15", stroke: "#713f12", "stroke-width": 2 }));
+        addText(group, x + 19, y - 16.5, `×${piece.stack}`, 9, "#1c1917");
+      }
+      if (piece.frozen_until_turn && piece.frozen_until_turn >= args.turn) {
+        addText(group, x, y + 19, "❄ GELÉ", 7, "#0c4a6e");
+      } else if (piece.attack_order && piece.attack_order.turn === args.turn) {
+        addText(group, x, y + 19, "⚔ A FRAPPÉ", 7, "#7f1d1d");
+      } else if (piece.wait > 0) {
+        addText(group, x, y + 19, `ATTENTE ${piece.wait}`, 7, "#061411");
+      } else if (piece.planted) {
+        addText(group, x, y + 19, "PLANTÉ", 7, "#061411");
+      } else if (piece.blocked) {
+        addText(group, x, y + 19, "BLOQUÉ", 7, "#7f1d1d");
+      } else if (piece.cargo && piece.cargo.length) {
+        addText(group, x, y + 19, `${piece.cargo.length} À BORD`, 7, "#061411");
+      }
+    }
+
+    // Étoile dorée des bases (comme les héros vagabonds).
+    function baseStar(group, sx, sy) {
+      group.appendChild(svgNode("circle", { class: "token", cx: sx, cy: sy, r: 10, fill: "#facc15", stroke: "#713f12", "stroke-width": 2 }));
+      addText(group, sx, sy + 0.5, "★", 11, "#713f12");
+    }
+
+    // Texte blanc cerné de noir : lisible sur n'importe quelle illustration.
+    function whiteText(parent, x, y, text, size) {
+      parent.appendChild(svgNode("text", { class: "label", x, y, "text-anchor": "middle", "dominant-baseline": "middle", "font-size": size, "font-weight": 900, fill: "#ffffff", stroke: "rgba(0,0,0,0.85)", "stroke-width": 3, "paint-order": "stroke" }, text));
+    }
+
+    // Nom écrit en arc de cercle, centré en haut du médaillon.
+    function arcName(group, piece, x, y, R) {
+      const r = R - 8;
+      const half = 88 * Math.PI / 180;
+      const id = `arc-${String(piece.id).replace(/[^A-Za-z0-9_-]/g, "_")}`;
+      const sx = x - r * Math.sin(half), sy = y - r * Math.cos(half);
+      const ex = x + r * Math.sin(half), ey = sy;
+      group.appendChild(svgNode("path", { id, d: `M${sx} ${sy} A${r} ${r} 0 0 1 ${ex} ${ey}`, fill: "none", stroke: "none" }));
+      const label = piece.name.toUpperCase();
+      const arcLength = r * 2 * half;
+      const size = Math.max(7, Math.min(10.5, arcLength / (0.66 * label.length)));
+      const text = svgNode("text", { class: "label", "font-size": size, "font-weight": 900, fill: "#ffffff", stroke: "rgba(0,0,0,0.85)", "stroke-width": 2.6, "paint-order": "stroke", "letter-spacing": 0.3 });
+      const attrs = { href: `#${id}`, startOffset: "50%", "text-anchor": "middle" };
+      // Nom trop long pour l'arc : on resserre les lettres pour qu'il tienne en entier.
+      if (size * 0.68 * label.length > arcLength * 0.94) {
+        attrs.textLength = (arcLength * 0.94).toFixed(1);
+        attrs.lengthAdjust = "spacingAndGlyphs";
+      }
+      const path = svgNode("textPath", attrs, label);
+      text.appendChild(path);
+      group.appendChild(text);
+    }
+
+    // Bâtiments et bases : pion carré, nom écrit verticalement à gauche.
+    function drawIllustratedBuilding(group, piece, x, y, image, ring, selected) {
+      const H = IMAGE_RADIUS - 3;
+      const corner = 2 * H * 0.1;
+      group.appendChild(svgNode("rect", { class: "token shadow", x: x - H - 2, y: y - H - 2, width: 2 * H + 4, height: 2 * H + 4, rx: corner + 2, fill: "#0b0f14" }));
+      group.appendChild(svgNode("image", {
+        class: "token",
+        href: `assets/${image}.jpg`,
+        x: x - H, y: y - H, width: 2 * H, height: 2 * H,
+        preserveAspectRatio: "xMidYMid slice",
+        "clip-path": "url(#square-clip)",
+        opacity: piece.dimmed ? 0.45 : 1,
+        "pointer-events": "none",
+      }));
+      group.appendChild(svgNode("rect", { class: "token", x: x - H, y: y - H, width: 2 * H, height: 2 * H, rx: corner, fill: "url(#side-shade)", "pointer-events": "none" }));
+      group.appendChild(svgNode("rect", { class: "token", x: x - H, y: y - H, width: 2 * H, height: 2 * H, rx: corner, fill: "url(#piece-shade)", opacity: 0.6, "pointer-events": "none" }));
+      // Cadre à la couleur du joueur (jaune si sélectionné).
+      group.appendChild(svgNode("rect", { class: "token", x: x - H, y: y - H, width: 2 * H, height: 2 * H, rx: corner, fill: "none", stroke: ring, "stroke-width": selected ? 5 : 3.5 }));
+
+      // Nom vertical, lu de bas en haut, le long du bord gauche.
+      const label = piece.name.toUpperCase();
+      const room = 2 * H - 10;
+      const size = Math.max(7, Math.min(10.5, room / (0.66 * label.length)));
+      const tx = x - H + 9;
+      const attrs = { class: "label", x: tx, y, "text-anchor": "middle", "dominant-baseline": "middle", "font-size": size, "font-weight": 900, fill: "#ffffff", stroke: "rgba(0,0,0,0.85)", "stroke-width": 2.6, "paint-order": "stroke", transform: `rotate(-90 ${tx} ${y})` };
+      if (size * 0.68 * label.length > room) {
+        attrs.textLength = room.toFixed(1);
+        attrs.lengthAdjust = "spacingAndGlyphs";
+      }
+      group.appendChild(svgNode("text", attrs, label));
+
+      if (piece.kind === "base") baseStar(group, x + H - 2, y - H + 2);
+      // Points de force en blanc, en bas.
+      whiteText(group, x + 5, y + H - 9, `${piece.pf} PF`, 12);
+      let status = null;
+      if (piece.frozen_until_turn && piece.frozen_until_turn >= args.turn) status = "❄ GELÉ";
+      else if (piece.wait > 0) status = `ATTENTE ${piece.wait}`;
+      else if (piece.blocked) status = "BLOQUÉ";
+      if (status) whiteText(group, x + 5, y + H - 21, status, 7.5);
+    }
+
+    function drawIllustratedPiece(group, piece, x, y, image, ring, selected) {
+      if (piece.kind !== "unit" && !piece.hero) return drawIllustratedBuilding(group, piece, x, y, image, ring, selected);
+      const R = IMAGE_RADIUS;
+      group.appendChild(svgNode("circle", { class: "token shadow", cx: x, cy: y, r: R + 2, fill: "#0b0f14" }));
+      group.appendChild(svgNode("image", {
+        class: "token",
+        href: `assets/${image}.jpg`,
+        x: x - R, y: y - R, width: 2 * R, height: 2 * R,
+        preserveAspectRatio: "xMidYMid slice",
+        "clip-path": "url(#piece-clip)",
+        opacity: piece.dimmed ? 0.45 : (piece.invisible ? 0.6 : 1),
+        "pointer-events": "none",
+      }));
+      group.appendChild(svgNode("circle", { class: "token", cx: x, cy: y, r: R, fill: "url(#piece-shade)", "pointer-events": "none" }));
+      // Anneau à la couleur du joueur (jaune si sélectionnée).
+      group.appendChild(svgNode("circle", { class: "token", cx: x, cy: y, r: R, fill: "none", stroke: ring, "stroke-width": selected ? 5 : 3.5 }));
+      arcName(group, piece, x, y, R);
+      if (piece.name === "Super Errant" || piece.name === "Super Ravageur") {
+        // Super-esprit : « S » dans un rond jaune, à gauche du médaillon.
+        const sx = x - R * 0.92, sy = y + 2;
+        group.appendChild(svgNode("circle", { class: "token", cx: sx, cy: sy, r: 11, fill: "#facc15", stroke: "#713f12", "stroke-width": 2 }));
+        addText(group, sx, sy + 1, "S", 13, "#713f12");
+      }
+      if (piece.hero) {
+        // Héros vagabond : étoile dorée à gauche du médaillon.
+        const sx = x - R * 0.92, sy = y + 2;
+        group.appendChild(svgNode("circle", { class: "token", cx: sx, cy: sy, r: 10, fill: "#facc15", stroke: "#713f12", "stroke-width": 2 }));
+        addText(group, sx, sy + 0.5, "★", 11, "#713f12");
+      }
+      if (piece.stack > 1) {
+        // Pile d'ouvriers sur la même case d'or ou de mana.
+        const bx = x + R * 0.92, by = y + 2;
+        group.appendChild(svgNode("circle", { class: "token", cx: bx, cy: by, r: 11, fill: "#facc15", stroke: "#713f12", "stroke-width": 2.2 }));
+        addText(group, bx, by + 0.5, `×${piece.stack}`, 11, "#1c1917");
+      }
+      // Points de force en blanc.
+      whiteText(group, x, y + R - 10, `${piece.pf} PF`, 12);
+      if (piece.attack_bonus) {
+        // Bonus d'attaque (ex. Marteau foudroyant), compté seulement quand l'unité attaque.
+        whiteText(group, x, y + R - 22, `⚔ +${String(piece.attack_bonus).replace(".", ",")} ATT`, 8);
+      }
+      let status = null;
+      if (piece.frozen_until_turn && piece.frozen_until_turn >= args.turn) status = "❄ GELÉ";
+      else if (piece.invisible && !piece.planted) status = "👻 INVISIBLE";
+      else if (piece.wait > 0) status = `ATTENTE ${piece.wait}`;
+      else if (piece.planted) status = "PLANTÉ";
+      else if (piece.blocked) status = "BLOQUÉ";
+      else if (piece.cargo && piece.cargo.length) status = `${piece.cargo.length} À BORD`;
+      if (status) whiteText(group, x, y + R - (piece.attack_bonus ? 32 : 22), status, 7.5);
+    }
+
+    // Fait glisser la pièce le long de son chemin, case par case, en accéléré.
+    function animateLastMove() {
+      const move = args.last_move;
+      if (!move || !move.seq || animatedMoves.has(move.seq)) return;
+      animatedMoves.add(move.seq);
+      try { sessionStorage.setItem("lw_animated_moves", JSON.stringify([...animatedMoves].slice(-40))); } catch (error) { /* ignoré */ }
+      const layer = pieceGroups[move.unit_id];
+      const route = move.route || [];
+      if (!layer || route.length < 2) return;
+      const end = center(route[route.length - 1][0], route[route.length - 1][1]);
+      const points = route.map(([q, r]) => { const c = center(q, r); return { x: c.x - end.x, y: c.y - end.y }; });
+      board.appendChild(layer);  // au-dessus des autres cases pendant le trajet
+      const total = (points.length - 1) * STEP_MS;
+      const startTime = Date.now();
+      layer.setAttribute("transform", `translate(${points[0].x},${points[0].y})`);
+      function frame() {
+        const t = Math.min(1, (Date.now() - startTime) / total);
+        const pos = t * (points.length - 1);
+        const i = Math.min(points.length - 2, Math.floor(pos));
+        const f = pos - i;
+        const ease = f < 0.5 ? 2 * f * f : 1 - Math.pow(-2 * f + 2, 2) / 2;
+        const x = points[i].x + (points[i + 1].x - points[i].x) * ease;
+        const y = points[i].y + (points[i + 1].y - points[i].y) * ease;
+        layer.setAttribute("transform", `translate(${x},${y})`);
+        if (t < 1) setTimeout(frame, 16);
+        else layer.removeAttribute("transform");
+      }
+      setTimeout(frame, 16);
+    }
+
+    function render(newArgs) {
+      const previousScrollLeft = wrapper.scrollLeft;
+      const previousScrollTop = wrapper.scrollTop;
+      if (newArgs.revision !== renderedRevision) {
+        locked = false;
+        lockedAt = 0;
+        if (unlockTimer) { clearTimeout(unlockTimer); unlockTimer = null; }
+        renderedRevision = newArgs.revision;
+      }
+      args = newArgs;
+      wrapper.classList.toggle("locked", locked);
+      wrapper.classList.toggle("readonly", Boolean(args.readonly));
+      board.replaceChildren();
+      pieceGroups = {};
+      buildDefs();
+
+      const rawCenters = args.cells.map(([q, r]) => rawCenter(q, r));
+      let minX = Math.min(...rawCenters.map(point => point.x - SIZE));
+      let minY = Math.min(...rawCenters.map(point => point.y - SQRT3 * SIZE / 2));
+      let maxX = Math.max(...rawCenters.map(point => point.x + SIZE));
+      let maxY = Math.max(...rawCenters.map(point => point.y + SQRT3 * SIZE / 2));
+      const withImage = useBackground();
+      wrapper.classList.toggle("illustrated", withImage);
+      if (withImage) {
+        // Le cadre suit l'image : A1 (0,0) tombe sur son centre dans l'image.
+        const k = SIZE / BACKGROUND.radius;
+        minX = Math.min(minX, -BACKGROUND.a1x * k);
+        minY = Math.min(minY, -BACKGROUND.a1y * k);
+        maxX = Math.max(maxX, (BACKGROUND.width - BACKGROUND.a1x) * k);
+        maxY = Math.max(maxY, (BACKGROUND.height - BACKGROUND.a1y) * k);
+        offsetX = -minX;
+        offsetY = -minY;
+        baseW = maxX - minX;
+        baseH = maxY - minY;
+        backgroundNode.setAttribute("x", offsetX - BACKGROUND.a1x * k);
+        backgroundNode.setAttribute("y", offsetY - BACKGROUND.a1y * k);
+        backgroundNode.setAttribute("width", BACKGROUND.width * k);
+        backgroundNode.setAttribute("height", BACKGROUND.height * k);
+        board.appendChild(backgroundNode);
+      } else {
+        offsetX = MARGIN - minX;
+        offsetY = MARGIN - minY;
+        baseW = maxX - minX + 2 * MARGIN;
+        baseH = maxY - minY + 2 * MARGIN;
+      }
+      applyView();
+
+      const occupants = new Map(args.entities.map(piece => [keyOf(piece.pos[0], piece.pos[1]), piece]));
+      const HERO_INITIALS = { "De Marbourg": "M", Sayn: "S", Wulfoad: "W", Campbell: "C", Aalongue: "A" };
+      const markers = new Map();
+      args.entities.forEach(piece => {
+        if (!piece.hero || !piece.marker) return;
+        const markKey = keyOf(piece.marker[0], piece.marker[1]);
+        if (!markers.has(markKey)) markers.set(markKey, []);
+        markers.get(markKey).push(HERO_INITIALS[piece.name] || "H");
+      });
+      const destinations = args.destinations || {};
+      const targets = args.targets || {};
+      const attackZone = new Set(args.attack_zone || []);  
+      const placements = new Set(args.placements || []);
+
+      for (const [q, r] of args.cells) {
+        const cellKey = keyOf(q, r);
+        const { x, y } = center(q, r);
+        const terrain = args.terrain[cellKey] || "plain";
+        const resource = args.resources[cellKey];
+        const piece = occupants.get(cellKey);
+        const reachable = Object.prototype.hasOwnProperty.call(destinations, cellKey);
+        const target = Object.prototype.hasOwnProperty.call(targets, cellKey);
+        const inAttackRange = attackZone.has(cellKey);  
+        const placed = placements.has(cellKey);
+        const group = svgNode("g", { class: `cell${reachable ? " reachable" : ""}`, tabindex: args.readonly ? -1 : 0, role: args.readonly ? "img" : "button" });
+        const style = cellStyle(terrain, resource);
+        if (withImage) {
+          // Case invisible mais cliquable : le décor vient de l'image.
+          group.appendChild(svgNode("polygon", { class: "ground", points: hexPoints(x, y), fill: "rgba(255,255,255,0)", stroke: "none" }));
+        } else {
+          group.appendChild(svgNode("polygon", { class: "ground", points: hexPoints(x, y), fill: style.fill, stroke: style.stroke, "stroke-width": style.width }));
+          drawTerrainArt(group, q, r, x, y, terrain, resource);
+        }
+// 1. Déplacement ou placement : remplissage.  
+if (reachable || placed) {  
+  group.appendChild(svgNode("polygon", {  
+    class: "highlight",  
+    points: hexPoints(x, y),  
+    fill: placed ? "#facc15" : "#22c55e",  
+    "fill-opacity": 0.30,  
+    stroke: placed ? "#a16207" : "#15803d",  
+    "stroke-width": 3  
+  }));  
+}  
+  
+  // 2. Portée : contour intérieur orange, sans remplissage.  
+  // Une case peut être à la fois verte et entourée d'orange.  
+  if (inAttackRange) {  
+    group.appendChild(svgNode("polygon", {  
+      class: "highlight",  
+      points: hexPoints(x, y, SIZE - 7),  
+      fill: "none",  
+      stroke: "#ea580c",  
+      "stroke-width": 3,  
+      "stroke-dasharray": "6 4",  
+      "stroke-linejoin": "round"  
+    }));  
+  }  
+    
+  // 3. Véritable cible attaquable : contour rouge prioritaire.  
+  if (target) {  
+    group.appendChild(svgNode("polygon", {  
+      class: "highlight",  
+      points: hexPoints(x, y, SIZE - 3),  
+      fill: "#ef4444",  
+      "fill-opacity": 0.16,  
+      stroke: "#b91c1c",  
+      "stroke-width": 5,  
+      "stroke-linejoin": "round"  
+    }));  
+  }  
+        // Sur l'image, la coordonnée n'apparaît qu'au survol (voir CSS).
+        drawCoord(group, x, y - 31, coord(q, r), withImage || Boolean(resource && resource[0] === "mana") || terrain === "forest" || terrain === "sea");
+        if (piece) {
+          // Chaque pièce dans son propre groupe : il peut être animé.
+          const pieceGroup = svgNode("g", { class: "piece-layer", "pointer-events": "none" });
+          drawPiece(pieceGroup, piece, x, y);
+          group.appendChild(pieceGroup);
+          pieceGroups[piece.id] = pieceGroup;
+        }
+        // Marqueurs de récolte des héros vagabonds (dernière ressource traversée).
+        const heroMarks = markers.get(cellKey);
+        if (heroMarks) {
+          heroMarks.forEach((mark, index) => {
+            const mx = x - 24 + index * 13, my = y + 22;
+            group.appendChild(svgNode("polygon", { class: "token", points: `${mx},${my - 7} ${mx + 6},${my} ${mx},${my + 7} ${mx - 6},${my}`, fill: "#f5f5f4", stroke: "#1c1917", "stroke-width": 1.5 }));
+            addText(group, mx, my + 0.5, mark, 7, "#1c1917");
+          });
+        }
+        // Sur l'image, l'or et le mana sont déjà dessinés.
+        if (resource && !withImage) drawResourceCount(group, x, y, resource);
+        group.addEventListener("click", () => emitCellClick(q, r));
+        group.addEventListener("keydown", event => { if (event.key === "Enter" || event.key === " ") { event.preventDefault(); emitCellClick(q, r); } });
+       group.addEventListener("mouseenter", () => {  
+  const details = [coord(q, r), style.name];
+
+  if (resource) {
+    details.push(
+      `${resource[0] === "gold" ? "Or" : "Mana"} x${resource[1]}`
+    );
+  }
+  if (piece) {
+    details.push(piece.name);
+  }
+  
+  if (reachable) {  
+    if (piece || args.attack_zone !== undefined) {  
+      const cost = destinations[cellKey];  
+  
+      details.push(  
+        cost > 0  
+          ? `Déplacement : ${cost} point(s)`  
+          : "Placement possible"  
+      );  
+    }  
+  }  
+  
+  if (inAttackRange) {  
+    details.push("Dans la portée d’attaque");  
+  }  
+  
+  if (target) {  
+    details.push(  
+      targets[cellKey].spell  
+        ? "Cible de sort possible"  
+        : "Cible attaquable"  
+    );  
+  }  
+  
+  info.textContent = details.join(" — ");  
+});
+        group.addEventListener("mouseleave", () => { info.textContent = "Clique sur une case ou une pièce."; });
+        board.appendChild(group);
+      }
+      const startCenter = center(0, 16); // A17
+      const endCenter = center(24, -12); // Y1
+      // L'image contient déjà sa propre ligne en pointillés.
+      if (!withImage) board.appendChild(svgNode("line", {
+        x1: startCenter.x,
+        y1: startCenter.y,
+        x2: endCenter.x,
+        y2: endCenter.y,
+        stroke: "#000000",
+        "stroke-width": 4,
+        "stroke-dasharray": "10 8",
+        "stroke-linecap": "round",
+        "pointer-events": "none",
+      }));
+      animateLastMove();
+      wrapper.scrollLeft = previousScrollLeft;
+      wrapper.scrollTop = previousScrollTop;
+      requestAnimationFrame(resizeFrame);
+    }
+
+    window.addEventListener("message", event => {
+      if (event.source !== window.parent) return;
+      const message = event.data;
+      if (message && message.type === "streamlit:render" && message.args) render(message.args);
+    });
+    window.addEventListener("resize", resizeFrame);
+    if ("ResizeObserver" in window) new ResizeObserver(resizeFrame).observe(wrapper);
+    sendToStreamlit("streamlit:componentReady", { apiVersion: 1 });
+    resizeFrame();
+  </script>
+</body>
+</html>
