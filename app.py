@@ -10252,6 +10252,7 @@ LOGO_FULL = Path(__file__).resolve().parent / "assets" / "logo.jpg"
 LOGO_BANNER = Path(__file__).resolve().parent / "assets" / "logo_bandeau.jpg"
 HOME_BATTLE = Path(__file__).resolve().parent / "assets" / "accueil.jpg"
 LOGO_HOME = Path(__file__).resolve().parent / "assets" / "logo_sans_texte.jpg"
+LOGO_TITLE = Path(__file__).resolve().parent / "assets" / "logo_titre.jpg"
 
 
 @st.cache_data
@@ -10270,28 +10271,18 @@ def render_logo_header(home):
         return
 
     if home:
-        # Menu principal : titre centré, puis le champ de bataille
-        # avec « Last War » écrit en jaune doré par-dessus.
-        battle = image_base64(str(HOME_BATTLE))
-        background = (
-            f"url('data:image/jpeg;base64,{battle}') center 40% / cover no-repeat"
-            if battle else "#16110d"
-        )
+        # Menu principal : titre centré, puis « Last War » et ses deux épées
+        # dorées sur fond brun.
+        title = image_base64(str(LOGO_TITLE)) or data
         st.markdown(
             f"""
-            <style>@import url('https://fonts.googleapis.com/css2?family=Pirata+One&display=swap');</style>
             <h1 style="text-align:center; margin:0 0 .8rem;">Menu principal</h1>
-            <div style="position:relative; width:100%; max-width:1100px; margin:0 auto 1rem;
-                        aspect-ratio:16 / 9; border-radius:16px; overflow:hidden;
-                        background:{background}; box-shadow:0 12px 34px #00000066;">
-              <div style="position:absolute; inset:0;
-                          background:linear-gradient(180deg, #00000099 0%, #00000033 40%, #00000000 65%);"></div>
-              <div style="position:absolute; top:7%; left:0; right:0; text-align:center;
-                          font-family:'Pirata One', 'UnifrakturCook', 'Old English Text MT', Georgia, serif;
-                          font-size:clamp(48px, 9vw, 132px); line-height:1; letter-spacing:2px;
-                          color:#f5c542;
-                          text-shadow:0 2px 0 #8a5a00, 0 4px 0 #5c3b00, 0 8px 24px #000000cc, 0 0 2px #000;">
-                Last War
+            <div style="display:flex; justify-content:center; margin:0 0 1.2rem;">
+              <div style="background:#18120e; border:1px solid #b8913f; border-radius:16px;
+                          padding:14px 28px; width:100%; max-width:760px;
+                          box-shadow:0 12px 34px #00000059, inset 0 0 0 4px #18120e, inset 0 0 0 5px #b8913f55;">
+                <img src="data:image/jpeg;base64,{title}" alt="Last War"
+                     style="width:100%; display:block; border-radius:8px;">
               </div>
             </div>
             """,
