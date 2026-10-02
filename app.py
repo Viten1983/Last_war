@@ -14333,12 +14333,12 @@ AI_PARAMS = {
         # Jeu simple mais jamais au hasard : unités les moins chères, pas
         # d'améliorations (sauf celles indispensables aux Vagabonds), marche
         # vers l'ennemi le plus proche, prend la première attaque gagnante.
-        "spend": 0.75, "save_for_age": False, "age_from": {2: 5, 3: 9},
+        "spend": 0.75, "save_for_age": False, "age_from": {2: 7, 3: 11},
         "building_goal": 1, "fast_build_at": None, "eco_colonies": False,
         "upgrade_min": 99999, "decisive_upgrades": False, "unit_rule": "cheap",
         "advance": 10.0, "danger": 0.0, "threat_turns": 0, "defend": 0.0,
         "groups": False, "replies": 0, "top": 0, "base_bonus": 1500.0,
-        "front": False, "chase": True, "first_attack": True,
+        "front": False, "chase": True, "first_attack": True, "tier_buildings": False,
     },
     "intermediaire": {
         "spend": 0.90, "save_for_age": True, "age_from": {2: 4, 3: 7},
@@ -15107,25 +15107,52 @@ def ai_wanted_buildings(g, me, P, goal=None, want_mana=False):
             e["owner"] == me and e["name"] == name for e in g["entities"]
         ):
             wanted.append(name)
-    def mana_use(data):
-        return max((UNITS[n]["mana"] for n in data["units"] if n in UNITS and n not in AI_WEAK_UNITS), default=0)
+    def buildable(data):
+        """Unités que ce bâtiment peut produire maintenant."""
+        return [
+            n for n in data["units"]
+            if n in UNITS and n != WORKER
+            and UNIT_AGES.get(n, 1) <= age
+            and UNIT_MAX_AGES.get(n, 9) >= age
+            and unit_requirement_met(g, me, n)
+        ]
 
-    producers = sorted(
-        (
-            (name, data) for name, data in faction["buildings"].items()
-            if data.get("units") and building_is_available(g, me, name)
-        ),
-        # Mana en trop : d'abord les bâtiments dont les unités en consomment.
-        key=lambda item: (
-            -(mana_use(item[1]) if want_mana else 0),
-            -BUILDING_AGES.get((faction_id(g, me), item[0]), 1),
+    def grade(item):
+        """(âge des unités produites, force, mana consommé) du bâtiment."""
+        names = buildable(item[1])
+        if not names:
+            return (0, 0.0, 0)
+        return (
+            max(UNIT_AGES.get(n, 1) for n in names),
+            max(UNITS[n]["pf"] * (1.3 if UNITS[n]["range"] else 1.0) for n in names),
+            max(UNITS[n]["mana"] for n in names if n not in AI_WEAK_UNITS) if any(
+                n not in AI_WEAK_UNITS for n in names
+            ) else 0,
+        )
+
+    available = [
+        (name, data) for name, data in faction["buildings"].items()
+        if data.get("units") and building_is_available(g, me, name)
+    ]
+    if P.get("tier_buildings", True):
+        producers = sorted(available, key=lambda item: (
+            # Mana en trop : d'abord les bâtiments dont les unités en consomment.
+            -(grade(item)[2] if want_mana else 0),
+            -grade(item)[0],          # unités de l'âge le plus élevé
+            -grade(item)[1],          # puis les plus fortes
             item[0],
-        ),
-    )
+        ))
+    else:
+        # Débutant : le moins cher d'abord, sans réfléchir à l'âge.
+        producers = sorted(available, key=lambda item: (item[1]["cost"], item[0]))
     goal = goal or P["building_goal"]
     for name, data in producers:
         count = sum(e["owner"] == me and e["name"] == name for e in g["entities"])
         target = data["limit"] if goal == "limit" else min(data["limit"], goal)
+        tier = grade((name, data))[0]
+        if tier and tier < age and P.get("tier_buildings", True):
+            # Bâtiment dépassé (ses unités sont d'un âge inférieur) : peu d'exemplaires.
+            target = min(target, 2)
         if count < target:
             wanted.append(name)
     return list(dict.fromkeys(wanted))
@@ -15171,12 +15198,24 @@ def ai_build_positions(g, me, source, name, P):
     return cells[:6]
 
 
-def ai_try_build(g, me, name, P, floors, accelerated=False):
+AI_BUILDS_PER_TURN = 2   # chantiers par tour (hors colonies)
+AI_KEEP_FOR_UNITS = 400  # or gardé pour recruter après un chantier
+
+
+def ai_try_build(g, me, name, P, floors, accelerated=False, keep=0):
+    # Caisse pleine : un chantier de plus (l'or doit servir à quelque chose).
+    limit = AI_BUILDS_PER_TURN + (1 if ai_gold(g, me) - floors[0] >= 1500 else 0)
+    if g.get("_ai_builds", 0) >= limit:
+        return None
     for source in ai_build_sources(g, me):
         for pos in ai_build_positions(g, me, source, name, P):
             new = ai_try(g, build, me, source["id"], name, pos, accelerated)
-            if new is not None and ai_within(new, me, floors):
-                return new
+            if new is None or not ai_within(new, me, floors):
+                continue
+            if keep and ai_gold(new, me) < floors[0] + keep:
+                continue  # il doit rester de quoi produire des unités
+            new["_ai_builds"] = new.get("_ai_builds", 0) + 1
+            return new
     return None
 
 
@@ -15185,11 +15224,57 @@ def ai_step_buildings(g, me, P, floors, want_mana, accelerated=False):
     for name in ai_wanted_buildings(g, me, P, goal="limit" if accelerated else None, want_mana=want_mana):
         new = None
         if accelerated or rich:
-            new = ai_try_build(g, me, name, P, floors, accelerated=True)
+            new = ai_try_build(g, me, name, P, floors, accelerated=True, keep=AI_KEEP_FOR_UNITS)
         if new is None and not accelerated:
-            new = ai_try_build(g, me, name, P, floors)
+            new = ai_try_build(g, me, name, P, floors, keep=AI_KEEP_FOR_UNITS)
         if new is not None:
             g = new
+    return g
+
+
+def ai_step_key_buildings(g, me, P, floors, want_mana):
+    """Un chantier clé par tour, avant le recrutement : un bâtiment qui produit
+    les unités de l'âge atteint (ou qui consomme le mana qui s'accumule).
+    Sinon l'or part en unités et ces bâtiments ne sortent jamais de terre."""
+    if ai_level_name(P) == "debutant" or g.get("_ai_key_builds", 0) >= 1:
+        return g
+    faction = faction_of(g, me)
+    age = g["players"][me]["age"]
+    spare = ai_mana(g, me) - floors[1]
+
+    def units_now(name):
+        return [
+            n for n in faction["buildings"].get(name, {}).get("units", ())
+            if n in UNITS and n != WORKER and UNIT_AGES.get(n, 1) <= age
+            and UNIT_MAX_AGES.get(n, 9) >= age and unit_requirement_met(g, me, n)
+        ]
+
+    # Mana que ses bâtiments peuvent déjà consommer en un tour.
+    capacity = 0
+    for producer in ai_producers(g, me):
+        costs = [
+            UNITS[n]["mana"] for n in ai_recruit_options(g, me, producer)
+            if UNITS[n]["mana"] and n not in AI_WEAK_UNITS
+        ]
+        if costs:
+            capacity += max(costs)
+    mana_short = want_mana and spare >= 2 and capacity < spare
+
+    for name in ai_wanted_buildings(g, me, P, goal="limit", want_mana=mana_short):
+        names = units_now(name)
+        if not names:
+            continue
+        tier = max(UNIT_AGES.get(n, 1) for n in names)
+        uses_mana = any(UNITS[n]["mana"] and n not in AI_WEAK_UNITS for n in names)
+        # Bâtiment du meilleur âge, ou capable d'écouler le mana en trop.
+        if tier < age and not (mana_short and uses_mana):
+            continue
+        new = ai_try_build(g, me, name, P, floors, accelerated=True, keep=800)
+        if new is None:
+            new = ai_try_build(g, me, name, P, floors, keep=AI_KEEP_FOR_UNITS)
+        if new is not None:
+            new["_ai_key_builds"] = new.get("_ai_key_builds", 0) + 1
+            return new
     return g
 
 
@@ -15239,10 +15324,13 @@ def ai_colony_positions(g, me, source):
     if source["name"] == WORKER:
         cells = worker_build_slots(g, source, faction_of(g, me)["base"])
     else:
-        cells = ai_free_cells_near(g, tuple(source["pos"]), 2, 6)
+        # Jusqu'à 8 cases de la base : les ressources éloignées comptent aussi.
+        cells = ai_free_cells_near(g, tuple(source["pos"]), 2, 8)
     cells = [
         p for p in cells
-        if ai_colony_value(g, p) and min((distance(p, b) for b in bases), default=9) >= 2
+        if ai_colony_value(g, p) >= AI_COLONY_MIN_VALUE
+        and min((distance(p, b) for b in bases), default=9) >= 2
+        and all(distance(p, q) > 3 for q in (tuple(e["pos"]) for e in ai_enemy_pieces(g, me) if e["kind"] == "base"))
     ]
     cells.sort(key=lambda p: (-ai_colony_value(g, p), -distance(p, enemy), p))
     return cells[:6]
@@ -15305,12 +15393,33 @@ def ai_dn_colony(g, me, floors):
     return g
 
 
+AI_COLONY_MIN_VALUE = 2
+
+
+def ai_colonies_allowed(g, me, P):
+    """Colonies fondées par tour : 2 en début de partie, 1 ensuite."""
+    if ai_level_name(P) == "debutant":
+        return 1
+    return 2 if g["turn"] <= 6 else 1
+
+
 def ai_step_colony(g, me, P, floors, want_mana):
-    if not P["eco_colonies"] and ai_has_mana_base(g, me):
+    if not P["eco_colonies"]:
+        # Débutant : il ne s'étend pas pour l'économie, juste de quoi
+        # atteindre le mana (nécessaire à l'âge III).
+        bases = sum(e["owner"] == me and e["kind"] == "base" for e in g["entities"])
+        if ai_has_mana_base(g, me) or bases >= 5:
+            return g
+    built = g.get("_ai_colonies", 0)
+    if built >= ai_colonies_allowed(g, me, P):
         return g
     if faction_id(g, me) == DERNIERS_NES:
-        return ai_dn_colony(g, me, floors)
-    return ai_try_colony(g, me, floors)
+        new = ai_dn_colony(g, me, floors)
+    else:
+        new = ai_try_colony(g, me, floors)
+    if new is not g:
+        new["_ai_colonies"] = built + 1
+    return new
 
 
 def ai_step_workers(g, me, P, floors, want_mana):
@@ -15651,7 +15760,7 @@ def ai_level_name(P):
 def ai_age_from(g, me, P):
     """Tour à partir duquel l'âge suivant est visé."""
     age = g["players"][me]["age"]
-    turn = P["age_from"][age + 1]
+    turn = P["age_from"].get(age + 1, 99)
     if is_vagabond(g, me) and age == 1:
         # Les Vagabonds grandissent vite : âge II au plus tard au tour 3.
         turn = min(turn, AI_VAGABOND_AGE_II[ai_level_name(P)])
@@ -15740,6 +15849,9 @@ def ai_production(draft, me, level):
     """Production complète de l'IA dans son brouillon privé."""
     P = ai_params(level)
     g = draft
+    g["_ai_colonies"] = 0
+    g["_ai_key_builds"] = 0
+    g["_ai_builds"] = 0
     start_gold, start_mana = ai_gold(g, me), ai_mana(g, me)
 
     g = ai_move_workers(g, me)
@@ -15771,8 +15883,12 @@ def ai_production(draft, me, level):
     goal_gold = max(floors[0], (1 - P["spend"]) * start_gold)
     goal_mana = max(floors[1], (1 - P["spend"]) * start_mana)
     steps = (
-        ai_step_recruit, ai_step_workers, ai_step_buildings, ai_step_upgrades,
-        ai_step_colony, ai_step_fusions, ai_step_fast_buildings,
+        # Une colonie sur l'or ou le mana (elle paie la suite), de quoi dépenser
+        # le mana, puis toute la production militaire.
+        # Un chantier clé et une colonie (ils paient la suite), puis toute
+        # la production militaire avec le reste.
+        ai_step_key_buildings, ai_step_colony, ai_step_recruit, ai_step_workers,
+        ai_step_buildings, ai_step_upgrades, ai_step_fusions, ai_step_fast_buildings,
     )
     for _ in range(8):
         progress = False
@@ -15786,6 +15902,9 @@ def ai_production(draft, me, level):
                 g, progress = new, True
         if not progress:
             break
+    g.pop("_ai_colonies", None)
+    g.pop("_ai_key_builds", None)
+    g.pop("_ai_builds", None)
     return g
 
 
@@ -16275,16 +16394,20 @@ def ai_turn_marks_view(bundle):
     marks = st.session_state.get("ai_turn_marks")
     if config is None or not marks:
         return None
+    g = bundle["game"]
     start = marks["start"]
-    moved, new = {}, []
-    for e in bundle["game"]["entities"]:
-        if e["owner"] != config["seat"]:
-            continue
-        before = start.get(str(e["id"]))
-        if before is None:
-            new.append(e["id"])
-        elif list(before) != list(e["pos"]):
-            moved[str(e["id"])] = list(before)
+    # Pièces apparues ce tour (recrutées, construites, fusionnées).
+    new = [
+        e["id"] for e in g["entities"]
+        if e["owner"] == config["seat"] and str(e["id"]) not in start
+    ]
+    # Un seul déplacement en relief : le dernier joué sur le plateau.
+    moved = {}
+    last = g.get("last_move") or {}
+    route = last.get("route") or []
+    unit = next((e for e in g["entities"] if e["id"] == last.get("unit_id")), None)
+    if unit is not None and len(route) >= 2 and list(unit["pos"]) != list(route[0]):
+        moved[str(unit["id"])] = list(route[0])
     return {"moved": moved, "new": new} if moved or new else None
 
 
@@ -16329,8 +16452,8 @@ def render_board(g, view, readonly=False):
         marks = ai_turn_marks_view(bundle)
         if marks:
             st.caption(
-                "🤖 Ce tour, l'IA : 🟠 a déplacé (flèche depuis le départ) · "
-                "🟢 a recruté · 🟡 a construit (bâtiment, base ou héros)."
+                "🤖 Ce tour : 🟠 dernier déplacement (flèche depuis la case de départ) · "
+                "🟢 unités recrutées par l'IA · 🟡 bâtiments, bases ou héros construits."
             )
     st.session_state["_lw_ai_marks"] = marks
     return _lw_marks_previous_render_board(g, view, readonly)
