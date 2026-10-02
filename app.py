@@ -8400,7 +8400,7 @@ def worker_count(g, owner):
 
 def worker_destinations(g, worker):
     # Bloqué tant que sa construction n'est pas finie.
-    if worker["wait"] or worker.get("worker_moved_turn") == g["turn"]:
+    if worker["wait"] or remaining_actions(g, worker) <= 0:
         return {}
 
     costs, _ = paths(g, worker)
@@ -8424,14 +8424,16 @@ def move_worker(g, owner, unit_id, destination):
             f"Cet ouvrier construit encore : bloqué pendant "
             f"{worker['wait']} fin(s) de tour."
         )
-    if worker.get("worker_moved_turn") == g["turn"]:
-        raise ValueError("Cet ouvrier s'est déjà déplacé ce tour.")
-    if destination not in worker_destinations(g, worker):
-        raise ValueError("Destination inaccessible ou occupée (5 cases maximum).")
+    options = worker_destinations(g, worker)
+    if destination not in options:
+        raise ValueError("Destination inaccessible ou occupée.")
 
     origin = coord(worker["pos"])
     worker["pos"] = list(destination)
     worker["worker_moved_turn"] = g["turn"]
+    # Déplacement en plusieurs fois : on décompte seulement ce qui a été utilisé.
+    worker["movement_spent"] = movement_spent(g, worker) + options[destination]
+    worker["movement_spent_turn"] = g["turn"]
     log(g, f"Ouvrier #{worker['id']} : {origin} → {coord(destination)}.")
 
 
@@ -9129,7 +9131,7 @@ def render_worker_controls(view, worker, prefix):
         )
         return
 
-    moved = worker.get("worker_moved_turn") == view["turn"]
+    moved = remaining_actions(view, worker) <= 0
     plan_mode = st.session_state.ui_plan_mode
     positions = [tuple(p) for p in st.session_state.ui_plan_positions]
 
@@ -9139,9 +9141,11 @@ def render_worker_controls(view, worker, prefix):
         if positions:
             st.write(f"Destination : **{coord(positions[0])}**")
             if auto_confirm("worker_move", worker["id"], positions[0]):
+                # Après le déplacement, l'ouvrier reste sélectionné pour continuer.
+                st.session_state["_resume_plan"] = {"id": worker["id"], "mode": "worker_move", "name": WORKER}
                 perform(draft_action, move_worker, worker["id"], positions[0])
         else:
-            st.info("Clique sur une case verte (5 cases maximum).")
+            st.info(f"Clique sur une case verte ({remaining_actions(view, worker)} déplacement(s) restant(s)).")
         if st.button("✕ Annuler", key=f"{prefix}_worker_move_cancel_{worker['id']}"):
             clear_placement()
             bump_ui()
@@ -10692,7 +10696,8 @@ def can_move(g, unit):
 def hero_paths(g, hero):
     """Déplacement du héros : traverse ses unités, pas les ennemis ni les bâtiments."""
     start = tuple(hero["pos"])
-    budget = hero_stats(g, hero)[1]
+    # Déplacements restants ce tour (on peut bouger en plusieurs fois).
+    budget = hero_stats(g, hero)[1] - hero_spent(g, hero)
     occupants = {tuple(e["pos"]): e for e in g["entities"]}
     costs, routes, queue = {start: 0}, {start: [start]}, [(0, start)]
 
@@ -10718,8 +10723,12 @@ def hero_paths(g, hero):
     return costs, routes
 
 
+def hero_spent(g, hero):
+    return hero.get("move_spent", 0) if hero.get("move_spent_turn") == g["turn"] else 0
+
+
 def hero_destinations(g, hero):
-    if hero_moved(g, hero) or (hero_produced(g, hero) and not multitasking(g, hero["owner"])):
+    if hero_ordered(g, hero) or (hero_produced(g, hero) and not multitasking(g, hero["owner"])):
         return {}
     costs, _ = hero_paths(g, hero)
     return {
@@ -10740,16 +10749,18 @@ def move_hero(g, owner, hero_id, destination):
     hero = require_own_hero(g, owner, hero_id)
     destination = require_position(destination)
 
-    if hero_moved(g, hero):
-        raise ValueError("Ce héros s'est déjà déplacé ce tour.")
+    if hero_ordered(g, hero):
+        raise ValueError("Ce héros a attaqué ce tour : il ne peut plus bouger.")
     if hero_produced(g, hero) and not multitasking(g, owner):
         raise ValueError("Ce héros a produit ce tour : il faut Multitâches pour aussi bouger.")
     if destination not in hero_destinations(g, hero):
         raise ValueError("Destination inaccessible ou occupée.")
 
-    _, routes = hero_paths(g, hero)
+    costs, routes = hero_paths(g, hero)
     route = routes[destination]
     origin = coord(hero["pos"])
+    hero["move_spent"] = hero_spent(g, hero) + costs[destination]
+    hero["move_spent_turn"] = g["turn"]
     hero["pos"] = list(destination)
     hero["moved_turn"] = g["turn"]
 
@@ -11228,6 +11239,8 @@ def board_event(event, g, view):
         st.session_state.ui_last_event = event["event_id"]
         if pos in hero_destinations(view, source):
             clear_placement()
+            # Après le déplacement, le héros reste prêt à repartir.
+            st.session_state["_resume_plan"] = {"id": source["id"], "mode": "hero_move", "name": source["name"]}
             perform(draft_action, move_hero, source["id"], pos)
         st.session_state.ui_message = "Cette case n'est pas accessible pour ce héros."
         bump_ui()
@@ -11281,10 +11294,12 @@ def render_hero_controls(view, hero, prefix):
     if not multitasking(view, owner):
         st.caption("Sans Multitâches : ce tour, le héros produit OU bouge/attaque.")
 
-    # Déplacement
-    if hero_moved(view, hero):
-        st.caption("✓ Déjà déplacé ce tour.")
+    # Déplacement (possible en plusieurs fois)
+    left = hero_stats(view, hero)[1] - hero_spent(view, hero)
+    if not hero_destinations(view, hero):
+        st.caption("✓ Plus de déplacement possible ce tour.")
     elif st.session_state.ui_plan_mode == "hero_move":
+        st.caption(f"{left} déplacement(s) restant(s).")
         st.info("Clique sur une case verte : le héros s'y rend aussitôt.")
         if st.button("✕ Annuler le déplacement", key=f"{prefix}_hero_move_cancel_{hero['id']}"):
             clear_placement()
@@ -12068,11 +12083,8 @@ def hero_attack_plan(g, hero):
     _, _, reach, _, _ = hero_stats(g, hero)
     reach = max(1, reach)
     start = tuple(hero["pos"])
-    if hero_moved(g, hero):
-        stands = {start: 0}
-    else:
-        costs, _ = hero_paths(g, hero)
-        stands = {pos: c for pos, c in costs.items() if pos == start or at(g, pos) is None}
+    costs, _ = hero_paths(g, hero)
+    stands = {pos: c for pos, c in costs.items() if pos == start or at(g, pos) is None}
 
     plan = {}
     for piece in g["entities"]:
@@ -13840,6 +13852,83 @@ def render_aalongue_spells(view, hero, prefix):
             st.session_state.ui_plan_positions = []
             st.session_state["_tp_reset"] = True
             perform(draft_action, cast_teleport, hero["id"], ids)
+
+
+# ============================================================
+# DÉPLACEMENTS EN PLUSIEURS FOIS (héros, ouvriers)
+# Après un déplacement, la pièce reste sélectionnée, en mode déplacement,
+# tant qu'il lui reste des déplacements.
+# ============================================================
+
+_lw_resume_previous_main = main
+
+
+def main():
+    resume = st.session_state.pop("_resume_plan", None)
+    if resume:
+        init_ui()
+        st.session_state.ui_selected_id = resume["id"]
+        st.session_state.ui_plan_mode = resume["mode"]
+        st.session_state.ui_plan_name = resume["name"]
+        st.session_state.ui_plan_positions = []
+    _lw_resume_previous_main()
+
+
+# ============================================================
+# VAGABONDS : UNE CASE DE RESSOURCE NE RAPPORTE QU'UNE FOIS
+# Deux marqueurs (ou deux héros) sur la même case d'or ou de mana ne
+# cumulent pas : seule la première récolte compte pour ce tour.
+# ============================================================
+
+_lw_marker_previous_hero_collect = hero_collect
+
+
+def hero_collect(g, hero):
+    marker = hero.get("marker")
+    taken = g.get("_harvested_markers")
+    if marker and taken is not None:
+        cell = (hero["owner"], key(tuple(marker)))
+        if cell in taken:
+            log(g, f"{hero['name']} : la case {coord(marker)} a déjà été récoltée ce tour (marqueurs non cumulables).")
+            return
+        taken.add(cell)
+    _lw_marker_previous_hero_collect(g, hero)
+
+
+_lw_marker_previous_harvest = harvest
+
+
+def harvest(g):
+    g["_harvested_markers"] = set()
+    try:
+        _lw_marker_previous_harvest(g)
+    finally:
+        g.pop("_harvested_markers", None)
+
+
+def shared_marker_heroes(g, hero):
+    marker = hero.get("marker")
+    if not marker:
+        return []
+    return [
+        h for h in g["entities"]
+        if h is not hero and h["owner"] == hero["owner"] and is_hero(h) and h.get("marker") == marker
+    ]
+
+
+_lw_marker_previous_move_hero = move_hero
+
+
+def move_hero(g, owner, hero_id, destination):
+    _lw_marker_previous_move_hero(g, owner, hero_id, destination)
+    hero = entity(g, hero_id)
+    others = shared_marker_heroes(g, hero)
+    if others:
+        g["_ui_message"] = (
+            f"⚠️ {hero['name']} pose son marqueur en {coord(hero['marker'])}, déjà utilisé par "
+            + ", ".join(h["name"] for h in others)
+            + " : cette case ne rapportera qu'une seule fois."
+        )
 
 
 
