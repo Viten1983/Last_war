@@ -15125,6 +15125,23 @@ def render_home():
             st.rerun()
     _lw_ai_previous_render_home()
 
+# ============================================================
+# BONUS D'ATTAQUE (Marteau foudroyant) : il absorbe aussi les pertes
+# Le Guerrier attaque avec 2,5 PF : contre 2 PF, il gagne et survit
+# avec 0,5 PF (auparavant l'attaque était impossible à valider).
+# ============================================================
+
+_lw_bonus_previous_combat_values = combat_values
+
+
+def combat_values(attackers, target):
+    values = _lw_bonus_previous_combat_values(attackers, target)
+    bonus = sum(float(a.get("attack_bonus", 0.0)) for a in attackers)
+    if bonus and values.get("winnable") and values.get("losses", 0) > 0:
+        values = dict(values, losses=max(0.0, float(values["losses"]) - bonus))
+    return values
+
+
 
 if __name__ == "__main__":
     main()
