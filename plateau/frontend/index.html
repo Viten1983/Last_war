@@ -561,6 +561,17 @@
       return { Incubateur: "INC", Habitations: "HAB", Déferlant: "DEF", "Tigre des forêts": "TIGRE", Elfe: "ELFE", Mare: "MARE", "Petite grotte": "GROTTE", "Forêt enchantée": "FORET", Kamikaze: "KAMIKZ", "Nain des montagnes": "NAIN", "Mage des montagnes": "MAGE", "Golem de pierre": "GOLEM", "Mammouth dompté": "MAMMTH", Ouvrier: "OUVR", Colonie: "COLONIE", Forteresse: "FORT", Chevalier: "CHEVAL", Catapulte: "CATAP", "Catapulte de l'enfer": "ENFER", Trébuchet: "TRÉBU", Dirigeable: "DIRIG", "Roi Théobald": "ROI", "Réserve naturelle": "RÉSERVE", "Atelier de siège": "ATELIER", "De Marbourg": "MARBRG", Wulfoad: "WULFOAD", Campbell: "CAMPBL", Aalongue: "AALONG", Errant: "ERRANT", Ravageur: "RAVAG", "Super Errant": "S.ERR", "Super Ravageur": "S.RAV", Sorcier: "SORC", Barbare: "BARB", Voyant: "VOYANT", Silencieux: "SILENC", Destruction: "DESTR", Parfait: "PARFAIT" }[name] || name.slice(0, 6).toUpperCase();
     }
 
+    // Butin d'un Gobelin : pastille 💰 (or) ou 🔮 (mana) au-dessus du pion.
+    function lootBadge(group, piece, x, y, R) {
+      const loot = piece.loot || {};
+      const gold = loot.gold || 0, mana = loot.mana || 0;
+      if (!gold && !mana) return;
+      const label = gold ? `💰 ${gold}` : `🔮 ${mana}`;
+      const by = y - R - 6;
+      group.appendChild(svgNode("rect", { class: "token", x: x - 26, y: by - 10, width: 52, height: 19, rx: 9.5, fill: gold ? "#facc15" : "#c4b5fd", stroke: "#1c1917", "stroke-width": 1.6 }));
+      addText(group, x, by, label, 11, "#1c1917");
+    }
+
     function drawPiece(group, piece, x, y) {
       const selected = piece.id === args.selected_id || (args.selected_ids || []).includes(piece.id);
       const colors = FACTION_COLORS[piece.faction] || FACTION_COLORS[piece.owner === 0 ? 0 : 1];
@@ -597,6 +608,7 @@
         group.appendChild(svgNode("circle", { class: "token", cx: x + 19, cy: y - 17, r: 9, fill: "#facc15", stroke: "#713f12", "stroke-width": 2 }));
         addText(group, x + 19, y - 16.5, `×${piece.stack}`, 9, "#1c1917");
       }
+      lootBadge(group, piece, x, y, 23);
       if (piece.frozen_until_turn && piece.frozen_until_turn >= args.turn) {
         addText(group, x, y + 19, "❄ GELÉ", 7, "#0c4a6e");
       } else if (piece.attack_order && piece.attack_order.turn === args.turn) {
@@ -722,6 +734,7 @@
         group.appendChild(svgNode("circle", { class: "token", cx: bx, cy: by, r: 11, fill: "#facc15", stroke: "#713f12", "stroke-width": 2.2 }));
         addText(group, bx, by + 0.5, `×${piece.stack}`, 11, "#1c1917");
       }
+      lootBadge(group, piece, x, y, R);
       // Points de force en blanc.
       whiteText(group, x, y + R - 10, `${piece.pf} PF`, 12);
       if (piece.attack_bonus) {
@@ -736,6 +749,52 @@
       else if (piece.blocked) status = "BLOQUÉ";
       else if (piece.cargo && piece.cargo.length) status = `${piece.cargo.length} À BORD`;
       if (status) whiteText(group, x, y + R - (piece.attack_bonus ? 32 : 22), status, 7.5);
+    }
+
+    // Contre l'IA : ce qu'elle a fait ce tour (déplacé, recruté, construit).
+    function drawAiMark(group, piece, x, y) {
+      const marks = args.ai_marks;
+      if (!marks) return;
+      const moved = Object.prototype.hasOwnProperty.call(marks.moved || {}, String(piece.id));
+      const isNew = (marks.new || []).includes(piece.id);
+      if (!moved && !isNew) return;
+      const color = isNew ? (piece.kind === "unit" ? "#22c55e" : "#f59e0b") : "#f97316";
+      group.appendChild(svgNode("circle", {
+        class: "ai-mark", cx: x, cy: y, r: IMAGE_RADIUS + 5, fill: "none", stroke: color,
+        "stroke-width": 5, "stroke-dasharray": isNew ? "none" : "9 5", opacity: 0.95, "pointer-events": "none",
+      }));
+      if (isNew) {
+        const by = y + IMAGE_RADIUS + 8;
+        group.appendChild(svgNode("rect", { class: "ai-mark", x: x - 27, y: by - 8, width: 54, height: 15, rx: 7.5, fill: color, stroke: "#1c1917", "stroke-width": 1.4, "pointer-events": "none" }));
+        addText(group, x, by, "NOUVEAU", 8.5, "#1c1917");
+      }
+    }
+
+    function drawAiArrows() {
+      const marks = args.ai_marks;
+      if (!marks || !marks.moved) return;
+      const layer = svgNode("g", { class: "ai-arrows", "pointer-events": "none" });
+      const byId = new Map(args.entities.map(piece => [String(piece.id), piece]));
+      for (const [id, from] of Object.entries(marks.moved)) {
+        const piece = byId.get(id);
+        if (!piece) continue;
+        const a = center(from[0], from[1]);
+        const b = center(piece.pos[0], piece.pos[1]);
+        const dx = b.x - a.x, dy = b.y - a.y;
+        const length = Math.hypot(dx, dy);
+        if (length < 1) continue;
+        const ux = dx / length, uy = dy / length;
+        const stop = Math.max(0, length - (IMAGE_RADIUS + 8));
+        const ex = a.x + ux * stop, ey = a.y + uy * stop;
+        layer.appendChild(svgNode("circle", { cx: a.x, cy: a.y, r: 7, fill: "#f97316", stroke: "#7c2d12", "stroke-width": 1.5, opacity: 0.9 }));
+        layer.appendChild(svgNode("line", { x1: a.x, y1: a.y, x2: ex, y2: ey, stroke: "#f97316", "stroke-width": 4, "stroke-dasharray": "9 6", "stroke-linecap": "round", opacity: 0.9 }));
+        const px = -uy, py = ux;
+        layer.appendChild(svgNode("polygon", {
+          points: `${ex + ux * 12},${ey + uy * 12} ${ex + px * 7},${ey + py * 7} ${ex - px * 7},${ey - py * 7}`,
+          fill: "#f97316", stroke: "#7c2d12", "stroke-width": 1.5, opacity: 0.95,
+        }));
+      }
+      board.appendChild(layer);
     }
 
     // Fait glisser la pièce le long de son chemin, case par case, en accéléré.
@@ -894,6 +953,7 @@ if (reachable || placed) {
           drawPiece(pieceGroup, piece, x, y);
           group.appendChild(pieceGroup);
           pieceGroups[piece.id] = pieceGroup;
+          drawAiMark(group, piece, x, y);
         }
         // Marqueurs de récolte des héros vagabonds (dernière ressource traversée).
         const heroMarks = markers.get(cellKey);
@@ -963,6 +1023,7 @@ if (reachable || placed) {
         "stroke-linecap": "round",
         "pointer-events": "none",
       }));
+      drawAiArrows();
       animateLastMove();
       wrapper.scrollLeft = previousScrollLeft;
       wrapper.scrollTop = previousScrollTop;

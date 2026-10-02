@@ -4467,6 +4467,7 @@ def render_board(g, view, readonly=False):
         revision=st.session_state.ui_revision,
         turn=g["turn"],
         last_move=view.get("last_move"),
+        ai_marks=st.session_state.get("_lw_ai_marks"),
         key=f"board_component_{st.session_state.ui_board_key}",
         default=None,
     )
@@ -10703,7 +10704,13 @@ def remaining_actions(g, unit):
         bonus += 1
     if g["players"][unit["owner"]].get("motivation_turn") == g["turn"]:
         bonus += 1
-    return _lw_vag_previous_remaining_actions(g, unit) + bonus
+    if not bonus:
+        return _lw_vag_previous_remaining_actions(g, unit)
+    # Le bonus s'ajoute au budget AVANT de retirer ce qui a été dépensé
+    # (sinon il restait toujours 1 déplacement : déplacements infinis).
+    fresh = dict(unit, movement_spent=0, movement_spent_turn=None)
+    budget = _lw_vag_previous_remaining_actions(g, fresh) + bonus
+    return max(0, budget - movement_spent(g, unit))
 
 
 _lw_vag_previous_can_move = can_move
@@ -14093,1044 +14100,6 @@ def draft_action(bundle, fn, *args):
 
 
 # ============================================================
-# IA : ADVERSAIRE CONTRÔLÉ PAR L'ORDINATEUR
-# Trois niveaux :
-# - Débutant : joue des coups légaux, souvent au hasard, économie simple ;
-# - Intermédiaire : choisit les attaques rentables (simulation de chaque
-#   action avec le moteur du jeu), économie et âges réguliers ;
-# - Expert : attaques groupées, évite les menaces, défend ses bases,
-#   vise les bases ennemies, colonies, améliorations et fusions.
-# L'IA ne voit que ce que voit un joueur : pas les unités invisibles,
-# pas la production secrète de l'adversaire.
-# ============================================================
-
-import random
-
-AI_LEVELS = {
-    "debutant": "🟢 Débutant",
-    "intermediaire": "🟠 Intermédiaire",
-    "expert": "🔴 Expert",
-}
-
-AI_PROFILES = {
-    "debutant": {
-        "noise": 900.0, "danger": 0.0, "advance": 6.0, "groups": False,
-        "pass_chance": 0.15, "move_samples": 3, "age_turn": 7, "age_reserve": 400,
-        "colonies": False, "upgrades": False, "fusions": False, "defend": 0.0,
-    },
-    "intermediaire": {
-        "noise": 60.0, "danger": 0.35, "advance": 10.0, "groups": False,
-        "pass_chance": 0.0, "move_samples": 5, "age_turn": 4, "age_reserve": 150,
-        "colonies": True, "upgrades": True, "fusions": True, "defend": 0.5,
-    },
-    "expert": {
-        "noise": 5.0, "danger": 0.1, "advance": 20.0, "groups": True, "lookahead": 0.8,
-        "pass_chance": 0.0, "move_samples": 8, "age_turn": 3, "age_reserve": 0,
-        "colonies": True, "upgrades": True, "fusions": True, "defend": 0.5,
-    },
-}
-
-AI_MAX_STEPS = 150
-
-
-def ai_profile(level):
-    return AI_PROFILES.get(level, AI_PROFILES["intermediaire"])
-
-
-def ai_rng(g, salt=0):
-    return random.Random(f"{g.get('turn')}-{g.get('tick', 0)}-{len(g.get('log', []))}-{salt}")
-
-
-def ai_clone(g):
-    """Copie légère : le journal n'est pas recopié (il est recollé ensuite)."""
-    saved = g.get("log", [])
-    g["log"] = []
-    try:
-        clone = copy.deepcopy(g)
-    finally:
-        g["log"] = saved
-    return clone
-
-
-def ai_restore_log(original, clone):
-    clone["log"] = list(original.get("log", [])) + clone.get("log", [])
-    return clone
-
-
-def ai_simulate(g, fn, *args):
-    """Exécute une action sur une copie ; None si elle est refusée."""
-    clone = ai_clone(g)
-    bundle = {"game": clone, "draft": None, "committed": None}
-    try:
-        game_action(bundle, fn, *args)
-    except (ValueError, KeyError, TypeError, IndexError, AttributeError, ZeroDivisionError):
-        return None
-    return bundle["game"]
-
-
-def ai_try_draft(g, fn, owner, *args):
-    """Action de production atomique sur le brouillon ; renvoie le nouvel état."""
-    clone = ai_clone(g)
-    try:
-        fn(clone, owner, *args)
-    except (ValueError, KeyError, TypeError, IndexError, AttributeError, ZeroDivisionError):
-        return None
-    return ai_restore_log(g, clone)
-
-
-# ------------------------------------------------------------
-# Évaluation d'une position
-# ------------------------------------------------------------
-
-def ai_unit_value(e):
-    data = UNITS.get(e["name"], {})
-    if e["name"] == WORKER:
-        return 140.0
-    base = data.get("cost", 100) / max(1, data.get("batch", 1)) + 140 * data.get("mana", 0)
-    base = max(base, 140.0 * float(data.get("pf", 1)))
-    top = float(e.get("max_pf") or data.get("pf") or 1)
-    return base * (0.35 + 0.65 * min(1.0, float(e["pf"]) / top))
-
-
-def ai_piece_value(g, e):
-    if e["kind"] == "unit":
-        return ai_unit_value(e)
-    pf = float(e["pf"])
-    top = float(e.get("max_pf") or 0) or max(pf, 1.0)
-    if is_hero(e):
-        return 1800.0 + 1200.0 * min(1.0, pf / top)
-    if e["kind"] == "base":
-        return 2200.0 + 1800.0 * min(1.0, pf / top) + (0 if e["wait"] else 300)
-    data = faction_of(g, e["owner"])["buildings"].get(e["name"], {})
-    return float(data.get("cost", 200)) * (0.5 + 0.5 * min(1.0, pf / top)) + 100
-
-
-def ai_material(g, me):
-    if g.get("winner") is not None:
-        if g["winner"] == me:
-            return 1e7
-        if g["winner"] == -1:
-            return 0.0
-        return -1e7
-    score = 0.0
-    for e in g["entities"]:
-        if e["owner"] == me:
-            score += ai_piece_value(g, e)
-        elif visible_to_player(g, e, me):
-            score -= ai_piece_value(g, e)
-    for owner in (0, 1):
-        sign = 1 if owner == me else -1
-        player = g["players"][owner]
-        score += sign * (0.5 * player.get("gold", 0) + 120 * player.get("mana", 0))
-    return score
-
-
-def ai_enemy_pieces(g, me):
-    return [e for e in g["entities"] if e["owner"] != me and visible_to_player(g, e, me)]
-
-
-def ai_threat_reach(e):
-    data = UNITS.get(e["name"], {})
-    return data.get("move", 0) + max(1, data.get("range", 0))
-
-
-def ai_context(g, me, profile):
-    """Données communes à l'évaluation des positions."""
-    enemies = ai_enemy_pieces(g, me)
-    enemy_units = [e for e in enemies if e["kind"] == "unit" and e["name"] not in NO_ATTACK_UNITS]
-    goals = [tuple(e["pos"]) for e in enemies if e["kind"] in ("base", "building")]
-    my_bases = [tuple(e["pos"]) for e in g["entities"] if e["owner"] == me and e["kind"] == "base"]
-    mine = sum(ai_unit_value(e) for e in g["entities"] if e["owner"] == me and e["kind"] == "unit")
-    theirs = sum(ai_unit_value(e) for e in enemy_units) or 1.0
-    return {
-        "profile": profile,
-        "goals": goals or [tuple(e["pos"]) for e in enemy_units],
-        "threats": [(tuple(e["pos"]), ai_threat_reach(e), float(e["pf"])) for e in enemy_units],
-        # Armée nettement supérieure : l'IA accepte davantage de risques.
-        "caution": profile["danger"] * (0.4 if mine > 1.3 * theirs else 1.0),
-        "intruders": [
-            tuple(e["pos"]) for e in enemy_units
-            if my_bases and min(distance(tuple(e["pos"]), b) for b in my_bases) <= 4
-        ],
-        "allies": {
-            e["id"]: tuple(e["pos"]) for e in g["entities"]
-            if e["owner"] == me and e["kind"] == "unit" and e["name"] != WORKER
-        },
-    }
-
-
-def ai_place_score(ctx, unit, pos):
-    """Avance vers les bases ennemies, défense des siennes, menaces."""
-    profile = ctx["profile"]
-    score = 0.0
-    if ctx["goals"]:
-        score -= profile["advance"] * min(distance(pos, p) for p in ctx["goals"])
-    if ctx["intruders"] and profile["defend"]:
-        score -= profile["defend"] * 8 * min(distance(pos, p) for p in ctx["intruders"])
-    if ctx["caution"]:
-        worst = max(
-            (pf for where, reach, pf in ctx["threats"] if distance(pos, where) <= reach),
-            default=0.0,
-        )
-        if worst >= float(unit["pf"]):
-            score -= ctx["caution"] * ai_unit_value(unit)
-        elif worst:
-            score -= ctx["caution"] * 0.25 * ai_unit_value(unit)
-    if profile.get("cohesion"):
-        # Avancer groupé : jusqu'à 3 alliés à 2 cases ou moins.
-        near = sum(
-            1 for eid, where in ctx["allies"].items()
-            if eid != unit["id"] and distance(pos, where) <= 2
-        )
-        score += profile["cohesion"] * min(3, near)
-    return score
-
-
-def ai_positional(g, me, profile):
-    ctx = ai_context(g, me, profile)
-    return sum(
-        ai_place_score(ctx, unit, tuple(unit["pos"]))
-        for unit in g["entities"]
-        if unit["owner"] == me and unit["kind"] == "unit" and unit["name"] != WORKER
-    )
-
-
-def ai_score(g, me, profile):
-    return ai_material(g, me) + ai_positional(g, me, profile)
-
-
-# ------------------------------------------------------------
-# Manœuvres
-# ------------------------------------------------------------
-
-def ai_melee_args(g, ids, target_id):
-    attackers, target, _ = prepare_attack(g, ids, target_id)
-    values = combat_values(attackers, target)
-    melee = [a for a in attackers if not (UNITS.get(a["name"], {}).get("range", 0) > 0)]
-    occupier = max(melee or attackers, key=lambda a: a["pf"])["id"]
-    if not values.get("winnable"):
-        return occupier, None
-    return occupier, default_losses(attackers, values.get("losses", 0.0), occupier)
-
-
-def ai_active_units(g, me):
-    return [
-        e for e in g["entities"]
-        if e["owner"] == me and e["kind"] == "unit" and e["name"] != WORKER and can_move(g, e)
-    ]
-
-
-def ai_attack_candidates(g, me, profile):
-    candidates = []
-    units = ai_active_units(g, me)
-    moving = g.get("moving_unit_id")
-    if moving is not None:
-        units = [u for u in units if u["id"] == moving] or units
-    reach = {}
-    for unit in units:
-        try:
-            _, targets = attack_map_preview(g, [unit])
-        except (ValueError, KeyError, TypeError):
-            continue
-        for pos, data in targets.items():
-            tid = data.get("target_id") if isinstance(data, dict) else None
-            target = at(g, pos) if tid is None else next((e for e in g["entities"] if e["id"] == tid), None)
-            if target is None or target["owner"] == me:
-                continue
-            tid = target["id"]
-            if unit["name"] == SORCERER:
-                for spell in SORCERER_SPELLS:
-                    candidates.append((cast_sorcerer_spell, (unit["id"], spell, tid)))
-                continue
-            if unit["name"] in MAGES or unit["name"] == "Décimant":
-                continue
-            if UNITS.get(unit["name"], {}).get("range", 0) > 0:
-                candidates.append((ranged_attack, (unit["id"], tid)))
-            reach.setdefault(tid, []).append(unit)
-            candidates.append(("melee", ([unit["id"]], tid)))
-    if profile["groups"]:
-        for tid, group in reach.items():
-            fighters = sorted(
-                (u for u in group if UNITS.get(u["name"], {}).get("range", 0) == 0),
-                key=lambda u: -u["pf"],
-            )
-            for size in (2, 3):
-                if len(fighters) >= size:
-                    candidates.append(("melee", ([u["id"] for u in fighters[:size]], tid)))
-    return candidates
-
-
-def ai_move_candidates(g, me, profile, rng, ctx):
-    """Déplacements notés directement (sans simulation) : (gain, unité, case)."""
-    units = ai_active_units(g, me)
-    moving = g.get("moving_unit_id")
-    if moving is not None:
-        units = [u for u in units if u["id"] == moving]
-    scored = []
-    for unit in units:
-        try:
-            destinations, _ = move_preview(g, unit)
-        except (ValueError, KeyError, TypeError):
-            continue
-        if not destinations:
-            continue
-        here = ai_place_score(ctx, unit, tuple(unit["pos"]))
-        cells = list(destinations)
-        if profile is AI_PROFILES["debutant"]:
-            cells = rng.sample(cells, min(len(cells), profile["move_samples"]))
-        for pos in cells:
-            gain = ai_place_score(ctx, unit, pos) - here
-            scored.append((gain + rng.uniform(-1, 1) * profile["noise"], unit["id"], pos))
-    return scored
-
-
-def ai_resolve(g, candidate):
-    fn, args = candidate
-    if fn == "melee":
-        ids, tid = args
-        try:
-            occupier, losses = ai_melee_args(g, ids, tid)
-        except (ValueError, KeyError, TypeError):
-            return None, None
-        return attack, (ids, tid, occupier, losses)
-    return fn, args
-
-
-def ai_special_candidates(g, me):
-    special = []
-    if decimant_hunt(g) is not None:
-        special.append((renounce_decimant_hunt, ()))
-    if dwarf_rally(g) is not None:
-        special.append((end_dwarf_rally, ()))
-    return special
-
-
-def ai_reply_loss(g, me):
-    """Pire perte matérielle que l'adversaire peut infliger tout de suite."""
-    opponent = 1 - me
-    if g.get("winner") is not None or g.get("phase") != "move" or g.get("active") != opponent:
-        return 0.0
-    base = ai_material(g, me)
-    worst = 0.0
-    replies = ai_attack_candidates(g, opponent, AI_PROFILES["intermediaire"])
-    for candidate in replies[:AI_REPLY_LIMIT]:
-        fn, args = ai_resolve(g, candidate)
-        if fn is None:
-            continue
-        after = ai_simulate(g, fn, *args)
-        if after is not None:
-            worst = max(worst, base - ai_material(after, me))
-    return worst
-
-
-def ai_lookahead(g, me, options, profile):
-    """Expert : les meilleurs coups sont corrigés par la riposte adverse."""
-    now = ai_clone(g)
-    now["active"] = 1 - me
-    now.pop("moving_unit_id", None)
-    if (1 - me) in now.get("passed", []):
-        return options
-    baseline = ai_reply_loss(now, me)
-    checked = []
-    for gain, after, move in options[:AI_LOOKAHEAD]:
-        if after is None:
-            after = ai_simulate(g, move_unit, *move)
-            if after is None:
-                continue
-        extra = ai_reply_loss(after, me) - baseline
-        checked.append((gain - profile["lookahead"] * extra, after, move))
-    checked.sort(key=lambda item: -item[0])
-    return checked + options[AI_LOOKAHEAD:]
-
-
-AI_LOOKAHEAD = 5
-AI_REPLY_LIMIT = 14
-
-
-def ai_move_step(bundle, me, level):
-    """Une activation de l'IA pendant les manœuvres."""
-    g = bundle["game"]
-    profile = ai_profile(level)
-    rng = ai_rng(g, me)
-    ctx = ai_context(g, me, profile)
-    before = ai_material(g, me) + ai_positional(g, me, profile)
-
-    options = []  # (gain, état simulé ou None, action)
-    attacks = ai_attack_candidates(g, me, profile) + ai_special_candidates(g, me)
-    if level == "debutant":
-        rng.shuffle(attacks)
-        attacks = attacks[:6]
-    for candidate in attacks:
-        fn, args = ai_resolve(g, candidate)
-        if fn is None:
-            continue
-        after = ai_simulate(g, fn, *args)
-        if after is None:
-            continue
-        gain = ai_material(after, me) + ai_positional(after, me, profile) - before
-        options.append((gain + rng.uniform(-1, 1) * profile["noise"], after, None))
-
-    for gain, unit_id, pos in ai_move_candidates(g, me, profile, rng, ctx):
-        options.append((gain, None, (unit_id, pos)))
-
-    if level == "debutant" and rng.random() < profile["pass_chance"]:
-        options = []
-    threshold = -400.0 if level == "debutant" else 0.0
-    options.sort(key=lambda item: -item[0])
-    if profile.get("lookahead"):
-        options = ai_lookahead(g, me, options, profile)
-    for gain, after, move in options[:12]:
-        if gain <= threshold:
-            break
-        if after is None:
-            after = ai_simulate(g, move_unit, *move)
-            if after is None:
-                continue
-        bundle["game"] = ai_restore_log(g, after)
-        return True
-
-    fallback = ai_simulate(g, pass_turn)
-    if fallback is None:
-        return False
-    bundle["game"] = ai_restore_log(g, fallback)
-    return True
-
-
-# ------------------------------------------------------------
-# Production
-# ------------------------------------------------------------
-
-def ai_enemy_home(g, me):
-    pieces = [tuple(e["pos"]) for e in g["entities"] if e["owner"] != me and e["kind"] == "base"]
-    if not pieces:
-        pieces = [tuple(e["pos"]) for e in g["entities"] if e["owner"] != me]
-    if not pieces:
-        return (GRID_WIDTH // 2, 0) if "GRID_WIDTH" in globals() else (10, 10)
-    return min(pieces, key=lambda p: sum(distance(p, q) for q in pieces))
-
-
-def ai_free_cells_near(g, origin, low, high):
-    return [
-        p for p in CELLS
-        if low <= distance(origin, p) <= high
-        and at(g, p) is None
-        and not blocked(g, p)
-        and key(p) not in g["resources"]
-    ]
-
-
-def ai_unit_rating(name, profile_level):
-    data = UNITS[name]
-    price = data["cost"] / max(1, data["batch"]) + 150 * data["mana"]
-    power = data["pf"] * (1.3 if data["range"] else 1.0) + 0.15 * data["move"]
-    if name in NO_ATTACK_UNITS or name in MAGES or name in ("Décimant", "Kamikaze", "Gobelin"):
-        power *= 0.4
-    return power / max(price, 50) * 1000 + data["pf"] * 0.5
-
-
-def ai_reserve(g, me, profile):
-    """Or mis de côté pour passer à l'âge suivant."""
-    age = g["players"][me]["age"]
-    if age >= 3 or g["turn"] < profile["age_turn"]:
-        return 0
-    return AGE_COSTS[age + 1]["gold"] if profile["age_reserve"] == 0 else 0
-
-
-def ai_mana_reserve(g, me, level):
-    """Mana gardé pour l'âge III."""
-    if level == "debutant" or g["players"][me]["age"] != 2:
-        return 0
-    need = AGE_COSTS[3]["mana"]
-    if is_vagabond(g, me) and not owns_upgrade(g, me, VAG_AGE_UPGRADES[3]):
-        need += UPGRADES[VAG_AGE_UPGRADES[3]]["mana"]
-    return need
-
-
-def ai_try_age(g, me, profile, rng):
-    age = g["players"][me]["age"]
-    if age >= 3 or g["turn"] < profile["age_turn"]:
-        return g
-    if profile is AI_PROFILES["debutant"] and rng.random() < 0.5:
-        return g
-    if is_vagabond(g, me):
-        needed = VAG_AGE_UPGRADES.get(age + 1)
-        if needed and not owns_upgrade(g, me, needed):
-            new = ai_try_draft(g, purchase_upgrade, me, needed)
-            if new is None:
-                return g
-            g = new
-    new = ai_try_draft(g, advance_age, me, age + 1)
-    return new or g
-
-
-def ai_wanted_buildings(g, me, profile):
-    faction = faction_of(g, me)
-    age = g["players"][me]["age"]
-    wanted = []
-    prerequisite = AGE_PREREQUISITES.get((faction_id(g, me), age + 1))
-    if prerequisite:
-        wanted.append(prerequisite)
-    producers = [
-        (name, data) for name, data in faction["buildings"].items()
-        if data.get("units") and building_is_available(g, me, name)
-    ]
-    # Les bâtiments de l'âge le plus élevé produisent les meilleures unités.
-    producers.sort(key=lambda item: -BUILDING_AGES.get((faction_id(g, me), item[0]), 1))
-    for name, data in producers:
-        count = sum(e["owner"] == me and e["name"] == name for e in g["entities"])
-        rich = g["players"][me]["gold"] >= 900
-        if count < (data["limit"] if rich else min(data["limit"], 2 if age > 1 else 1)):
-            wanted.append(name)
-    tech = TECH_BUILDINGS.get(faction_id(g, me))
-    if profile["upgrades"] and tech and building_is_available(g, me, tech):
-        if not any(e["owner"] == me and e["name"] == tech for e in g["entities"]):
-            wanted.append(tech)
-    seen = []
-    for name in wanted:
-        if name not in seen:
-            seen.append(name)
-    return seen
-
-
-def ai_build_positions(g, me, source, name):
-    if name == TECH_BUILDINGS.get(faction_id(g, me)) and me in TECH_CELLS:
-        return [tech_cell(me)]
-    enemy = ai_enemy_home(g, me)
-    if source["name"] == WORKER:
-        cells = worker_build_slots(g, source, name)
-    else:
-        cells = ai_free_cells_near(g, tuple(source["pos"]), 1, 3)
-    # Les bâtiments restent à l'abri, du côté opposé à l'ennemi.
-    cells.sort(key=lambda p: (-distance(p, enemy), distance(p, tuple(source["pos"]))))
-    return cells[:6]
-
-
-def ai_build_sources(g, me):
-    if faction_id(g, me) == DERNIERS_NES:
-        workers = [
-            e for e in g["entities"]
-            if e["owner"] == me and e["name"] == WORKER and not e["wait"] and not e["used"]
-        ]
-        # Les ouvriers qui ne récoltent pas construisent en priorité.
-        workers.sort(key=lambda w: key(tuple(w["pos"])) in g["resources"])
-        return workers
-    return [
-        e for e in g["entities"]
-        if e["owner"] == me and e["kind"] == "base" and not is_hero(e) and not e["wait"] and not e["used"]
-    ]
-
-
-def ai_try_build(g, me, name, rng):
-    for source in ai_build_sources(g, me):
-        for pos in ai_build_positions(g, me, source, name):
-            new = ai_try_draft(g, build, me, source["id"], name, pos, False)
-            if new is not None:
-                return new
-    return None
-
-
-def ai_has_mana_base(g, me):
-    return any(
-        g["resources"].get(key(q), ("", 0))[0] == "mana"
-        for e in g["entities"] if e["owner"] == me and e["kind"] == "base" and not is_hero(e)
-        for q in neighbors(tuple(e["pos"]))
-    )
-
-
-def ai_colony_value(g, p):
-    # Le mana compte triple : il débloque l'âge III et les meilleures unités.
-    return sum(
-        (3 if g["resources"][key(q)][0] == "mana" else 1) * g["resources"][key(q)][1]
-        for q in neighbors(p)
-        if key(q) in g["resources"] and at(g, q) is None
-    )
-
-
-def ai_colony_positions(g, me, source):
-    enemy = ai_enemy_home(g, me)
-    bases = [tuple(e["pos"]) for e in g["entities"] if e["owner"] == me and e["kind"] == "base"]
-    if source["name"] == WORKER:
-        cells = worker_build_slots(g, source, faction_of(g, me)["base"])
-    else:
-        cells = ai_free_cells_near(g, tuple(source["pos"]), 2, 6)
-    cells = [
-        p for p in cells
-        if ai_colony_value(g, p) and min((distance(p, b) for b in bases), default=9) >= 2
-    ]
-    cells.sort(key=lambda p: (-ai_colony_value(g, p), -distance(p, enemy)))
-    return cells[:6]
-
-
-def ai_try_colony(g, me, profile):
-    if not profile["colonies"] or is_vagabond(g, me):
-        return g
-    bases = [e for e in g["entities"] if e["owner"] == me and e["kind"] == "base"]
-    if len(bases) >= 7:
-        return g
-    name = faction_of(g, me)["base"]
-    cost = base_cost_for_age(g, me)
-    need_mana = not ai_has_mana_base(g, me)
-    margin = 0 if need_mana else 300
-    if ai_level_of(profile) == "expert" and g["turn"] <= 6:
-        # Début de partie : l'Expert investit dans des colonies (plus de revenus).
-        margin = 0
-    if g["players"][me]["gold"] < cost + margin or g["turn"] < 2:
-        return g
-    options = [
-        (source, pos)
-        for source in ai_build_sources(g, me)
-        for pos in ai_colony_positions(g, me, source)
-    ]
-    options.sort(key=lambda item: -ai_colony_value(g, item[1]))
-    for source, pos in options:
-        new = ai_try_draft(g, build, me, source["id"], name, pos, False)
-        if new is not None:
-            return new
-    return g
-
-
-def ai_scout_mana(g, me, profile):
-    """Derniers nés : un ouvrier part fonder une colonie près du mana."""
-    if not profile["colonies"] or faction_id(g, me) != DERNIERS_NES or ai_has_mana_base(g, me):
-        return g
-    mana_cells = [P for P, v in ((tuple(int(x) for x in k.split(",")), v) for k, v in g["resources"].items()) if v[0] == "mana"]
-    spots = [
-        p for m in mana_cells for p in neighbors(m)
-        if valid_position(p) and at(g, p) is None and not blocked(g, p) and key(p) not in g["resources"]
-    ]
-    if not spots:
-        return g
-    workers = [
-        e for e in g["entities"]
-        if e["owner"] == me and e["name"] == WORKER and not e["wait"] and not e["used"]
-    ]
-    workers.sort(key=lambda w: (key(tuple(w["pos"])) in g["resources"], min(distance(tuple(w["pos"]), q) for q in spots)))
-    for worker in workers[:1]:
-        options = list(worker_destinations(g, worker))
-        if not options:
-            continue
-        # Se placer à côté d'une case de fondation, le plus près possible.
-        best = min(options, key=lambda p: min(distance(p, q) for q in spots))
-        new = ai_try_draft(g, move_worker, me, worker["id"], best)
-        if new is not None:
-            return new
-    return g
-
-
-def ai_try_upgrades(g, me, profile, rng):
-    if not profile["upgrades"]:
-        return g
-    names = list(available_upgrades(g, me))
-    rng.shuffle(names)
-    names.sort(key=lambda n: (n not in PF_UPGRADES, UPGRADES[n]["cost"]))
-    for name in names:
-        upgrade = UPGRADES[name]
-        if g["players"][me]["gold"] - upgrade["cost"] < 300 + ai_reserve(g, me, profile):
-            continue
-        if upgrade["mana"] and g["players"][me]["mana"] - upgrade["mana"] < ai_mana_reserve(g, me, "expert"):
-            continue
-        new = ai_try_draft(g, purchase_upgrade, me, name)
-        if new is not None:
-            g = new
-    return g
-
-
-def ai_recruit_positions(g, me, producer, count):
-    enemy = ai_enemy_home(g, me)
-    g["_recruit_batch"] = count
-    try:
-        cells = list(recruitment_slots(g, producer))
-    except TypeError:
-        cells = list(recruitment_slots(g, producer, count))
-    finally:
-        g.pop("_recruit_batch", None)
-    cells.sort(key=lambda p: distance(p, enemy))
-    return cells
-
-
-def ai_recruit_options(g, me, producer):
-    faction = faction_of(g, me)
-    if is_hero(producer):
-        return [n for n in VAG_SLOTS if hero_can_produce(g, producer, n)]
-    if producer["kind"] == "base":
-        return [WORKER] if faction_id(g, me) == DERNIERS_NES else []
-    return list(faction["buildings"].get(producer["name"], {}).get("units", []))
-
-
-def ai_try_recruit(g, me, producer, profile, rng, level, budget):
-    options = [n for n in ai_recruit_options(g, me, producer) if n != WORKER and n in UNITS]
-    if not options:
-        return None
-    if level == "debutant":
-        rng.shuffle(options)
-    elif budget >= 1500:
-        # Beaucoup d'or : les unités les plus puissantes d'abord.
-        options.sort(key=lambda n: (-UNITS[n]["pf"] * (1.3 if UNITS[n]["range"] else 1), rng.random()))
-    else:
-        options.sort(key=lambda n: -ai_unit_rating(n, level) - rng.uniform(0, 0.5))
-    for name in options:
-        data = UNITS[name]
-        mana_left = g["players"][me]["mana"] - ai_mana_reserve(g, me, level)
-        if data["cost"] > budget or (data["mana"] and data["mana"] > mana_left):
-            continue
-        batch = 1 if is_hero(producer) else recruitment_batch(g, me, name)
-        cells = ai_recruit_positions(g, me, producer, batch)
-        if len(cells) < batch:
-            continue
-        new = ai_try_draft(g, recruit, me, producer["id"], name, cells[:batch])
-        if new is not None:
-            return new
-    return None
-
-
-def ai_workers(g, me, profile):
-    """Derniers nés : ouvriers sur les ressources voisines des bases."""
-    if faction_id(g, me) != DERNIERS_NES:
-        return g
-    bases = [e for e in g["entities"] if e["owner"] == me and e["kind"] == "base" and not e["wait"]]
-
-    def useful(p):
-        return key(p) in g["resources"] and any(distance(p, tuple(b["pos"])) == 1 for b in bases)
-
-    for worker in [e for e in g["entities"] if e["owner"] == me and e["name"] == WORKER]:
-        if useful(tuple(worker["pos"])) or worker["wait"]:
-            continue
-        options = [p for p in worker_destinations(g, worker) if useful(p)]
-        if options:
-            target = min(options, key=lambda p: distance(p, tuple(worker["pos"])))
-            new = ai_try_draft(g, move_worker, me, worker["id"], target)
-            if new is not None:
-                g = new
-    # Des ouvriers en plus : pour récolter et construire.
-    spots = sum(
-        1 for b in bases for p in neighbors(tuple(b["pos"]))
-        if key(p) in g["resources"] and terrain(g, p) != "sea"
-    )
-    workers = worker_count(g, me)
-    for base in bases:
-        if workers >= spots + 2:
-            break
-        batch = worker_batch(g, base)
-        if not batch or base["used"]:
-            continue
-        cells = worker_slots(g, base)
-        cells.sort(key=lambda p: key(p) not in g["resources"])
-        if len(cells) < batch:
-            continue
-        new = ai_try_draft(g, recruit, me, base["id"], WORKER, cells[:batch])
-        if new is not None:
-            g = new
-            workers += batch
-    return g
-
-
-def ai_heroes(g, me, profile, rng):
-    """Vagabonds : les héros posent leur marqueur sur l'or ou le mana."""
-    if not is_vagabond(g, me):
-        return g
-    enemy = ai_enemy_home(g, me)
-    heroes = [e for e in g["entities"] if e["owner"] == me and is_hero(e)]
-    taken = {key(tuple(h["marker"])) for h in heroes if h.get("marker")}
-    for hero in heroes:
-        marker = hero.get("marker")
-        if marker and key(tuple(marker)) in g["resources"]:
-            continue
-        options = hero_destinations(g, hero)
-        if not options:
-            continue
-        costs, routes = hero_paths(g, hero)
-
-        def gain(p):
-            crossed = [q for q in routes.get(p, [])[1:] if key(q) in g["resources"] and key(q) not in taken]
-            if not crossed:
-                return -1
-            kind, mult = g["resources"][key(crossed[-1])]
-            if kind == "mana":
-                return mult * (2.5 if g["players"][me]["mana"] < 4 else 1.0)
-            return mult * 1.5
-
-        best = max(options, key=lambda p: (gain(p), distance(p, enemy)))
-        if gain(best) <= 0:
-            continue
-        new = ai_try_draft(g, move_hero, me, hero["id"], best)
-        if new is not None:
-            g = new
-            moved = entity(g, hero["id"])
-            if moved.get("marker"):
-                taken.add(key(tuple(moved["marker"])))
-    return g
-
-
-def ai_fusions(g, me, profile):
-    if not profile["fusions"] or not is_vagabond(g, me):
-        return g
-    for result, data in sorted(FUSIONS.items(), key=lambda item: -item[1]["age"]):
-        if data["age"] > g["players"][me]["age"]:
-            continue
-        pool = {}
-        for e in g["entities"]:
-            if e["owner"] == me and e["kind"] == "unit" and e["name"] in data["parts"] and not e["wait"]:
-                pool.setdefault(e["name"], []).append(e)
-        if any(len(pool.get(n, [])) < k for n, k in data["parts"].items()):
-            continue
-        ids = [u["id"] for n, k in data["parts"].items() for u in pool[n][:k]]
-        first = entity(g, ids[0])
-        for pos in [tuple(first["pos"])] + list(neighbors(tuple(first["pos"]))):
-            new = ai_try_draft(g, fuse_spirits, me, result, ids, pos)
-            if new is not None:
-                g = new
-                break
-    return g
-
-
-def ai_production(draft, me, level):
-    """Construit, recrute et améliore dans le brouillon privé de l'IA."""
-    profile = ai_profile(level)
-    rng = ai_rng(draft, 17 + me)
-    g = draft
-
-    g = ai_try_age(g, me, profile, rng)
-    g = ai_scout_mana(g, me, profile)
-    g = ai_workers(g, me, profile)
-    g = ai_heroes(g, me, profile, rng)
-
-    if not ai_has_mana_base(g, me):
-        g = ai_try_colony(g, me, profile)
-    wanted = ai_wanted_buildings(g, me, profile)
-    if level == "debutant":
-        rng.shuffle(wanted)
-        wanted = wanted[:1]
-    for name in wanted[:2]:
-        new = ai_try_build(g, me, name, rng)
-        if new is not None:
-            g = new
-
-    g = ai_try_colony(g, me, profile)
-    g = ai_try_upgrades(g, me, profile, rng)
-    g = ai_fusions(g, me, profile)
-
-    producers = [
-        e for e in g["entities"]
-        if e["owner"] == me and (e["kind"] == "building" or is_hero(e)) and not e["wait"]
-    ]
-    rng.shuffle(producers)
-    for _ in range(3):
-        for producer in producers:
-            current = next((e for e in g["entities"] if e["id"] == producer["id"]), None)
-            if current is None:
-                continue
-            budget = g["players"][me]["gold"] - ai_reserve(g, me, profile)
-            new = ai_try_recruit(g, me, current, profile, rng, level, budget)
-            if new is not None:
-                g = new
-    return g
-
-
-def ai_build_phase(bundle, me, level):
-    g = bundle["game"]
-    ensure_draft(bundle)
-    draft = bundle["draft"]
-    draft["remaining"] = g["remaining"]
-    draft["tick"] = g["tick"]
-    draft["active"] = g["active"]
-    try:
-        bundle["draft"] = ai_production(draft, me, level)
-    except Exception:
-        bundle["draft"] = draft
-    try:
-        commit_plan(bundle)
-    except ValueError:
-        # Plan impossible à fusionner : l'IA valide une production vide.
-        bundle["draft"] = None
-        ensure_draft(bundle)
-        commit_plan(bundle)
-
-
-# ------------------------------------------------------------
-# Pilotage d'un tour complet
-# ------------------------------------------------------------
-
-def ai_config(bundle):
-    config = bundle.get("ai") if isinstance(bundle, dict) else None
-    if not isinstance(config, dict) or config.get("seat") not in (0, 1):
-        return None
-    return config
-
-
-def ai_take_turn(bundle):
-    """Fait jouer l'IA jusqu'à ce que ce soit au joueur humain."""
-    config = ai_config(bundle)
-    if config is None:
-        return False
-    me, level = config["seat"], config.get("level", "intermediaire")
-    played = False
-    for _ in range(AI_MAX_STEPS):
-        g = bundle["game"]
-        if g["winner"] is not None or g["active"] != me:
-            break
-        g["curtain"] = False
-        if g["phase"] == "build":
-            if me in g.get("ready", []):
-                break
-            ai_build_phase(bundle, me, level)
-        elif g["phase"] == "move":
-            if not ai_move_step(bundle, me, level):
-                break
-        else:
-            break
-        played = True
-        check_victory(bundle["game"])
-    return played
-
-
-def ai_force_pass(bundle):
-    """Secours : l'IA termine proprement sa phase."""
-    g = bundle["game"]
-    if g["phase"] == "move":
-        game_action(bundle, pass_turn)
-    elif g["phase"] == "build":
-        bundle["draft"] = None
-        ensure_draft(bundle)
-        commit_plan(bundle)
-
-
-# ------------------------------------------------------------
-# Interface : partie contre l'IA
-# ------------------------------------------------------------
-
-def ai_label(bundle):
-    config = ai_config(bundle)
-    if config is None:
-        return ""
-    g = bundle["game"]
-    return f"{AI_LEVELS.get(config.get('level'), 'IA')} · {faction_of(g, config['seat'])['name']}"
-
-
-def ai_autoplay():
-    """Avant l'affichage : si c'est à l'IA, elle joue jusqu'au tour du joueur."""
-    bundle = st.session_state.get("bundle")
-    config = ai_config(bundle)
-    if config is None or not isinstance(bundle.get("game"), dict):
-        return
-    g = bundle["game"]
-    tick(g)
-    if g["winner"] is not None or g["active"] != config["seat"]:
-        return
-
-    candidate = copy.deepcopy(bundle)
-    start = len(candidate["game"]["log"])
-    problem = None
-    try:
-        ai_take_turn(candidate)
-    except Exception as exc:  # l'IA ne doit jamais bloquer la partie
-        problem = exc
-        candidate = copy.deepcopy(bundle)
-        try:
-            ai_force_pass(candidate)
-        except Exception:
-            return
-
-    game = candidate["game"]
-    report = game.pop("_combat_report", None)
-    game.pop("_ui_message", None)
-    game["curtain"] = False
-    if report is not None:
-        st.session_state.ui_combat_report = report
-
-    seat = config["seat"]
-    name = faction_of(game, seat)["name"]
-    lines = [line for line in game["log"][start:] if "passe pour le reste" not in line]
-    st.session_state.ai_last_actions = lines[-40:]
-    if problem is not None:
-        st.session_state.ui_message = f"🤖 L'IA a rencontré un problème ({problem}) : elle passe."
-    elif lines:
-        shown = [line.split(" — ", 1)[-1] for line in lines[-6:]]
-        st.session_state.ui_message = (
-            f"🤖 {name} (IA) a joué :\n\n" + "\n".join(f"- {line}" for line in shown)
-        )
-    st.session_state.bundle = candidate
-    bump_ui(clear_selection=True)
-
-
-_lw_ai_previous_main = main
-
-
-def main():
-    if not st.query_params.get("room"):
-        init_ui()
-        ai_autoplay()
-    _lw_ai_previous_main()
-
-
-_lw_ai_previous_render_sidebar = render_sidebar
-
-
-def render_sidebar(bundle):
-    _lw_ai_previous_render_sidebar(bundle)
-    if ai_config(bundle) is None:
-        return
-    with st.sidebar:
-        st.markdown(f"**🤖 Adversaire : IA** — {ai_label(bundle)}")
-        lines = st.session_state.get("ai_last_actions") or []
-        if lines:
-            with st.expander("Derniers coups de l'IA"):
-                st.markdown("\n".join(f"- {line}" for line in lines[-15:]))
-
-
-_lw_ai_previous_render_home = render_home
-
-
-def render_home():
-    with st.container(border=True):
-        st.markdown("### 🤖 Jouer contre l'IA")
-        st.caption("L'ordinateur joue l'autre faction, en respectant toutes les règles.")
-        faction_ids = list(FACTIONS)
-        mine_col, ai_col = st.columns(2)
-        with mine_col:
-            mine = st.selectbox(
-                "Ta faction", faction_ids, index=faction_ids.index(EXILES),
-                format_func=lambda fid: FACTIONS[fid]["name"], key="ai_home_mine",
-            )
-        with ai_col:
-            theirs = st.selectbox(
-                "Faction de l'IA", faction_ids, index=faction_ids.index(DEFERLANTS),
-                format_func=lambda fid: FACTIONS[fid]["name"], key="ai_home_theirs",
-            )
-        level = st.radio(
-            "Niveau de l'IA", list(AI_LEVELS), index=1, horizontal=True,
-            format_func=AI_LEVELS.get, key="ai_home_level",
-        )
-        st.caption({
-            "debutant": "Débutant : joue des coups simples, souvent au hasard. Idéal pour apprendre.",
-            "intermediaire": "Intermédiaire : produit beaucoup, bâtiments vers le front, économise pour les âges.",
-            "expert": "Expert : dépense tout son or, unités fortes de son âge, vise les bases et anticipe 3 coups.",
-        }[level])
-        first_col, mode_col = st.columns(2)
-        with first_col:
-            human_first = st.radio(
-                "Qui commence ?", [True, False], horizontal=True,
-                format_func=lambda v: "Moi" if v else "L'IA", key="ai_home_first",
-            )
-        with mode_col:
-            mode = st.radio(
-                "Victoire", list(VICTORY_MODES), index=list(VICTORY_MODES).index("bases"),
-                format_func=lambda m: VICTORY_MODES[m].split(" — ")[0], key="ai_home_mode",
-            )
-        minutes = 0
-        if mode == "time":
-            minutes = st.number_input("Durée en minutes", 5, 180, 60, 1, key="ai_home_minutes")
-        same = mine == theirs
-        if same:
-            st.error("Choisis deux factions différentes.")
-        if st.button("⚔️ Lancer la partie contre l'IA", type="primary", disabled=same, key="ai_home_start"):
-            # L'IA joue en haut du plateau (siège 0), toi en bas (siège 1).
-            bundle = new_bundle(1 if human_first else 0, 0, int(minutes), mode, (theirs, mine))
-            bundle["ai"] = {"seat": 0, "level": level}
-            reset_session(bundle)
-            st.rerun()
-    _lw_ai_previous_render_home()
-
-# ============================================================
 # BONUS D'ATTAQUE (Marteau foudroyant) : il absorbe aussi les pertes
 # Le Guerrier attaque avec 2,5 PF : contre 2 PF, il gagne et survit
 # avec 0,5 PF (auparavant l'attaque était impossible à valider).
@@ -15204,850 +14173,6 @@ def main():
     _lw_automove_previous_main()
 
 # ============================================================
-# IA (version 2) : production plus forte et anticipation
-# Intermédiaire : produit beaucoup, bâtiments vers le front, économise
-#   pour l'âge suivant tout en continuant à produire.
-# Expert : dépense tout (bâtiments au maximum, accélérés s'il est riche,
-#   unités de son âge en priorité, améliorations, colonies), vise les
-#   bases par les vrais chemins et anticipe 3 coups (son coup, la
-#   riposte adverse, sa réponse).
-# ============================================================
-
-AI_PROFILES["intermediaire"].update({
-    "front": True, "save_floor": 0.4, "build_target": "age", "tier_first": False,
-    "accelerate_at": 0, "depth": 1,
-})
-AI_PROFILES["expert"].update({
-    "front": True, "save_floor": 0.25, "build_target": "limit", "tier_first": True,
-    "accelerate_at": 1500, "depth": 3,
-})
-AI_PROFILES["debutant"].update({
-    "front": False, "save_floor": 1.0, "build_target": "one", "tier_first": False,
-    "accelerate_at": 0, "depth": 1,
-})
-
-# Améliorations prioritaires (production des Vagabonds).
-AI_PRIORITY_UPGRADES = ["Étroite communication I", "Multitâches", "Étroite communication II"]
-
-
-def ai_level_of(profile):
-    return next((lvl for lvl, prof in AI_PROFILES.items() if prof is profile), "intermediaire")
-
-
-def ai_age_ready(g, me):
-    """Vrai si l'âge suivant est atteignable (prérequis présents)."""
-    age = g["players"][me]["age"]
-    if age >= 3:
-        return False
-    needed = AGE_PREREQUISITES.get((faction_id(g, me), age + 1))
-    if needed and not building_is_completed(g, me, needed):
-        return False
-    # Inutile d'économiser l'or si le mana manque.
-    mana = AGE_COSTS[age + 1]["mana"]
-    if is_vagabond(g, me):
-        upgrade = VAG_AGE_UPGRADES.get(age + 1)
-        if upgrade and not owns_upgrade(g, me, upgrade):
-            mana += UPGRADES[upgrade]["mana"]
-    return g["players"][me]["mana"] >= mana
-
-
-def ai_reserve(g, me, profile):
-    """Or mis de côté pour l'âge suivant (jamais tout : la production continue)."""
-    age = g["players"][me]["age"]
-    if age >= 3 or g["turn"] < profile["age_turn"] or not ai_age_ready(g, me):
-        return 0
-    cost = AGE_COSTS[age + 1]["gold"]
-    if is_vagabond(g, me):
-        needed = VAG_AGE_UPGRADES.get(age + 1)
-        if needed and not owns_upgrade(g, me, needed):
-            cost += UPGRADES[needed]["cost"]
-    gold = g["players"][me]["gold"]
-    level = ai_level_of(profile)
-    if level == "expert" and gold < 0.6 * cost:
-        # L'Expert ne bloque pas son or tant que l'âge est encore loin.
-        return 0
-    floor = profile.get("save_floor", 1.0)
-    return max(0, min(cost, int(gold * (1 - floor))))
-
-
-def ai_unit_order(g, me, options, profile, rng, budget):
-    level = ai_level_of(profile)
-    age = g["players"][me]["age"]
-    if level == "debutant":
-        rng.shuffle(options)
-        return options
-
-    def strength(n):
-        data = UNITS[n]
-        value = data["pf"] * (1.3 if data["range"] else 1.0) + 0.1 * data["move"]
-        if n in NO_ATTACK_UNITS or n in MAGES or n in ("Décimant", "Kamikaze", "Gobelin", "Voyant"):
-            value *= 0.35
-        return value
-
-    if profile.get("tier_first"):
-        # Expert : unités de son âge d'abord, les plus fortes en tête.
-        options.sort(key=lambda n: (-min(UNIT_AGES.get(n, 1), age), -strength(n), rng.random()))
-    elif budget >= 1200:
-        options.sort(key=lambda n: (-strength(n), rng.random()))
-    else:
-        options.sort(key=lambda n: -ai_unit_rating(n, level) - rng.uniform(0, 0.5))
-    return options
-
-
-def ai_try_recruit(g, me, producer, profile, rng, level, budget):
-    options = [n for n in ai_recruit_options(g, me, producer) if n != WORKER and n in UNITS]
-    if not options:
-        return None
-    options = ai_unit_order(g, me, options, profile, rng, budget)
-    for name in options:
-        data = UNITS[name]
-        mana_left = g["players"][me]["mana"] - ai_mana_reserve(g, me, level)
-        if data["cost"] > budget or (data["mana"] and data["mana"] > mana_left):
-            continue
-        batch = 1 if is_hero(producer) else recruitment_batch(g, me, name)
-        cells = ai_recruit_positions(g, me, producer, batch)
-        if len(cells) < batch:
-            continue
-        new = ai_try_draft(g, recruit, me, producer["id"], name, cells[:batch])
-        if new is not None:
-            return new
-    return None
-
-
-def ai_mana_reserve(g, me, level):
-    """Mana gardé pour l'âge III, seulement quand il est proche."""
-    if level == "debutant" or g["players"][me]["age"] != 2 or not ai_age_ready(g, me):
-        return 0
-    need = AGE_COSTS[3]["mana"]
-    if is_vagabond(g, me) and not owns_upgrade(g, me, VAG_AGE_UPGRADES[3]):
-        need += UPGRADES[VAG_AGE_UPGRADES[3]]["mana"]
-    return need
-
-
-def ai_wanted_buildings(g, me, profile):
-    faction = faction_of(g, me)
-    age = g["players"][me]["age"]
-    target = profile.get("build_target", "one")
-    wanted = []
-    prerequisite = AGE_PREREQUISITES.get((faction_id(g, me), age + 1))
-    if prerequisite and not any(e["owner"] == me and e["name"] == prerequisite for e in g["entities"]):
-        wanted.append(prerequisite)
-    producers = [
-        (name, data) for name, data in faction["buildings"].items()
-        if data.get("units") and building_is_available(g, me, name)
-    ]
-    producers.sort(key=lambda item: -BUILDING_AGES.get((faction_id(g, me), item[0]), 1))
-    for name, data in producers:
-        count = sum(e["owner"] == me and e["name"] == name for e in g["entities"])
-        if target == "limit":
-            goal = data["limit"]
-        elif target == "age":
-            goal = min(data["limit"], age + 1)
-        else:
-            goal = min(data["limit"], 2 if age > 1 else 1)
-        if count < goal:
-            wanted.append(name)
-    tech = TECH_BUILDINGS.get(faction_id(g, me))
-    if profile["upgrades"] and tech and building_is_available(g, me, tech):
-        if not any(e["owner"] == me and e["name"] == tech for e in g["entities"]):
-            wanted.append(tech)
-    return list(dict.fromkeys(wanted))
-
-
-def ai_enemy_reach_cells(g, me):
-    """Cases que les unités ennemies visibles peuvent frapper au prochain tour."""
-    return [
-        (tuple(e["pos"]), ai_threat_reach(e))
-        for e in ai_enemy_pieces(g, me)
-        if e["kind"] == "unit" and e["name"] not in NO_ATTACK_UNITS
-    ]
-
-
-def ai_build_positions(g, me, source, name):
-    if name == TECH_BUILDINGS.get(faction_id(g, me)) and me in TECH_CELLS:
-        return [tech_cell(me)]
-    enemy = ai_enemy_home(g, me)
-    if source["name"] == WORKER:
-        cells = worker_build_slots(g, source, name)
-    else:
-        cells = ai_free_cells_near(g, tuple(source["pos"]), 1, 4)
-    profile = g.get("_ai_profile")
-    if profile and profile.get("front"):
-        # Bâtiments de production vers le front, mais hors de portée immédiate.
-        reach = ai_enemy_reach_cells(g, me)
-
-        def exposed(p):
-            return any(distance(p, w) <= r for w, r in reach)
-
-        cells.sort(key=lambda p: (exposed(p), distance(p, enemy), distance(p, tuple(source["pos"]))))
-    else:
-        cells.sort(key=lambda p: (-distance(p, enemy), distance(p, tuple(source["pos"]))))
-    return cells[:6]
-
-
-def ai_try_build(g, me, name, rng, accelerated=False):
-    for source in ai_build_sources(g, me):
-        for pos in ai_build_positions(g, me, source, name):
-            new = ai_try_draft(g, build, me, source["id"], name, pos, accelerated)
-            if new is not None:
-                return new
-    return None
-
-
-def ai_try_upgrades(g, me, profile, rng):
-    if not profile["upgrades"]:
-        return g
-    level = ai_level_of(profile)
-    names = list(available_upgrades(g, me))
-    rng.shuffle(names)
-    names.sort(key=lambda n: (
-        n not in AI_PRIORITY_UPGRADES,
-        AI_PRIORITY_UPGRADES.index(n) if n in AI_PRIORITY_UPGRADES else 0,
-        n not in PF_UPGRADES,
-        UPGRADES[n]["cost"],
-    ))
-    keep = 0 if level == "expert" else 300
-    for name in names:
-        upgrade = UPGRADES[name]
-        if g["players"][me]["gold"] - upgrade["cost"] < keep + ai_reserve(g, me, profile):
-            continue
-        if upgrade["mana"] and g["players"][me]["mana"] - upgrade["mana"] < ai_mana_reserve(g, me, level):
-            continue
-        new = ai_try_draft(g, purchase_upgrade, me, name)
-        if new is not None:
-            g = new
-    return g
-
-
-def ai_recruit_all(g, me, profile, rng, level, passes=3, keep_reserve=True):
-    producers = [
-        e for e in g["entities"]
-        if e["owner"] == me and (e["kind"] == "building" or is_hero(e)) and not e["wait"]
-    ]
-    rng.shuffle(producers)
-    for _ in range(passes):
-        progress = False
-        for producer in producers:
-            current = next((e for e in g["entities"] if e["id"] == producer["id"]), None)
-            if current is None:
-                continue
-            reserve = ai_reserve(g, me, profile) if keep_reserve else 0
-            budget = g["players"][me]["gold"] - reserve
-            new = ai_try_recruit(g, me, current, profile, rng, level, budget)
-            if new is not None:
-                g, progress = new, True
-        if not progress:
-            break
-    return g
-
-
-def ai_production(draft, me, level):
-    """Construit, recrute et améliore dans le brouillon privé de l'IA.
-    Priorité aux unités militaires : chaque bâtiment prêt produit d'abord."""
-    profile = ai_profile(level)
-    rng = ai_rng(draft, 17 + me)
-    g = draft
-    g["_ai_profile"] = profile
-    try:
-        g = ai_scout_mana(g, me, profile)
-        g = ai_workers(g, me, profile)
-        g = ai_heroes(g, me, profile, rng)
-
-        # Passage d'âge immédiat seulement si l'or suffit largement.
-        age = g["players"][me]["age"]
-        if age < 3 and g["players"][me]["gold"] >= 1.6 * AGE_COSTS[age + 1]["gold"]:
-            g = ai_try_age(g, me, profile, rng)
-            g["_ai_profile"] = profile
-
-        if level == "debutant":
-            g = ai_try_age(g, me, profile, rng)
-            g["_ai_profile"] = profile
-
-        # 1. Tous les bâtiments prêts produisent des unités militaires.
-        g = ai_fusions(g, me, profile)
-        g = ai_recruit_all(g, me, profile, rng, level, passes=1, keep_reserve=(level != "expert"))
-
-        # 2. Âge suivant avec ce qui reste.
-        if level != "debutant":
-            g = ai_try_age(g, me, profile, rng)
-            g["_ai_profile"] = profile
-
-        # 3. Nouveaux bâtiments de production.
-        if is_vagabond(g, me) and level != "debutant":
-            g = ai_try_upgrades(g, me, profile, rng)
-        if not ai_has_mana_base(g, me):
-            g = ai_try_colony(g, me, profile)
-        wanted = ai_wanted_buildings(g, me, profile)
-        if level == "debutant":
-            rng.shuffle(wanted)
-            wanted = wanted[:1]
-        rich = bool(profile.get("accelerate_at")) and g["players"][me]["gold"] >= profile["accelerate_at"]
-        for name in wanted[: (len(wanted) if level == "expert" else 3)]:
-            new = ai_try_build(g, me, name, rng, accelerated=rich)
-            if new is None and rich:
-                new = ai_try_build(g, me, name, rng)
-            if new is not None:
-                g = new
-
-        # 4. Le reste : encore des unités, puis améliorations et colonies.
-        g = ai_recruit_all(g, me, profile, rng, level, passes=3)
-        g = ai_try_upgrades(g, me, profile, rng)
-        g = ai_try_colony(g, me, profile)
-        g = ai_recruit_all(g, me, profile, rng, level, passes=2)
-    finally:
-        g.pop("_ai_profile", None)
-    return g
-
-
-# Détruire 3 bases ennemies gagne la partie : chaque base détruite compte beaucoup.
-AI_BASE_KILL_VALUE = 3500.0
-
-_lw_ai3_previous_ai_material = ai_material
-
-
-def ai_material(g, me):
-    score = _lw_ai3_previous_ai_material(g, me)
-    if g.get("winner") is not None:
-        return score
-    return score + AI_BASE_KILL_VALUE * (
-        g["players"][me].get("bases", 0) - g["players"][1 - me].get("bases", 0)
-    )
-
-
-# ------------------------------------------------------------
-# Manœuvres : vrais chemins vers les bases, anticipation sur 3 coups
-# ------------------------------------------------------------
-
-def ai_goal_distances(g, goals, base_goals):
-    """Distance de marche (montagnes = 2, mer infranchissable) vers les objectifs.
-    Les bases ennemies sont prioritaires sur les bâtiments."""
-    dist = {}
-    queue = []
-    for pos in goals:
-        start = 0 if pos in base_goals else 3
-        if start < dist.get(pos, math.inf):
-            dist[pos] = start
-            heapq.heappush(queue, (start, pos))
-    while queue:
-        cost, pos = heapq.heappop(queue)
-        if cost != dist.get(pos):
-            continue
-        for nxt in neighbors(pos):
-            kind = terrain(g, nxt)
-            if kind == "sea":
-                continue
-            new = cost + (2 if kind == "mountain" else 1)
-            if new < dist.get(nxt, math.inf):
-                dist[nxt] = new
-                heapq.heappush(queue, (new, nxt))
-    return dist
-
-
-_lw_ai2_previous_ai_context = ai_context
-
-
-def ai_context(g, me, profile):
-    ctx = _lw_ai2_previous_ai_context(g, me, profile)
-    if profile.get("depth", 1) > 1 or profile.get("front"):
-        enemies = ai_enemy_pieces(g, me)
-        bases = {tuple(e["pos"]) for e in enemies if e["kind"] == "base"}
-        buildings = {tuple(e["pos"]) for e in enemies if e["kind"] == "building"}
-        if bases or buildings:
-            ctx["goal_dist"] = ai_goal_distances(g, bases | buildings, bases)
-    return ctx
-
-
-_lw_ai2_previous_ai_place_score = ai_place_score
-
-
-def ai_place_score(ctx, unit, pos):
-    dist = ctx.get("goal_dist")
-    if not dist or is_flying(unit):
-        return _lw_ai2_previous_ai_place_score(ctx, unit, pos)
-    # Même calcul, mais la distance aux objectifs suit les vrais chemins.
-    saved = ctx["goals"]
-    ctx["goals"] = []
-    try:
-        score = _lw_ai2_previous_ai_place_score(ctx, unit, pos)
-    finally:
-        ctx["goals"] = saved
-    far = max(dist.values(), default=0) + 5
-    return score - ctx["profile"]["advance"] * dist.get(pos, far)
-
-
-def ai_best_attack(g, side, me):
-    """Meilleure attaque immédiate du camp « side », mesurée du point de vue de « me »."""
-    if g.get("winner") is not None or g.get("phase") != "move" or g.get("active") != side:
-        return 0.0, None
-    base = ai_material(g, me)
-    best, best_state = 0.0, None
-    for candidate in ai_attack_candidates(g, side, AI_PROFILES["intermediaire"])[:AI_REPLY_LIMIT]:
-        fn, args = ai_resolve(g, candidate)
-        if fn is None:
-            continue
-        after = ai_simulate(g, fn, *args)
-        if after is None:
-            continue
-        delta = ai_material(after, me) - base
-        gain = delta if side == me else -delta
-        if gain > best:
-            best, best_state = gain, after
-    return best, best_state
-
-
-def ai_lookahead(g, me, options, profile):
-    """Coup de l'IA → meilleure riposte adverse → meilleure réponse de l'IA."""
-    opponent = 1 - me
-    if opponent in g.get("passed", []):
-        return options
-    now = ai_clone(g)
-    now["active"] = opponent
-    now.pop("moving_unit_id", None)
-    baseline, _ = ai_best_attack(now, opponent, me)
-    depth = profile.get("depth", 2)
-    checked = []
-    for gain, after, move in options[:AI_LOOKAHEAD]:
-        if after is None:
-            after = ai_simulate(g, move_unit, *move)
-            if after is None:
-                continue
-        loss, reply_state = ai_best_attack(after, opponent, me)
-        value = gain - profile["lookahead"] * (loss - baseline)
-        if depth >= 3:
-            follow_from = reply_state if reply_state is not None else after
-            if follow_from.get("active") == me:
-                follow, _ = ai_best_attack(follow_from, me, me)
-                value += 0.5 * profile["lookahead"] * follow
-        checked.append((value, after, move))
-    checked.sort(key=lambda item: -item[0])
-    return checked + options[AI_LOOKAHEAD:]
-
-
-AI_LOOKAHEAD = 6
-AI_REPLY_LIMIT = 12
-
-# ============================================================
-# IA (version 3) : améliorations choisies selon la partie,
-# passage d'âge planifié, défense des passages vers ses bases.
-# ============================================================
-
-# Unités concernées par chaque amélioration.
-AI_UPGRADE_UNITS = {
-    "2 pattes en plus": ("Déferlant",),
-    "Dents acérées": ("Déferlant",),
-    "Dents acérées volants": ("Volant",),
-    "Instinct elfique": ("Elfe",),
-    "Développement musculaire": ("Mammouth dompté",),
-    "Meute de tigres": ("Tigre des forêts",),
-    "Marteau foudroyant": ("Guerrier",),
-    "Esquive": ("Éclaireur",),
-    "Flèches enflammées": ("Archer",),
-    "Pierres enflammées": ("Catapulte", "Catapulte de l'enfer"),
-    "Invisibilité griffons": ("Griffon",),
-    "Mutation imminente": ("Agile",),
-    "Endurance": ("Barbare",),
-}
-# Améliorations rarement utiles à l'IA (mécaniques qu'elle n'exploite pas).
-AI_MINOR_UPGRADES = {"Mutation kamikaze", "Rampants", "Trébuchet", "Aramil le sorcier élu", "Solidarité"}
-AI_UPGRADE_URGENT = 500
-AI_UPGRADE_DECISIVE = 2000
-# Âge visé à partir de ce tour (Expert).
-AI_AGE_DUE = {2: 3, 3: 6}
-
-
-def ai_upgrade_value(g, me, name):
-    """Intérêt d'une amélioration pour l'IA, selon la partie en cours."""
-    if name in AI_PRIORITY_UPGRADES:
-        return 3000
-    if name in AI_MINOR_UPGRADES:
-        return 60
-    mine = [e for e in g["entities"] if e["owner"] == me and e["kind"] == "unit"]
-    enemies = [e for e in ai_enemy_pieces(g, me) if e["kind"] == "unit"]
-    concerned = AI_UPGRADE_UNITS.get(name, ())
-    owned = sum(e["name"] in concerned for e in mine)
-    producible = any(
-        n in concerned
-        for data in faction_of(g, me)["buildings"].values()
-        for n in data.get("units", [])
-    )
-    value = 150 + 130 * owned + (120 if producible else 0)
-    if name == "Meute de tigres":
-        # Contre une marée d'unités d'âge I (ex. 10 Déferlants), les Tigres piétinent.
-        weak = sum(UNIT_AGES.get(e["name"], 1) == 1 for e in enemies)
-        swarm = sum(e["name"] == "Déferlant" for e in enemies)
-        value += 70 * weak + (2500 if swarm >= 10 or weak >= 12 else 0)
-    elif name == "Vengeance":
-        value += 25 * len(enemies)
-    elif name in PF_UPGRADES or name in ATTACK_UPGRADES:
-        value += 80 * owned
-    return value
-
-
-def ai_buy_upgrades(g, me, profile, rng, minimum):
-    """Achète les améliorations dont l'intérêt dépasse « minimum », les plus utiles d'abord."""
-    if not profile["upgrades"]:
-        return g
-    level = ai_level_of(profile)
-    names = sorted(available_upgrades(g, me), key=lambda n: -ai_upgrade_value(g, me, n))
-    for name in names:
-        value = ai_upgrade_value(g, me, name)
-        if value < minimum:
-            break
-        upgrade = UPGRADES[name]
-        if upgrade["mana"] and g["players"][me]["mana"] - upgrade["mana"] < ai_mana_reserve(g, me, level):
-            continue
-        if value < AI_UPGRADE_DECISIVE and g["players"][me]["gold"] - upgrade["cost"] < ai_reserve(g, me, profile):
-            continue
-        new = ai_try_draft(g, purchase_upgrade, me, name)
-        if new is not None:
-            g = new
-    return g
-
-
-def ai_try_upgrades(g, me, profile, rng):
-    """Améliorations restantes avec l'or qui reste (après le recrutement)."""
-    keep = 0 if ai_level_of(profile) == "expert" else 300
-    if g["players"][me]["gold"] <= keep:
-        return g
-    return ai_buy_upgrades(g, me, profile, rng, minimum=100)
-
-
-def ai_age_due(g, me, profile):
-    age = g["players"][me]["age"]
-    if age >= 3 or not ai_age_ready(g, me):
-        return False
-    return g["turn"] >= AI_AGE_DUE.get(age + 1, 99) if ai_level_of(profile) == "expert" else g["turn"] >= profile["age_turn"]
-
-
-_lw_ai3_previous_ai_reserve = ai_reserve
-
-
-def ai_reserve(g, me, profile):
-    if ai_level_of(profile) != "expert":
-        return _lw_ai3_previous_ai_reserve(g, me, profile)
-    if not ai_age_due(g, me, profile):
-        return 0
-    # Âge dû : l'Expert met l'or de côté (il passe l'âge au tour suivant au plus tard).
-    age = g["players"][me]["age"]
-    cost = AGE_COSTS[age + 1]["gold"]
-    if is_vagabond(g, me):
-        needed = VAG_AGE_UPGRADES.get(age + 1)
-        if needed and not owns_upgrade(g, me, needed):
-            cost += UPGRADES[needed]["cost"]
-    return min(cost, g["players"][me]["gold"])
-
-
-_lw_ai3_previous_ai_unit_order = ai_unit_order
-
-
-def ai_unit_order(g, me, options, profile, rng, budget):
-    options = _lw_ai3_previous_ai_unit_order(g, me, options, profile, rng, budget)
-    if ai_level_of(profile) == "debutant":
-        return options
-    # Unités renforcées par une amélioration achetée : priorité.
-    boosted = {
-        unit for name, units in AI_UPGRADE_UNITS.items()
-        if owns_upgrade(g, me, name) for unit in units
-    }
-    return sorted(options, key=lambda n: n not in boosted)
-
-
-_lw_ai3_previous_ai_wanted_buildings = ai_wanted_buildings
-
-
-def ai_wanted_buildings(g, me, profile):
-    wanted = _lw_ai3_previous_ai_wanted_buildings(g, me, profile)
-    tech = TECH_BUILDINGS.get(faction_id(g, me))
-    if tech in wanted and ai_level_of(profile) != "debutant":
-        # Le bâtiment technique (améliorations) passe juste après le prérequis d'âge.
-        wanted.remove(tech)
-        wanted.insert(1 if wanted and wanted[0] == AGE_PREREQUISITES.get((faction_id(g, me), g["players"][me]["age"] + 1)) else 0, tech)
-    return wanted
-
-
-def ai_production(draft, me, level):
-    """Production : améliorations utiles, âge dû, unités militaires, bâtiments."""
-    profile = ai_profile(level)
-    rng = ai_rng(draft, 17 + me)
-    g = draft
-    g["_ai_profile"] = profile
-    try:
-        g = ai_scout_mana(g, me, profile)
-        g = ai_workers(g, me, profile)
-        g = ai_heroes(g, me, profile, rng)
-
-        # 0. Améliorations décisives (contre-mesure, production des héros) : avant tout.
-        urgent = False
-        if level != "debutant":
-            owned = len(g["players"][me].get("upgrades", []))
-            g = ai_buy_upgrades(g, me, profile, rng, minimum=AI_UPGRADE_DECISIVE)
-            urgent = len(g["players"][me].get("upgrades", [])) > owned or bool(g.pop("_ai_urgent", False))
-            # Menacé (armée plus faible) : les unités passent avant l'âge.
-            urgent = urgent or bool(ai_context(g, me, profile).get("defensive"))
-
-        # 1. Âge : tout de suite s'il est dû et payable (ou si l'or abonde).
-        age = g["players"][me]["age"]
-        if level == "debutant" or (ai_age_due(g, me, profile) and not urgent) or (
-            age < 3 and g["players"][me]["gold"] >= 1.6 * AGE_COSTS[age + 1]["gold"]
-        ):
-            g = ai_try_age(g, me, profile, rng)
-            g["_ai_profile"] = profile
-
-        # 2. Améliorations importantes pour la partie en cours.
-        if level != "debutant":
-            g = ai_buy_upgrades(g, me, profile, rng, minimum=AI_UPGRADE_URGENT)
-
-        # 3. Tous les bâtiments prêts produisent des unités militaires.
-        g = ai_fusions(g, me, profile)
-        g = ai_recruit_all(g, me, profile, rng, level, passes=1, keep_reserve=not urgent)
-
-        # 4. Nouveaux bâtiments (prérequis d'âge et bâtiment technique d'abord).
-        if not ai_has_mana_base(g, me):
-            g = ai_try_colony(g, me, profile)
-        wanted = ai_wanted_buildings(g, me, profile)
-        if level == "debutant":
-            rng.shuffle(wanted)
-            wanted = wanted[:1]
-        rich = bool(profile.get("accelerate_at")) and g["players"][me]["gold"] >= profile["accelerate_at"]
-        for name in wanted[: (len(wanted) if level == "expert" else 3)]:
-            # L'or mis de côté pour l'âge n'est pas dépensé en bâtiments.
-            cost = faction_of(g, me)["buildings"].get(name, {}).get("cost", 0)
-            if g["players"][me]["gold"] - cost * (1.5 if rich else 1) < ai_reserve(g, me, profile):
-                continue
-            new = ai_try_build(g, me, name, rng, accelerated=rich)
-            if new is None and rich:
-                new = ai_try_build(g, me, name, rng)
-            if new is not None:
-                g = new
-
-        # 5. Le reste : unités, autres améliorations, colonies.
-        g = ai_recruit_all(g, me, profile, rng, level, passes=3)
-        g = ai_try_upgrades(g, me, profile, rng)
-        g = ai_try_colony(g, me, profile)
-        g = ai_recruit_all(g, me, profile, rng, level, passes=2)
-    finally:
-        g.pop("_ai_profile", None)
-    return g
-
-
-# ------------------------------------------------------------
-# Défense : tenir les passages entre l'ennemi et ses bases
-# ------------------------------------------------------------
-
-AI_GUARD_VALUE = 70.0
-
-
-def ai_walk_distances(g, sources):
-    dist, queue = {}, []
-    for pos in sources:
-        dist[pos] = 0
-        heapq.heappush(queue, (0, pos))
-    while queue:
-        cost, pos = heapq.heappop(queue)
-        if cost != dist.get(pos):
-            continue
-        for nxt in neighbors(pos):
-            kind = terrain(g, nxt)
-            if kind == "sea":
-                continue
-            new = cost + (2 if kind == "mountain" else 1)
-            if new < dist.get(nxt, math.inf):
-                dist[nxt] = new
-                heapq.heappush(queue, (new, nxt))
-    return dist
-
-
-_lw_ai3_previous_ai_context = ai_context
-
-
-def ai_context(g, me, profile):
-    ctx = _lw_ai3_previous_ai_context(g, me, profile)
-    if profile.get("defend", 0) <= 0 or ai_level_of(profile) == "debutant":
-        return ctx
-    bases = [tuple(e["pos"]) for e in g["entities"] if e["owner"] == me and e["kind"] == "base" and not is_hero(e)]
-    if not bases:
-        return ctx
-    home = ai_walk_distances(g, bases)
-    enemies = [
-        e for e in ai_enemy_pieces(g, me)
-        if e["kind"] == "unit" and e["name"] not in NO_ATTACK_UNITS
-    ]
-    # Ennemis qui peuvent atteindre une base en 2 tours environ.
-    approaching = [
-        (tuple(e["pos"]), home.get(tuple(e["pos"]), 99))
-        for e in enemies
-        if home.get(tuple(e["pos"]), 99) <= 2 * UNITS.get(e["name"], {}).get("move", 3) + 2
-    ]
-    mine = sum(ai_unit_value(e) for e in g["entities"] if e["owner"] == me and e["kind"] == "unit" and e["name"] != WORKER)
-    theirs = sum(ai_unit_value(e) for e in enemies) or 1.0
-    ctx["home_dist"] = home
-    ctx["approaching"] = approaching
-    # Armée plus faible : on tient les passages plutôt que d'attaquer.
-    ctx["defensive"] = mine < 0.9 * theirs
-    return ctx
-
-
-_lw_ai3_previous_ai_place_score = ai_place_score
-
-
-def ai_place_score(ctx, unit, pos):
-    score = _lw_ai3_previous_ai_place_score(ctx, unit, pos)
-    home = ctx.get("home_dist")
-    if not home:
-        return score
-    here = home.get(pos, 99)
-    if ctx.get("defensive"):
-        # Moins d'avance vers l'ennemi, rester près de ses bases.
-        dist = ctx.get("goal_dist")
-        if dist:
-            far = max(dist.values(), default=0) + 5
-            score += 0.7 * ctx["profile"]["advance"] * dist.get(pos, far)
-        if here > 4:
-            score -= 12 * (here - 4)
-    guard = 0.0
-    for where, their_home in ctx.get("approaching", []):
-        # Case sur le chemin de cet ennemi vers nos bases, devant elles.
-        if here <= 4 and here + distance(pos, where) <= their_home + 1:
-            guard = max(guard, 1.0 if here >= 1 else 0.5)
-    return score + AI_GUARD_VALUE * guard * (1.5 if ctx.get("defensive") else 1.0)
-
-# ============================================================
-# IA (version 4) : ouvriers des Derniers nés envoyés sur les chantiers
-# clés (Forge en case technique, colonie près du mana), et ces
-# constructions passent avant le recrutement.
-# ============================================================
-
-def ai_worker_to_site(g, me, sites, reserved=()):
-    """Envoie un ouvrier libre à côté d'une des cases « sites » ; renvoie (état, ouvrier)."""
-    sites = [p for p in sites if at(g, p) is None]
-    if not sites:
-        return g, None
-    workers = [
-        e for e in g["entities"]
-        if e["owner"] == me and e["name"] == WORKER and not e["wait"] and not e["used"]
-        and e["id"] not in reserved
-    ]
-    # Déjà à côté d'un chantier : il construit tout de suite.
-    for worker in workers:
-        if any(distance(tuple(worker["pos"]), p) == 1 for p in sites):
-            return g, worker
-    workers.sort(key=lambda w: (
-        key(tuple(w["pos"])) in g["resources"],
-        min(distance(tuple(w["pos"]), p) for p in sites),
-    ))
-    for worker in workers[:2]:
-        options = list(worker_destinations(g, worker))
-        if not options:
-            continue
-        best = min(options, key=lambda p: (min(abs(distance(p, q) - 1) for q in sites), p))
-        new = ai_try_draft(g, move_worker, me, worker["id"], best)
-        if new is not None:
-            moved = entity(new, worker["id"])
-            if any(distance(tuple(moved["pos"]), p) == 1 for p in sites):
-                return new, moved
-            return new, None
-    return g, None
-
-
-def ai_mana_sites(g, me):
-    bases = [tuple(e["pos"]) for e in g["entities"] if e["owner"] == me and e["kind"] == "base"]
-    return [
-        p for k, v in g["resources"].items() if v[0] == "mana"
-        for p in neighbors(tuple(int(x) for x in k.split(",")))
-        if valid_position(p) and at(g, p) is None and not blocked(g, p)
-        and key(p) not in g["resources"]
-        and min((distance(p, b) for b in bases), default=9) >= 2
-    ]
-
-
-def ai_key_constructions(g, me, profile, rng):
-    """Colonie près du mana, prérequis d'âge et bâtiment technique, avant les unités."""
-    if ai_level_of(profile) == "debutant":
-        return g
-    faction = faction_of(g, me)
-    dn = faction_id(g, me) == DERNIERS_NES
-    used = set()
-
-    # 1. Colonie au bord du mana (indispensable pour l'âge III et les unités fortes).
-    if profile["colonies"] and not is_vagabond(g, me) and not ai_has_mana_base(g, me):
-        if dn:
-            sites = ai_mana_sites(g, me)
-            g, worker = ai_worker_to_site(g, me, sites)
-            if worker is not None:
-                used.add(worker["id"])
-                for pos in sorted(
-                    (p for p in sites if distance(p, tuple(worker["pos"])) == 1),
-                    key=lambda p: -ai_colony_value(g, p),
-                ):
-                    new = ai_try_draft(g, build, me, worker["id"], faction["base"], pos, False)
-                    if new is not None:
-                        g = new
-                        break
-        else:
-            g = ai_try_colony(g, me, dict(profile, colonies=True))
-
-    # 2. Prérequis d'âge et bâtiment technique (améliorations).
-    age = g["players"][me]["age"]
-    key_buildings = [
-        name for name in (
-            AGE_PREREQUISITES.get((faction_id(g, me), age + 1)),
-            TECH_BUILDINGS.get(faction_id(g, me)),
-        )
-        if name and building_is_available(g, me, name)
-        and not any(e["owner"] == me and e["name"] == name for e in g["entities"])
-    ]
-    for name in key_buildings:
-        if dn and name == TECH_BUILDINGS.get(DERNIERS_NES) and me in TECH_CELLS:
-            cell = tech_cell(me)
-            g, worker = ai_worker_to_site(g, me, [cell], reserved=used)
-            if worker is not None:
-                new = ai_try_draft(g, build, me, worker["id"], name, cell, False)
-                if new is not None:
-                    g = new
-                    used.add(worker["id"])
-            continue
-        new = ai_try_build(g, me, name, rng)
-        if new is not None:
-            g = new
-    return g
-
-
-_lw_ai4_previous_ai_production = ai_production
-
-
-def ai_production(draft, me, level):
-    profile = ai_profile(level)
-    rng = ai_rng(draft, 29 + me)
-    draft["_ai_profile"] = profile
-    try:
-        urgent = False
-        if level != "debutant":
-            # Contre-mesures décisives d'abord (ex. Meute de tigres contre une marée).
-            owned = len(draft["players"][me].get("upgrades", []))
-            draft = ai_buy_upgrades(draft, me, profile, rng, minimum=AI_UPGRADE_DECISIVE)
-            urgent = len(draft["players"][me].get("upgrades", [])) > owned
-        if not urgent:
-            draft = ai_key_constructions(draft, me, profile, rng)
-        draft["_ai_urgent"] = urgent
-    finally:
-        draft.pop("_ai_profile", None)
-    result = _lw_ai4_previous_ai_production(draft, me, level)
-    result.pop("_ai_urgent", None)
-    return result
-
-_lw_ai5_previous_ai_build_sources = ai_build_sources
-
-
-def ai_build_sources(g, me):
-    if faction_id(g, me) != EXILES:
-        return _lw_ai5_previous_ai_build_sources(g, me)
-    # Les Habitations des Exilés peuvent construire plusieurs fois par tour.
-    return [
-        e for e in g["entities"]
-        if e["owner"] == me and e["kind"] == "base" and not e["wait"]
-    ]
-
-# ============================================================
 # ABANDON DE LA PARTIE
 # À tout moment, le joueur peut abandonner : l'autre joueur gagne.
 # - Partie locale : abandon du joueur qui a la main.
@@ -16117,37 +14242,6 @@ def render_sidebar(bundle):
     with st.sidebar:
         render_forfeit(bundle)
 
-# --- IA : distances de marche mises en cache (la carte ne change pas en cours de partie).
-_AI_DIST_CACHE = {}
-
-
-def ai_terrain_key(g):
-    return hash(tuple(sorted(g["terrain"].items())))
-
-
-_lw_cache_previous_ai_walk_distances = ai_walk_distances
-
-
-def ai_walk_distances(g, sources):
-    cache_key = ("walk", ai_terrain_key(g), frozenset(sources))
-    if cache_key not in _AI_DIST_CACHE:
-        if len(_AI_DIST_CACHE) > 400:
-            _AI_DIST_CACHE.clear()
-        _AI_DIST_CACHE[cache_key] = _lw_cache_previous_ai_walk_distances(g, sources)
-    return _AI_DIST_CACHE[cache_key]
-
-
-_lw_cache_previous_ai_goal_distances = ai_goal_distances
-
-
-def ai_goal_distances(g, goals, base_goals):
-    cache_key = ("goal", ai_terrain_key(g), frozenset(goals), frozenset(base_goals))
-    if cache_key not in _AI_DIST_CACHE:
-        if len(_AI_DIST_CACHE) > 400:
-            _AI_DIST_CACHE.clear()
-        _AI_DIST_CACHE[cache_key] = _lw_cache_previous_ai_goal_distances(g, goals, base_goals)
-    return _AI_DIST_CACHE[cache_key]
-
 # --- Écran de fin après un abandon : image dédiée.
 ABANDON_IMAGE = Path(__file__).parent / "assets" / "abandon.jpg"
 
@@ -16202,6 +14296,2378 @@ def render_victory_screen(g):
         unsafe_allow_html=True,
     )
 
+# ============================================================
+# IA : ADVERSAIRE CONTRÔLÉ PAR L'ORDINATEUR — TROIS NIVEAUX
+# Un seul moteur, des réglages différents par niveau (AI_PARAMS).
+# Chaque action est d'abord essayée sur une copie de la partie : l'IA
+# respecte toutes les règles du jeu. Elle ne voit que ce qu'un joueur
+# voit (pas d'unité invisible non détectée, pas la production secrète
+# de l'adversaire). Aucun choix n'est tiré au hasard.
+#
+# Débutant      : dépense au moins 75 % de son or et de son mana.
+#                 Attaque ce qu'il bat, avance vers la base ennemie la
+#                 plus proche, ne surveille pas les menaces.
+# Intermédiaire : dépense au moins 90 %. Voit venir la riposte adverse,
+#                 évite les cases menacées au prochain tour, défend ses
+#                 bases, attaque en groupe.
+# Expert        : dépense 100 % de ses ressources, sauf ce qu'il garde
+#                 pour passer à l'âge II ou III. Anticipe l'adversaire sur
+#                 2 tours (riposte, réponse, nouvelle riposte), agressif :
+#                 vise les bases (3 bases détruites = victoire).
+# ============================================================
+
+AI_LEVELS = {
+    "debutant": "🟢 Débutant",
+    "intermediaire": "🟠 Intermédiaire",
+    "expert": "🔴 Expert",
+}
+
+AI_LEVEL_TEXT = {
+    "debutant": "Débutant : joue simplement mais jamais au hasard, dépense au moins 75 % de ses ressources.",
+    "intermediaire": "Intermédiaire : dépense au moins 90 %, voit venir tes attaques, se défend et attaque bien.",
+    "expert": "Expert : dépense tout (sauf pour changer d'âge), anticipe sur 2 tours et attaque sans relâche.",
+}
+
+AI_PARAMS = {
+    "debutant": {
+        # Jeu simple mais jamais au hasard : unités les moins chères, pas
+        # d'améliorations (sauf celles indispensables aux Vagabonds), marche
+        # vers l'ennemi le plus proche, prend la première attaque gagnante.
+        "spend": 0.75, "save_for_age": False, "age_from": {2: 5, 3: 9},
+        "building_goal": 1, "fast_build_at": None, "eco_colonies": False,
+        "upgrade_min": 99999, "decisive_upgrades": False, "unit_rule": "cheap",
+        "advance": 10.0, "danger": 0.0, "threat_turns": 0, "defend": 0.0,
+        "groups": False, "replies": 0, "top": 0, "base_bonus": 1500.0,
+        "front": False, "chase": True, "first_attack": True,
+    },
+    "intermediaire": {
+        "spend": 0.90, "save_for_age": True, "age_from": {2: 4, 3: 7},
+        "building_goal": 2, "fast_build_at": None, "eco_colonies": True,
+        "upgrade_min": 300, "decisive_upgrades": True, "unit_rule": "balanced",
+        "advance": 12.0, "danger": 0.3, "threat_turns": 1, "defend": 1.0,
+        "groups": True, "replies": 1, "top": 5, "base_bonus": 2500.0,
+        "front": True,
+    },
+    "expert": {
+        "spend": 1.0, "save_for_age": True, "age_from": {2: 3, 3: 6},
+        "building_goal": "limit", "fast_build_at": 1500, "eco_colonies": True,
+        "upgrade_min": 150, "decisive_upgrades": True, "unit_rule": "tier",
+        "advance": 26.0, "danger": 0.15, "threat_turns": 2, "defend": 0.6,
+        "groups": True, "replies": 3, "top": 4, "base_bonus": 3500.0,
+        "front": True,
+    },
+}
+
+AI_MAX_STEPS = 1500  # garde-fou : l'IA joue tout son tour d'un coup
+AI_TRIES = 12
+AI_REPLY_LIMIT = 8
+AI_ATTACK_LIMIT = 30  # attaques simulées au plus par activation (les plus prometteuses)
+AI_ANTICIPATE_WEIGHT = 0.8
+AI_GUARD_VALUE = 70.0
+AI_ERRORS = (ValueError, KeyError, TypeError, IndexError, AttributeError, ZeroDivisionError)
+
+# Unités dont l'IA n'exploite pas les pouvoirs : produites en dernier recours.
+AI_WEAK_UNITS = {"Gobelin", "Mage des montagnes", "Décimant", "Dirigeable", "Kamikaze", "Aramil"}
+
+
+def ai_params(level):
+    return AI_PARAMS.get(level, AI_PARAMS["intermediaire"])
+
+
+# ------------------------------------------------------------
+# Copies rapides et essais d'actions
+# ------------------------------------------------------------
+
+def ai_copy(value):
+    kind = type(value)
+    if kind is dict:
+        return {k: ai_copy(v) for k, v in value.items()}
+    if kind is list:
+        return [ai_copy(v) for v in value]
+    if kind is tuple:
+        return tuple(ai_copy(v) for v in value)
+    if kind is set:
+        return set(value)
+    return value
+
+
+# La carte ne change jamais pendant la partie : les copies la partagent.
+AI_SHARED_FIELDS = ("terrain", "resources")
+
+
+def ai_clone(g):
+    """Copie de travail de la partie (journal vidé, recollé ensuite)."""
+    return {
+        k: [] if k == "log" else v if k in AI_SHARED_FIELDS else ai_copy(v)
+        for k, v in g.items()
+    }
+
+
+def ai_restore_log(original, clone):
+    clone["log"] = list(original.get("log", [])) + clone.get("log", [])
+    return clone
+
+
+def ai_simulate(g, fn, *args):
+    """Manœuvre essayée sur une copie ; None si les règles la refusent."""
+    bundle = {"game": ai_clone(g), "draft": None, "committed": None}
+    try:
+        game_action(bundle, fn, *args)
+    except AI_ERRORS:
+        return None
+    return bundle["game"]
+
+
+def ai_try(g, fn, me, *args):
+    """Action de production essayée sur une copie du brouillon."""
+    clone = ai_clone(g)
+    try:
+        fn(clone, me, *args)
+    except AI_ERRORS:
+        return None
+    return ai_restore_log(g, clone)
+
+
+def ai_gold(g, me):
+    return g["players"][me]["gold"]
+
+
+def ai_mana(g, me):
+    return g["players"][me]["mana"]
+
+
+# ------------------------------------------------------------
+# Évaluation d'une position
+# ------------------------------------------------------------
+
+def ai_unit_value(e):
+    data = UNITS.get(e["name"], {})
+    if e["name"] == WORKER:
+        return 140.0
+    base = data.get("cost", 100) / max(1, data.get("batch", 1)) + 140 * data.get("mana", 0)
+    base = max(base, 140.0 * float(data.get("pf", 1)))
+    top = float(e.get("max_pf") or data.get("pf") or 1)
+    return base * (0.35 + 0.65 * min(1.0, float(e["pf"]) / top))
+
+
+def ai_piece_value(g, e):
+    if e["kind"] == "unit":
+        return ai_unit_value(e)
+    pf = float(e["pf"])
+    top = float(e.get("max_pf") or 0) or max(pf, 1.0)
+    if is_hero(e):
+        return 1800.0 + 1200.0 * min(1.0, pf / top)
+    if e["kind"] == "base":
+        return 2200.0 + 1800.0 * min(1.0, pf / top) + (0 if e["wait"] else 300)
+    data = faction_of(g, e["owner"])["buildings"].get(e["name"], {})
+    return float(data.get("cost", 200)) * (0.5 + 0.5 * min(1.0, pf / top)) + 100
+
+
+def ai_material(g, me, P):
+    if g.get("winner") is not None:
+        if g["winner"] == me:
+            return 1e7
+        return 0.0 if g["winner"] == -1 else -1e7
+    score = 0.0
+    for e in g["entities"]:
+        if e["owner"] == me:
+            score += ai_piece_value(g, e)
+        elif visible_to_player(g, e, me):
+            score -= ai_piece_value(g, e)
+    for owner in (0, 1):
+        sign = 1 if owner == me else -1
+        player = g["players"][owner]
+        score += sign * (0.5 * player.get("gold", 0) + 120 * player.get("mana", 0))
+    # Détruire 3 bases gagne la partie : chaque base détruite compte beaucoup.
+    score += P["base_bonus"] * (
+        g["players"][me].get("bases", 0) - g["players"][1 - me].get("bases", 0)
+    )
+    return score
+
+
+def ai_enemy_pieces(g, me):
+    return [e for e in g["entities"] if e["owner"] != me and visible_to_player(g, e, me)]
+
+
+# ------------------------------------------------------------
+# Cartes de distances (vrais chemins : montagne = 2, mer infranchissable)
+# ------------------------------------------------------------
+
+_AI_DIST_CACHE = {}
+_AI_TERRAIN_FP = {}
+
+
+def ai_terrain_fp(g):
+    terrain = g["terrain"]
+    entry = _AI_TERRAIN_FP.get(id(terrain))
+    if entry is None or entry[0] is not terrain:
+        if len(_AI_TERRAIN_FP) > 50:
+            _AI_TERRAIN_FP.clear()
+        entry = (terrain, hash(tuple(sorted(terrain.items()))))
+        _AI_TERRAIN_FP[id(terrain)] = entry
+    return entry[1]
+
+
+def ai_distance_map(g, starts):
+    """Distance de marche minimale depuis des cases de départ {case: coût initial}."""
+    cache_key = (ai_terrain_fp(g), frozenset(starts.items()))
+    cached = _AI_DIST_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+    dist = dict(starts)
+    queue = [(cost, pos) for pos, cost in starts.items()]
+    heapq.heapify(queue)
+    while queue:
+        cost, pos = heapq.heappop(queue)
+        if cost != dist.get(pos):
+            continue
+        for nxt in neighbors(pos):
+            kind = terrain(g, nxt)
+            if kind == "sea":
+                continue
+            new = cost + (2 if kind == "mountain" else 1)
+            if new < dist.get(nxt, math.inf):
+                dist[nxt] = new
+                heapq.heappush(queue, (new, nxt))
+    if len(_AI_DIST_CACHE) > 400:
+        _AI_DIST_CACHE.clear()
+    _AI_DIST_CACHE[cache_key] = dist
+    return dist
+
+
+# ------------------------------------------------------------
+# Positionnement : avancer, défendre, éviter les menaces
+# ------------------------------------------------------------
+
+def ai_context(g, me, P):
+    enemies = ai_enemy_pieces(g, me)
+    fighters = [e for e in enemies if e["kind"] == "unit" and e["name"] not in NO_ATTACK_UNITS]
+    if P.get("chase"):
+        # Débutant : il marche vers l'ennemi le plus proche, quel qu'il soit.
+        starts = {tuple(e["pos"]): 0 for e in enemies}
+    else:
+        starts = {tuple(e["pos"]): 0 for e in enemies if e["kind"] == "base"}
+    for e in enemies:
+        # Les bâtiments comptent, mais les bases passent avant.
+        if e["kind"] == "building":
+            starts.setdefault(tuple(e["pos"]), 3)
+    if not starts:
+        starts = {tuple(e["pos"]): 0 for e in fighters}
+    goal = ai_distance_map(g, starts) if starts else {}
+    my_bases = {tuple(e["pos"]): 0 for e in g["entities"] if e["owner"] == me and e["kind"] == "base"}
+    home = ai_distance_map(g, my_bases) if my_bases and P["defend"] else {}
+    mine = sum(
+        ai_unit_value(e) for e in g["entities"]
+        if e["owner"] == me and e["kind"] == "unit" and e["name"] != WORKER
+    )
+    theirs = sum(ai_unit_value(e) for e in fighters)
+    horizon = max(1, P["threat_turns"])
+    approaching = []
+    if home:
+        for e in fighters:
+            d = home.get(tuple(e["pos"]), 99)
+            if d <= horizon * UNITS.get(e["name"], {}).get("move", 3) + 2:
+                approaching.append((tuple(e["pos"]), d))
+    return {
+        "P": P,
+        "goal": goal,
+        "goal_cells": list(starts),
+        "goal_far": max(goal.values(), default=0) + 5,
+        "home": home,
+        "approaching": approaching,
+        "defensive": bool(P["defend"]) and mine < 0.9 * theirs,
+        "threats": [
+            (tuple(e["pos"]), UNITS.get(e["name"], {}).get("move", 0),
+             max(1, UNITS.get(e["name"], {}).get("range", 0)), float(e["pf"]))
+            for e in fighters
+        ],
+    }
+
+
+def ai_place_score(ctx, unit, pos):
+    P = ctx["P"]
+    score = 0.0
+    # Avancer vers les bases ennemies (vrais chemins ; les volants vont droit).
+    if ctx["goal_cells"]:
+        if is_flying(unit):
+            dist = min(distance(pos, q) for q in ctx["goal_cells"])
+        else:
+            dist = ctx["goal"].get(pos, ctx["goal_far"])
+        score += P["advance"] * (0.3 if ctx["defensive"] else 1.0) * max(0, ctx["goal_far"] - dist)
+    # Défendre : tenir les passages entre l'ennemi et ses bases.
+    home = ctx["home"]
+    if home:
+        here = home.get(pos, 99)
+        if ctx["defensive"] and here > 4:
+            score -= 12 * (here - 4)
+        for where, their_home in ctx["approaching"]:
+            if here <= 4 and here + distance(pos, where) <= their_home + 1:
+                guard = 1.0 if here >= 1 else 0.5
+                score += AI_GUARD_VALUE * P["defend"] * guard * (1.5 if ctx["defensive"] else 1.0)
+                break
+    # Menaces : ennemis capables de frapper cette case (1 ou 2 tours).
+    if P["danger"] and ctx["threats"]:
+        mine = float(unit["pf"])
+        now = later = 0.0
+        for where, move, reach, pf in ctx["threats"]:
+            gap = distance(pos, where)
+            if gap <= move + reach:
+                now = max(now, pf)
+            elif P["threat_turns"] >= 2 and gap <= 2 * move + reach:
+                later = max(later, pf)
+        value = ai_unit_value(unit)
+        if now >= mine:
+            score -= P["danger"] * value
+        elif now:
+            score -= P["danger"] * 0.25 * value
+        if later >= mine:
+            score -= P["danger"] * 0.4 * value
+    return score
+
+
+def ai_positional(g, me, P, ctx=None):
+    ctx = ctx or ai_context(g, me, P)
+    return sum(
+        ai_place_score(ctx, unit, tuple(unit["pos"]))
+        for unit in g["entities"]
+        if unit["owner"] == me and unit["kind"] == "unit" and unit["name"] != WORKER
+    )
+
+
+def ai_evaluate(g, me, P):
+    return ai_material(g, me, P) + ai_positional(g, me, P)
+
+
+# ------------------------------------------------------------
+# Manœuvres
+# ------------------------------------------------------------
+
+def ai_active_units(g, me):
+    units = [
+        e for e in g["entities"]
+        if e["owner"] == me and e["kind"] == "unit" and e["name"] != WORKER and can_move(g, e)
+    ]
+    moving = g.get("moving_unit_id")
+    if moving is not None:
+        units = [u for u in units if u["id"] == moving] or units
+    return units
+
+
+def ai_melee_args(g, ids, target_id):
+    attackers, target, _ = prepare_attack(g, ids, target_id)
+    values = combat_values(attackers, target)
+    melee = [a for a in attackers if UNITS.get(a["name"], {}).get("range", 0) <= 0]
+    occupier = max(melee or attackers, key=lambda a: a["pf"])["id"]
+    if not values.get("winnable"):
+        return occupier, None
+    return occupier, default_losses(attackers, values.get("losses", 0.0), occupier)
+
+
+AI_FOCUS_RADIUS = 8
+
+
+def ai_attack_candidates(g, side, groups, near=None):
+    """Attaques possibles : (fonction, arguments, cible). « near » : seulement
+    les unités proches de ces cases (anticipation locale, plus rapide)."""
+    candidates = []
+    reach = {}
+    units = ai_active_units(g, side)
+    if near:
+        units = [
+            u for u in units
+            if min(distance(tuple(u["pos"]), p) for p in near) <= AI_FOCUS_RADIUS
+        ]
+    for unit in units:
+        try:
+            _, targets = attack_map_preview(g, [unit])
+        except AI_ERRORS:
+            continue
+        for pos, data in targets.items():
+            tid = data.get("target_id") if isinstance(data, dict) else None
+            target = at(g, pos) if tid is None else next((e for e in g["entities"] if e["id"] == tid), None)
+            if target is None or target["owner"] == side:
+                continue
+            if unit["name"] == SORCERER:
+                for spell in SORCERER_SPELLS:
+                    candidates.append((cast_sorcerer_spell, (unit["id"], spell, target["id"]), target))
+                continue
+            if unit["name"] in MAGES or unit["name"] == "Décimant":
+                continue
+            if UNITS.get(unit["name"], {}).get("range", 0) > 0:
+                candidates.append((ranged_attack, (unit["id"], target["id"]), target))
+            reach.setdefault(target["id"], (target, []))[1].append(unit)
+            candidates.append(("melee", ([unit["id"]], target["id"]), target))
+    if groups:
+        for target, group in reach.values():
+            fighters = sorted(
+                (u for u in group if UNITS.get(u["name"], {}).get("range", 0) <= 0),
+                key=lambda u: (-u["pf"], u["id"]),
+            )
+            for size in (2, 3):
+                if len(fighters) >= size:
+                    candidates.append(("melee", ([u["id"] for u in fighters[:size]], target["id"]), target))
+    return candidates
+
+
+def ai_resolve(g, candidate):
+    fn, args, _ = candidate
+    if fn == "melee":
+        ids, tid = args
+        try:
+            occupier, losses = ai_melee_args(g, ids, tid)
+        except AI_ERRORS:
+            return None, None
+        return attack, (ids, tid, occupier, losses)
+    return fn, args
+
+
+def ai_special_candidates(g):
+    special = []
+    if decimant_hunt(g) is not None:
+        special.append((renounce_decimant_hunt, (), None))
+    if dwarf_rally(g) is not None:
+        special.append((end_dwarf_rally, (), None))
+    return special
+
+
+def ai_move_candidates(g, me, ctx):
+    """Déplacements notés directement (sans simulation) : (gain, unité, case)."""
+    scored = []
+    for unit in ai_active_units(g, me):
+        try:
+            destinations, _ = move_preview(g, unit)
+        except AI_ERRORS:
+            continue
+        here = ai_place_score(ctx, unit, tuple(unit["pos"]))
+        for pos in sorted(destinations):
+            scored.append((ai_place_score(ctx, unit, pos) - here, unit["id"], pos))
+    return scored
+
+
+def ai_best_attack(g, side, me, P, near=None):
+    """Meilleure attaque immédiate de « side » ; gain vu par « side »."""
+    if g.get("winner") is not None or g.get("phase") != "move" or g.get("active") != side:
+        return 0.0, None
+    base = ai_material(g, me, P)
+    candidates = ai_attack_candidates(g, side, groups=False, near=near)
+    # Les cibles de grande valeur d'abord (bases, grosses unités).
+    candidates.sort(key=lambda c: -(ai_piece_value(g, c[2]) if c[2] is not None else 0))
+    best, best_state = 0.0, None
+    for candidate in candidates[:AI_REPLY_LIMIT]:
+        fn, args = ai_resolve(g, candidate)
+        if fn is None:
+            continue
+        after = ai_simulate(g, fn, *args)
+        if after is None:
+            continue
+        delta = ai_material(after, me, P) - base
+        gain = delta if side == me else -delta
+        if gain > best:
+            best, best_state = gain, after
+    return best, best_state
+
+
+def ai_exchange(state, me, P, plies, near=None):
+    """Attaques alternées (meilleure de chaque camp) : bilan vu par « me »."""
+    total = 0.0
+    for _ in range(plies):
+        if state.get("winner") is not None or state.get("phase") != "move":
+            break
+        side = state["active"]
+        gain, after = ai_best_attack(state, side, me, P, near)
+        if after is None:
+            other = 1 - side
+            if other in state.get("passed", []):
+                break
+            state = dict(state, active=other)
+            state.pop("moving_unit_id", None)
+            continue
+        total += gain if side == me else -gain
+        state = after
+    return total
+
+
+# Budget de réflexion par tour de l'IA : au-delà, elle joue sans anticiper
+# (la page ne doit jamais rester figée).
+AI_TURN_BUDGET = 6.0
+_AI_DEADLINE = [0.0]
+
+
+def ai_anticipate(g, me, options, P):
+    """Corrige les meilleurs coups par les ripostes adverses à venir."""
+    plies, top = P["replies"], P["top"]
+    if not plies or not top or (1 - me) in g.get("passed", []):
+        return options
+    if _AI_DEADLINE[0] and time.time() > _AI_DEADLINE[0]:
+        return options
+    now = ai_clone(g)
+    now["active"] = 1 - me
+    now.pop("moving_unit_id", None)
+    before = {e["id"]: (tuple(e["pos"]), float(e["pf"])) for e in g["entities"]}
+    checked = []
+    for gain, after, move in options[:top]:
+        if after is None:
+            after = ai_simulate(g, move_unit, *move)
+            if after is None:
+                continue
+        # Zone du coup : cases des pièces déplacées, blessées ou détruites.
+        near = set()
+        after_ids = set()
+        for e in after["entities"]:
+            after_ids.add(e["id"])
+            old = before.get(e["id"])
+            if old is None or old != (tuple(e["pos"]), float(e["pf"])):
+                near.add(tuple(e["pos"]))
+                if old is not None:
+                    near.add(old[0])
+        near.update(pos for eid, (pos, _) in before.items() if eid not in after_ids)
+        if not near:
+            checked.append((gain, after, move))
+            continue
+        baseline = ai_exchange(now, me, P, plies, near)
+        future = ai_exchange(after, me, P, plies, near)
+        checked.append((gain + AI_ANTICIPATE_WEIGHT * (future - baseline), after, move))
+    checked.sort(key=lambda item: -item[0])
+    return checked + options[top:]
+
+
+def ai_move_step(bundle, me, level):
+    """Une activation de l'IA pendant les manœuvres."""
+    g = bundle["game"]
+    P = ai_params(level)
+    ctx = ai_context(g, me, P)
+    material = ai_material(g, me, P)
+    placed = {
+        u["id"]: (tuple(u["pos"]), float(u["pf"]), ai_place_score(ctx, u, tuple(u["pos"])))
+        for u in g["entities"]
+        if u["owner"] == me and u["kind"] == "unit" and u["name"] != WORKER
+    }
+
+    def gain_of(after):
+        """Bilan matériel + position des seules unités qui ont changé."""
+        gain = ai_material(after, me, P) - material
+        seen = set()
+        for u in after["entities"]:
+            if u["owner"] != me or u["kind"] != "unit" or u["name"] == WORKER:
+                continue
+            seen.add(u["id"])
+            old = placed.get(u["id"])
+            if old is None:
+                gain += ai_place_score(ctx, u, tuple(u["pos"]))
+            elif tuple(u["pos"]) != old[0] or float(u["pf"]) != old[1]:
+                gain += ai_place_score(ctx, u, tuple(u["pos"])) - old[2]
+        for uid, (_, _, value) in placed.items():
+            if uid not in seen:
+                gain -= value
+        return gain
+
+    attacks = ai_attack_candidates(g, me, P["groups"])
+    # Les cibles les plus précieuses d'abord (bases, grosses unités), attaques
+    # groupées comprises ; au-delà de la limite, on ne simule pas.
+    attacks.sort(key=lambda c: (
+        -(ai_piece_value(g, c[2]) if c[2] is not None else 0),
+        len(c[1][0]) if c[0] == "melee" else 1,
+    ))
+    options = []  # (gain, état simulé ou None, déplacement)
+    for candidate in attacks[:AI_ATTACK_LIMIT] + ai_special_candidates(g):
+        fn, args = ai_resolve(g, candidate)
+        if fn is None:
+            continue
+        after = ai_simulate(g, fn, *args)
+        if after is None:
+            continue
+        gain = gain_of(after)
+        if P.get("first_attack") and gain > 0:
+            # Débutant : il prend la première attaque gagnante, sans comparer.
+            bundle["game"] = ai_restore_log(g, after)
+            return True
+        options.append((gain, after, None))
+    for gain, unit_id, pos in ai_move_candidates(g, me, ctx):
+        options.append((gain, None, (unit_id, pos)))
+
+    options.sort(key=lambda item: -item[0])
+    options = ai_anticipate(g, me, options, P)
+    for gain, after, move in options[:AI_TRIES]:
+        if gain <= 0:
+            break
+        if after is None:
+            after = ai_simulate(g, move_unit, *move)
+            if after is None:
+                continue
+        bundle["game"] = ai_restore_log(g, after)
+        return True
+
+    # Rien d'utile : terminer l'activation de l'unité en cours, sinon passer.
+    moving = g.get("moving_unit_id")
+    for fn, args in (((finish_unit_activation, (moving,)),) if moving is not None else ()) + ((pass_turn, ()),):
+        after = ai_simulate(g, fn, *args)
+        if after is not None:
+            bundle["game"] = ai_restore_log(g, after)
+            return True
+    return False
+
+
+# ------------------------------------------------------------
+# Production : choix des unités, bâtiments, améliorations
+# ------------------------------------------------------------
+
+AI_UPGRADE_UNITS = {
+    "2 pattes en plus": ("Déferlant",),
+    "Dents acérées": ("Déferlant",),
+    "Dents acérées volants": ("Volant",),
+    "Instinct elfique": ("Elfe",),
+    "Développement musculaire": ("Mammouth dompté",),
+    "Meute de tigres": ("Tigre des forêts",),
+    "Marteau foudroyant": ("Guerrier",),
+    "Esquive": ("Éclaireur",),
+    "Flèches enflammées": ("Archer",),
+    "Pierres enflammées": ("Catapulte", "Catapulte de l'enfer"),
+    "Invisibilité griffons": ("Griffon",),
+    "Mutation imminente": ("Agile",),
+    "Endurance": ("Barbare",),
+}
+# Mécaniques que l'IA n'exploite pas.
+AI_MINOR_UPGRADES = {"Mutation kamikaze", "Rampants", "Trébuchet", "Aramil le sorcier élu", "Solidarité"}
+# Production des héros vagabonds : indispensables.
+AI_PRIORITY_UPGRADES = ["Étroite communication I", "Multitâches", "Étroite communication II"]
+AI_DECISIVE = 2000
+
+
+def ai_enemy_home(g, me):
+    pieces = [tuple(e["pos"]) for e in g["entities"] if e["owner"] != me and e["kind"] == "base"]
+    if not pieces:
+        pieces = [tuple(e["pos"]) for e in g["entities"] if e["owner"] != me] or [CELLS[len(CELLS) // 2]]
+    return min(pieces, key=lambda p: (sum(distance(p, q) for q in pieces), p))
+
+
+def ai_free_cells_near(g, origin, low, high):
+    return [
+        p for p in CELLS
+        if low <= distance(origin, p) <= high
+        and at(g, p) is None
+        and not blocked(g, p)
+        and key(p) not in g["resources"]
+    ]
+
+
+AI_VAGABOND_UPGRADES = {
+    "Étroite communication I": 2600,
+    "Mutation imminente": 2300,
+    "Endurance": 2250,
+    "Solidarité": 2100,
+}
+
+
+def ai_upgrade_value(g, me, name):
+    """Intérêt d'une amélioration selon la partie en cours."""
+    if is_vagabond(g, me) and (name in AI_VAGABOND_UPGRADES or name in VAG_AGE_UPGRADES.values()):
+        # Les améliorations font toute la force des Vagabonds : toutes, au plus tôt.
+        if name == "Étroite communication I" and owns_upgrade(g, me, "Étroite communication II"):
+            return 0
+        if VAG_AGE_UPGRADES.get(g["players"][me]["age"] + 1) == name:
+            return 3000
+        return AI_VAGABOND_UPGRADES.get(name, 2400)
+    if name in VAG_AGE_UPGRADES.values():
+        # Obligatoire pour l'âge suivant : décisive ; sinon très utile.
+        age = g["players"][me]["age"]
+        return 3000 if VAG_AGE_UPGRADES.get(age + 1) == name else 1200
+    if name == "Étroite communication I":
+        # Inutile une fois la version II achetée.
+        return 0 if owns_upgrade(g, me, "Étroite communication II") else 1500
+    if name in AI_MINOR_UPGRADES:
+        return 60
+    mine = [e for e in g["entities"] if e["owner"] == me and e["kind"] == "unit"]
+    enemies = [e for e in ai_enemy_pieces(g, me) if e["kind"] == "unit"]
+    concerned = AI_UPGRADE_UNITS.get(name, ())
+    owned = sum(e["name"] in concerned for e in mine)
+    producible = any(
+        n in concerned
+        for data in faction_of(g, me)["buildings"].values()
+        for n in data.get("units", [])
+    )
+    value = 150 + 130 * owned + (120 if producible else 0)
+    if name == "Meute de tigres":
+        # Contre une marée d'unités d'âge I (ex. 10 Déferlants) : les Tigres piétinent.
+        weak = sum(UNIT_AGES.get(e["name"], 1) == 1 for e in enemies)
+        swarm = sum(e["name"] == "Déferlant" for e in enemies)
+        value += 70 * weak + (2500 if swarm >= 10 or weak >= 12 else 0)
+    elif name == "Vengeance":
+        value += 25 * len(enemies)
+    elif name in PF_UPGRADES or name in ATTACK_UPGRADES:
+        value += 80 * owned
+    return value
+
+
+def ai_boosted_units(g, me):
+    return {
+        unit for name, units in AI_UPGRADE_UNITS.items()
+        if owns_upgrade(g, me, name) for unit in units
+    }
+
+
+def ai_unit_score(g, me, name, P, want_mana, boosted):
+    data = UNITS[name]
+    strength = data["pf"] * (1.3 if data["range"] else 1.0) + 0.1 * data["move"]
+    if name in AI_WEAK_UNITS or name in NO_ATTACK_UNITS:
+        strength *= 0.35
+    price = data["cost"] / max(1, data["batch"]) + 150 * data["mana"]
+    efficiency = strength / max(price, 50) * 1000
+    rule = P["unit_rule"]
+    if rule == "cheap":
+        score = 10000 / max(price, 50)
+    elif rule == "value":
+        score = efficiency
+    elif rule == "balanced":
+        score = efficiency + 6 * strength
+    else:
+        # Expert : unités de son âge d'abord, les plus fortes en tête.
+        tier = min(UNIT_AGES.get(name, 1), g["players"][me]["age"])
+        score = 100 * tier + 10 * strength
+    if name in boosted:
+        score *= 1.3
+    if want_mana and data["mana"] and name not in AI_WEAK_UNITS and name not in NO_ATTACK_UNITS:
+        # Mana en trop : les unités de combat qui en consomment passent devant.
+        score = score * 1.6 + 400 * data["mana"]
+    return score
+
+
+def ai_recruit_options(g, me, producer):
+    faction = faction_of(g, me)
+    if is_hero(producer):
+        return [n for n in VAG_SLOTS if hero_can_produce(g, producer, n)]
+    if producer["kind"] == "base":
+        return []
+    return [
+        n for n in faction["buildings"].get(producer["name"], {}).get("units", [])
+        if n in UNITS and n != WORKER
+    ]
+
+
+def ai_recruit_positions(g, me, producer, count):
+    enemy = ai_enemy_home(g, me)
+    g["_recruit_batch"] = count
+    try:
+        cells = list(recruitment_slots(g, producer))
+    except TypeError:
+        cells = list(recruitment_slots(g, producer, count))
+    finally:
+        g.pop("_recruit_batch", None)
+    cells.sort(key=lambda p: (distance(p, enemy), p))
+    return cells
+
+
+def ai_producers(g, me):
+    producers = [
+        e for e in g["entities"]
+        if e["owner"] == me and (e["kind"] == "building" or is_hero(e)) and not e["wait"]
+    ]
+    producers.sort(key=lambda e: (-BUILDING_AGES.get((faction_id(g, me), e["name"]), 1), e["id"]))
+    return producers
+
+
+def ai_within(g, me, floors):
+    return ai_gold(g, me) >= floors[0] and ai_mana(g, me) >= floors[1]
+
+
+def ai_step_recruit(g, me, P, floors, want_mana):
+    """Chaque producteur prêt recrute sa meilleure unité abordable."""
+    boosted = ai_boosted_units(g, me)
+    for producer in ai_producers(g, me):
+        current = next((e for e in g["entities"] if e["id"] == producer["id"]), None)
+        if current is None or (current.get("used") and not is_hero(current)):
+            continue
+        names = sorted(
+            ai_recruit_options(g, me, current),
+            key=lambda n: (-ai_unit_score(g, me, n, P, want_mana, boosted), n),
+        )
+        for name in names:
+            data = UNITS[name]
+            if data["cost"] > ai_gold(g, me) - floors[0] or data["mana"] > ai_mana(g, me) - floors[1]:
+                continue
+            batch = 1 if is_hero(current) else recruitment_batch(g, me, name)
+            cells = ai_recruit_positions(g, me, current, batch)
+            if len(cells) < batch:
+                continue
+            new = ai_try(g, recruit, me, current["id"], name, cells[:batch])
+            if new is not None and ai_within(new, me, floors):
+                g = new
+                break
+    return g
+
+
+def ai_wanted_buildings(g, me, P, goal=None, want_mana=False):
+    faction = faction_of(g, me)
+    age = g["players"][me]["age"]
+    wanted = []
+    for name in (
+        AGE_PREREQUISITES.get((faction_id(g, me), age + 1)),
+        TECH_BUILDINGS.get(faction_id(g, me)),
+    ):
+        if name and building_is_available(g, me, name) and not any(
+            e["owner"] == me and e["name"] == name for e in g["entities"]
+        ):
+            wanted.append(name)
+    def mana_use(data):
+        return max((UNITS[n]["mana"] for n in data["units"] if n in UNITS and n not in AI_WEAK_UNITS), default=0)
+
+    producers = sorted(
+        (
+            (name, data) for name, data in faction["buildings"].items()
+            if data.get("units") and building_is_available(g, me, name)
+        ),
+        # Mana en trop : d'abord les bâtiments dont les unités en consomment.
+        key=lambda item: (
+            -(mana_use(item[1]) if want_mana else 0),
+            -BUILDING_AGES.get((faction_id(g, me), item[0]), 1),
+            item[0],
+        ),
+    )
+    goal = goal or P["building_goal"]
+    for name, data in producers:
+        count = sum(e["owner"] == me and e["name"] == name for e in g["entities"])
+        target = data["limit"] if goal == "limit" else min(data["limit"], goal)
+        if count < target:
+            wanted.append(name)
+    return list(dict.fromkeys(wanted))
+
+
+def ai_build_sources(g, me):
+    if faction_id(g, me) == DERNIERS_NES:
+        workers = [
+            e for e in g["entities"]
+            if e["owner"] == me and e["name"] == WORKER and not e["wait"] and not e["used"]
+        ]
+        # Les ouvriers en trop construisent ; ceux qui récoltent, en dernier.
+        spare = {w["id"] for w in ai_dn_spare_workers(g, me)}
+        workers.sort(key=lambda w: (w["id"] not in spare, w["id"]))
+        return workers
+    return [
+        e for e in g["entities"]
+        if e["owner"] == me and e["kind"] == "base" and not is_hero(e) and not e["wait"]
+        # Les Habitations des Exilés peuvent construire plusieurs fois par tour.
+        and (not e["used"] or faction_id(g, me) == EXILES)
+    ]
+
+
+def ai_build_positions(g, me, source, name, P):
+    if name == TECH_BUILDINGS.get(faction_id(g, me)) and me in TECH_CELLS:
+        return [tech_cell(me)]
+    enemy = ai_enemy_home(g, me)
+    if source["name"] == WORKER:
+        cells = worker_build_slots(g, source, name)
+    else:
+        cells = ai_free_cells_near(g, tuple(source["pos"]), 1, 4)
+    origin = tuple(source["pos"])
+    if P["front"]:
+        # Vers le front (unités plus vite au combat), mais hors de portée immédiate.
+        reach = [
+            (tuple(e["pos"]), UNITS.get(e["name"], {}).get("move", 0) + max(1, UNITS.get(e["name"], {}).get("range", 0)))
+            for e in ai_enemy_pieces(g, me) if e["kind"] == "unit"
+        ]
+        cells.sort(key=lambda p: (any(distance(p, w) <= r for w, r in reach), distance(p, enemy), distance(p, origin), p))
+    else:
+        # Débutant : à l'abri, derrière ses bases.
+        cells.sort(key=lambda p: (-distance(p, enemy), distance(p, origin), p))
+    return cells[:6]
+
+
+def ai_try_build(g, me, name, P, floors, accelerated=False):
+    for source in ai_build_sources(g, me):
+        for pos in ai_build_positions(g, me, source, name, P):
+            new = ai_try(g, build, me, source["id"], name, pos, accelerated)
+            if new is not None and ai_within(new, me, floors):
+                return new
+    return None
+
+
+def ai_step_buildings(g, me, P, floors, want_mana, accelerated=False):
+    rich = P["fast_build_at"] is not None and ai_gold(g, me) - floors[0] >= P["fast_build_at"]
+    for name in ai_wanted_buildings(g, me, P, goal="limit" if accelerated else None, want_mana=want_mana):
+        new = None
+        if accelerated or rich:
+            new = ai_try_build(g, me, name, P, floors, accelerated=True)
+        if new is None and not accelerated:
+            new = ai_try_build(g, me, name, P, floors)
+        if new is not None:
+            g = new
+    return g
+
+
+def ai_step_fast_buildings(g, me, P, floors, want_mana):
+    """Or encore en trop : bâtiments accélérés (prêts tout de suite pour recruter)."""
+    return ai_step_buildings(g, me, P, floors, want_mana, accelerated=True)
+
+
+def ai_buy_upgrades(g, me, P, floors, minimum):
+    names = sorted(available_upgrades(g, me), key=lambda n: (-ai_upgrade_value(g, me, n), n))
+    for name in names:
+        value = ai_upgrade_value(g, me, name)
+        if value < minimum:
+            break
+        # Les améliorations décisives passent avant l'or gardé pour l'âge.
+        limits = (0, 0) if value >= AI_DECISIVE else floors
+        new = ai_try(g, purchase_upgrade, me, name)
+        if new is not None and ai_within(new, me, limits):
+            g = new
+    return g
+
+
+def ai_step_upgrades(g, me, P, floors, want_mana):
+    return ai_buy_upgrades(g, me, P, floors, P["upgrade_min"])
+
+
+def ai_has_mana_base(g, me):
+    return any(
+        g["resources"].get(key(q), ("", 0))[0] == "mana"
+        for e in g["entities"] if e["owner"] == me and e["kind"] == "base" and not is_hero(e)
+        for q in neighbors(tuple(e["pos"]))
+    )
+
+
+def ai_colony_value(g, p):
+    # Le mana compte triple : il débloque l'âge III et les meilleures unités.
+    return sum(
+        (3 if g["resources"][key(q)][0] == "mana" else 1) * g["resources"][key(q)][1]
+        for q in neighbors(p)
+        if key(q) in g["resources"] and at(g, q) is None
+    )
+
+
+def ai_colony_positions(g, me, source):
+    enemy = ai_enemy_home(g, me)
+    bases = [tuple(e["pos"]) for e in g["entities"] if e["owner"] == me and e["kind"] == "base"]
+    if source["name"] == WORKER:
+        cells = worker_build_slots(g, source, faction_of(g, me)["base"])
+    else:
+        cells = ai_free_cells_near(g, tuple(source["pos"]), 2, 6)
+    cells = [
+        p for p in cells
+        if ai_colony_value(g, p) and min((distance(p, b) for b in bases), default=9) >= 2
+    ]
+    cells.sort(key=lambda p: (-ai_colony_value(g, p), -distance(p, enemy), p))
+    return cells[:6]
+
+
+def ai_near_mana(g, p):
+    return any(g["resources"].get(key(q), ("", 0))[0] == "mana" for q in neighbors(p))
+
+
+def ai_try_colony(g, me, floors, mana_only=False):
+    if is_vagabond(g, me):
+        return g
+    bases = [e for e in g["entities"] if e["owner"] == me and e["kind"] == "base"]
+    if len(bases) >= 7:
+        return g
+    name = faction_of(g, me)["base"]
+    options = [
+        (source, pos)
+        for source in ai_build_sources(g, me)
+        for pos in ai_colony_positions(g, me, source)
+        if not mana_only or ai_near_mana(g, pos)
+    ]
+    options.sort(key=lambda item: (-ai_colony_value(g, item[1]), item[1]))
+    for source, pos in options:
+        new = ai_try(g, build, me, source["id"], name, pos, False)
+        if new is not None and ai_within(new, me, floors):
+            return new
+    return g
+
+
+def ai_dn_colony(g, me, floors):
+    """Derniers nés : un ouvrier bâtisseur fonde une colonie sur une case riche."""
+    bases = [tuple(e["pos"]) for e in g["entities"] if e["owner"] == me and e["kind"] == "base"]
+    if len(bases) >= 7:
+        return g
+    enemy = [tuple(e["pos"]) for e in ai_enemy_pieces(g, me) if e["kind"] == "base"]
+    sites = sorted(
+        (
+            p for p in CELLS
+            if at(g, p) is None and not blocked(g, p) and key(p) not in g["resources"]
+            and ai_colony_value(g, p) >= 2
+            and min((distance(p, q) for q in bases), default=9) >= 2
+            and all(distance(p, q) > 4 for q in enemy)
+        ),
+        key=lambda p: (-ai_colony_value(g, p), p),
+    )[:12]
+    busy = {w["id"] for w in g["entities"] if w["owner"] == me and w["name"] == WORKER} - {
+        w["id"] for w in ai_dn_spare_workers(g, me)
+    }
+    g, worker = ai_worker_to_site(g, me, sites, reserved=busy)
+    if worker is None:
+        return g
+    for pos in sorted(
+        (p for p in sites if distance(p, tuple(worker["pos"])) == 1),
+        key=lambda p: (-ai_colony_value(g, p), p),
+    ):
+        new = ai_try(g, build, me, worker["id"], faction_of(g, me)["base"], pos, False)
+        if new is not None and ai_within(new, me, floors):
+            return new
+    return g
+
+
+def ai_step_colony(g, me, P, floors, want_mana):
+    if not P["eco_colonies"] and ai_has_mana_base(g, me):
+        return g
+    if faction_id(g, me) == DERNIERS_NES:
+        return ai_dn_colony(g, me, floors)
+    return ai_try_colony(g, me, floors)
+
+
+def ai_step_workers(g, me, P, floors, want_mana):
+    """Derniers nés : de nouveaux ouvriers pour récolter et construire."""
+    if faction_id(g, me) != DERNIERS_NES:
+        return g
+    bases = [e for e in g["entities"] if e["owner"] == me and e["kind"] == "base" and not e["wait"]]
+    wanted = sum(ai_dn_slots(g, me).values()) + 2
+    workers = worker_count(g, me)
+    for base in bases:
+        if workers >= wanted:
+            break
+        current = entity(g, base["id"])
+        batch = worker_batch(g, current)
+        if not batch or current["used"]:
+            continue
+        cells = sorted(worker_slots(g, current), key=lambda p: (key(p) not in g["resources"], p))
+        if len(cells) < batch:
+            continue
+        new = ai_try(g, recruit, me, current["id"], WORKER, cells[:batch])
+        if new is not None and ai_within(new, me, floors):
+            g = new
+            workers += batch
+    return g
+
+
+def ai_step_fusions(g, me, P, floors, want_mana):
+    """Vagabonds : fusions d'esprits (unités plus fortes, consomment du mana)."""
+    if not is_vagabond(g, me):
+        return g
+    for result, data in sorted(FUSIONS.items(), key=lambda item: (-item[1]["age"], item[0])):
+        if data["age"] > g["players"][me]["age"]:
+            continue
+        pool = {}
+        for e in g["entities"]:
+            if e["owner"] == me and e["kind"] == "unit" and e["name"] in data["parts"] and not e["wait"]:
+                pool.setdefault(e["name"], []).append(e)
+        if any(len(pool.get(n, [])) < k for n, k in data["parts"].items()):
+            continue
+        ids = [u["id"] for n, k in data["parts"].items() for u in pool[n][:k]]
+        first = entity(g, ids[0])
+        for pos in [tuple(first["pos"])] + list(neighbors(tuple(first["pos"]))):
+            new = ai_try(g, fuse_spirits, me, result, ids, pos)
+            if new is not None and ai_within(new, me, floors):
+                g = new
+                break
+    return g
+
+
+# ------------------------------------------------------------
+# Production : préparatifs (ouvriers, héros, chantiers clés, âge)
+# ------------------------------------------------------------
+
+def ai_dn_slots(g, me):
+    """Derniers nés : {case: ouvriers utiles}. Chaque base récolte avec autant
+    d'ouvriers que son niveau (Colonie 1, Ville 2, Forteresse 3), empilés sur
+    sa meilleure case d'or et sa meilleure case de mana."""
+    slots = {}
+    for base in g["entities"]:
+        if base["owner"] != me or base["kind"] != "base" or base["wait"]:
+            continue
+        level = BASE_LEVEL_DATA.get(base["name"], {"level": 1})["level"]
+        for kind in ("gold", "mana"):
+            cells = [
+                p for p in neighbors(tuple(base["pos"]))
+                if g["resources"].get(key(p), ("", 0))[0] == kind
+                and not blocked(g, p)
+                and all(e["owner"] == me and e["name"] == WORKER for e in pieces_at(g, p))
+            ]
+            if cells:
+                best = max(cells, key=lambda p: (g["resources"][key(p)][1], p))
+                slots[best] = max(slots.get(best, 0), min(level, WORKER_STACK))
+    return slots
+
+
+def ai_dn_present(g, me, pos):
+    return sum(1 for e in pieces_at(g, pos) if e["owner"] == me and e["name"] == WORKER)
+
+
+def ai_dn_spare_workers(g, me, slots=None):
+    """Ouvriers libres qui ne remplissent pas un poste de récolte."""
+    slots = ai_dn_slots(g, me) if slots is None else slots
+    spare = []
+    for worker in g["entities"]:
+        if worker["owner"] != me or worker["name"] != WORKER or worker["wait"]:
+            continue
+        pos = tuple(worker["pos"])
+        if ai_dn_present(g, me, pos) > slots.get(pos, 0):
+            spare.append(worker)
+    return spare
+
+
+def ai_move_workers(g, me):
+    """Derniers nés : les ouvriers en trop remplissent les postes de récolte."""
+    if faction_id(g, me) != DERNIERS_NES:
+        return g
+    slots = ai_dn_slots(g, me)
+    deficits = sorted(
+        (pos for pos, need in slots.items() if ai_dn_present(g, me, pos) < need),
+        key=lambda pos: (g["resources"][key(pos)][0] != "gold", -g["resources"][key(pos)][1], pos),
+    )
+    for pos in deficits:
+        while ai_dn_present(g, me, pos) < slots[pos]:
+            movers = [
+                w for w in ai_dn_spare_workers(g, me, slots)
+                if not w["used"] and pos in worker_destinations(g, w)
+            ]
+            if not movers:
+                break
+            worker = min(movers, key=lambda w: (distance(tuple(w["pos"]), pos), w["id"]))
+            new = ai_try(g, move_worker, me, worker["id"], pos)
+            if new is None:
+                break
+            g = new
+    return g
+
+
+def ai_marker_value(g, me, hero, cell, need_mana):
+    """Récolte d'un héros dont le marqueur est sur cette case (en équivalent or)."""
+    resource = g["resources"].get(key(tuple(cell))) if cell else None
+    if resource is None:
+        return 0.0
+    kind, mult = resource
+    _, _, _, gold, mana = hero_stats(g, hero)
+    if kind == "gold":
+        return float(gold * mult)
+    return float(mana * mult * (300 if need_mana else 130))
+
+
+def ai_hero_safe(g, me, hero, pos):
+    """Un héros détruit compte comme une base perdue : éviter les cases menacées."""
+    danger = sum(
+        float(e["pf"]) for e in ai_enemy_pieces(g, me)
+        if e["kind"] == "unit" and e["name"] not in NO_ATTACK_UNITS
+        and distance(pos, tuple(e["pos"])) <= UNITS.get(e["name"], {}).get("move", 0)
+        + max(1, UNITS.get(e["name"], {}).get("range", 0))
+    )
+    return danger < float(hero["pf"])
+
+
+def ai_move_heroes(g, me):
+    """Vagabonds : chaque héros vise la case d'or ou de mana la plus rentable
+    (×2, ×3 en priorité) ; trop loin, il s'en approche tour après tour."""
+    if not is_vagabond(g, me):
+        return g
+    # Mana rare (âges, unités fortes) ou or qui s'entasse : le mana vaut plus.
+    need_mana = g["players"][me]["age"] < 3 or ai_mana(g, me) < 6 or ai_gold(g, me) > 1500
+    heroes = sorted(
+        (e for e in g["entities"] if e["owner"] == me and is_hero(e)),
+        key=lambda h: (-hero_stats(g, h)[3], h["id"]),
+    )
+    taken = {}
+    for h in heroes:
+        if h.get("marker"):
+            taken.setdefault(key(tuple(h["marker"])), h["id"])
+    cells = [tuple(int(x) for x in k.split(",")) for k in g["resources"]]
+    enemy_bases = [
+        tuple(e["pos"]) for e in ai_enemy_pieces(g, me) if e["kind"] == "base"
+    ]
+    claimed = set()
+
+    for hero in heroes:
+        current = entity(g, hero["id"])
+        options = hero_destinations(g, current)
+        if not options:
+            continue
+        mine_key = key(tuple(current["marker"])) if current.get("marker") else None
+        if mine_key and taken.get(mine_key) not in (None, current["id"]):
+            mine_key = None  # marqueur partagé : il ne rapporte rien
+        others = {k for k, hid in taken.items() if hid != current["id"]}
+
+        def value_of(cell):
+            if cell is None or key(tuple(cell)) in others:
+                return 0.0
+            return ai_marker_value(g, me, current, cell, need_mana)
+
+        here_value = value_of(current.get("marker")) if mine_key else 0.0
+        _, routes = hero_paths(g, current)
+
+        def after_move(p):
+            crossed = [q for q in routes.get(p, [])[1:] if key(q) in g["resources"]]
+            return crossed[-1] if crossed else current.get("marker")
+
+        safe = [p for p in sorted(options) if ai_hero_safe(g, me, current, p)]
+        best = max(
+            safe,
+            key=lambda p: (value_of(after_move(p)), -distance(p, tuple(current["pos"]))),
+            default=None,
+        )
+        target = None
+        if best is not None and value_of(after_move(best)) > 1.15 * here_value:
+            target = best
+        else:
+            # Une case bien plus riche, à 2 tours de marche au plus, loin des
+            # bases ennemies et pas déjà visée par un autre héros : s'en approcher
+            # sans perdre la valeur du marqueur actuel.
+            reach = 2 * hero_stats(g, current)[1] + 1
+            here = tuple(current["pos"])
+            richer = [
+                c for c in cells
+                if value_of(c) >= 1.5 * max(here_value, 1.0)
+                and key(c) not in claimed
+                and distance(here, c) <= reach
+                and all(distance(c, b) > 3 for b in enemy_bases)
+            ]
+            if richer and safe:
+                goal = min(richer, key=lambda c: (-value_of(c), distance(here, c), c))
+                step = min(
+                    (p for p in safe if value_of(after_move(p)) >= here_value),
+                    key=lambda p: (distance(p, goal), p),
+                    default=None,
+                )
+                if step is not None and distance(step, goal) < distance(here, goal):
+                    target = step
+                    claimed.add(key(goal))
+        if target is None:
+            continue
+        new = ai_try(g, move_hero, me, current["id"], target)
+        if new is None:
+            continue
+        g = new
+        moved = entity(g, hero["id"])
+        for k, hid in list(taken.items()):
+            if hid == hero["id"]:
+                del taken[k]
+        if moved.get("marker"):
+            taken.setdefault(key(tuple(moved["marker"])), hero["id"])
+    return g
+
+
+def ai_worker_to_site(g, me, sites, reserved=()):
+    """Envoie un ouvrier libre à côté d'une des cases « sites » ; renvoie (état, ouvrier prêt)."""
+    sites = [p for p in sites if at(g, p) is None]
+    if not sites:
+        return g, None
+    workers = [
+        e for e in g["entities"]
+        if e["owner"] == me and e["name"] == WORKER and not e["wait"] and not e["used"]
+        and e["id"] not in reserved
+    ]
+    for worker in workers:
+        if any(distance(tuple(worker["pos"]), p) == 1 for p in sites):
+            return g, worker
+    workers.sort(key=lambda w: (
+        key(tuple(w["pos"])) in g["resources"],
+        min(distance(tuple(w["pos"]), p) for p in sites),
+        w["id"],
+    ))
+    for worker in workers[:2]:
+        options = list(worker_destinations(g, worker))
+        if not options:
+            continue
+        best = min(options, key=lambda p: (min(abs(distance(p, q) - 1) for q in sites), p))
+        new = ai_try(g, move_worker, me, worker["id"], best)
+        if new is not None:
+            moved = entity(new, worker["id"])
+            ready = any(distance(tuple(moved["pos"]), p) == 1 for p in sites)
+            return new, (moved if ready else None)
+    return g, None
+
+
+def ai_mana_sites(g, me):
+    bases = [tuple(e["pos"]) for e in g["entities"] if e["owner"] == me and e["kind"] == "base"]
+    return [
+        p for k, v in g["resources"].items() if v[0] == "mana"
+        for p in neighbors(tuple(int(x) for x in k.split(",")))
+        if valid_position(p) and at(g, p) is None and not blocked(g, p)
+        and key(p) not in g["resources"]
+        and min((distance(p, b) for b in bases), default=9) >= 2
+    ]
+
+
+def ai_key_constructions(g, me, P, floors=(0, 0)):
+    """Avant les dépenses : colonie au bord du mana, prérequis d'âge, bâtiment technique."""
+    faction = faction_of(g, me)
+    dn = faction_id(g, me) == DERNIERS_NES
+    used = set()
+    if not is_vagabond(g, me) and not ai_has_mana_base(g, me):
+        if dn:
+            sites = ai_mana_sites(g, me)
+            g, worker = ai_worker_to_site(g, me, sites)
+            if worker is not None:
+                used.add(worker["id"])
+                for pos in sorted(
+                    (p for p in sites if distance(p, tuple(worker["pos"])) == 1),
+                    key=lambda p: (-ai_colony_value(g, p), p),
+                ):
+                    new = ai_try(g, build, me, worker["id"], faction["base"], pos, False)
+                    if new is not None and ai_within(new, me, floors):
+                        g = new
+                        break
+        elif g["turn"] >= 2:
+            g = ai_try_colony(g, me, floors, mana_only=True)
+    age = g["players"][me]["age"]
+    for name in (
+        AGE_PREREQUISITES.get((faction_id(g, me), age + 1)),
+        TECH_BUILDINGS.get(faction_id(g, me)),
+    ):
+        if not name or not building_is_available(g, me, name) or any(
+            e["owner"] == me and e["name"] == name for e in g["entities"]
+        ):
+            continue
+        if dn and name == TECH_BUILDINGS.get(DERNIERS_NES) and me in TECH_CELLS:
+            cell = tech_cell(me)
+            g, worker = ai_worker_to_site(g, me, [cell], reserved=used)
+            if worker is not None:
+                new = ai_try(g, build, me, worker["id"], name, cell, False)
+                if new is not None and ai_within(new, me, floors):
+                    g = new
+                    used.add(worker["id"])
+            continue
+        new = ai_try_build(g, me, name, P, floors)
+        if new is not None:
+            g = new
+    return g
+
+
+def ai_next_age_cost(g, me):
+    age = g["players"][me]["age"]
+    if age >= 3:
+        return None
+    gold, mana = AGE_COSTS[age + 1]["gold"], AGE_COSTS[age + 1]["mana"]
+    if is_vagabond(g, me):
+        needed = VAG_AGE_UPGRADES.get(age + 1)
+        if needed and not owns_upgrade(g, me, needed):
+            gold += UPGRADES[needed]["cost"]
+            mana += UPGRADES[needed]["mana"]
+    return gold, mana
+
+
+AI_VAGABOND_AGE_II = {"debutant": 3, "intermediaire": 2, "expert": 2}
+
+
+def ai_level_name(P):
+    return next((lvl for lvl, params in AI_PARAMS.items() if params is P), "intermediaire")
+
+
+def ai_age_from(g, me, P):
+    """Tour à partir duquel l'âge suivant est visé."""
+    age = g["players"][me]["age"]
+    turn = P["age_from"][age + 1]
+    if is_vagabond(g, me) and age == 1:
+        # Les Vagabonds grandissent vite : âge II au plus tard au tour 3.
+        turn = min(turn, AI_VAGABOND_AGE_II[ai_level_name(P)])
+    return turn
+
+
+def ai_age_due(g, me, P):
+    """L'âge suivant est visé (tour atteint, prérequis construits)."""
+    age = g["players"][me]["age"]
+    if age >= 3 or g["turn"] < ai_age_from(g, me, P):
+        return False
+    needed = AGE_PREREQUISITES.get((faction_id(g, me), age + 1))
+    return not needed or building_is_completed(g, me, needed)
+
+
+def ai_try_age(g, me):
+    """Passe à l'âge suivant ; l'amélioration obligatoire des Vagabonds est
+    achetée dès que possible, même si l'âge ne se paie qu'au tour suivant."""
+    age = g["players"][me]["age"]
+    if is_vagabond(g, me):
+        needed = VAG_AGE_UPGRADES.get(age + 1)
+        if needed and not owns_upgrade(g, me, needed):
+            new = ai_try(g, purchase_upgrade, me, needed)
+            if new is None:
+                return g
+            g = new
+    return ai_try(g, advance_age, me, age + 1) or g
+
+
+def ai_expected_income(g, me):
+    """Or et mana que la prochaine récolte rapportera."""
+    clone = ai_clone(g)
+    before = (ai_gold(clone, me), ai_mana(clone, me))
+    try:
+        harvest(clone)
+    except AI_ERRORS:
+        return 0, 0
+    return ai_gold(clone, me) - before[0], ai_mana(clone, me) - before[1]
+
+
+def ai_age_floors(g, me, P):
+    """Ressources gardées pour l'âge suivant : seulement ce que la récolte ne couvrira pas."""
+    vagabond_rush = is_vagabond(g, me) and g["players"][me]["age"] == 1
+    if not (P["save_for_age"] or vagabond_rush) or not ai_age_due(g, me, P):
+        return 0, 0
+    gold_cost, mana_cost = ai_next_age_cost(g, me)
+    income_gold, income_mana = ai_expected_income(g, me)
+    if ai_mana(g, me) + income_mana < mana_cost:
+        # Le mana manque encore : on le garde, mais l'or est dépensé.
+        return 0, min(ai_mana(g, me), mana_cost)
+    return (
+        max(0, min(ai_gold(g, me), gold_cost - income_gold)),
+        max(0, min(ai_mana(g, me), mana_cost - income_mana)),
+    )
+
+
+def ai_under_threat(g, me, P):
+    """Danger immédiat : armée bien plus faible et ennemis à un tour de ses bases."""
+    if not P["defend"]:
+        return False
+    age = g["players"][me]["age"]
+    if age < 3 and g["turn"] >= ai_age_from(g, me, P) + 3:
+        return False  # l'âge suivant ne peut plus attendre
+    bases = {tuple(e["pos"]): 0 for e in g["entities"] if e["owner"] == me and e["kind"] == "base"}
+    if not bases:
+        return False
+    home = ai_distance_map(g, bases)
+    fighters = [
+        e for e in ai_enemy_pieces(g, me)
+        if e["kind"] == "unit" and e["name"] not in NO_ATTACK_UNITS
+    ]
+    close = [
+        e for e in fighters
+        if home.get(tuple(e["pos"]), 99) <= UNITS.get(e["name"], {}).get("move", 3) + 2
+    ]
+    if not close:
+        return False
+    mine = sum(
+        ai_unit_value(e) for e in g["entities"]
+        if e["owner"] == me and e["kind"] == "unit" and e["name"] != WORKER
+    )
+    return mine < 0.6 * sum(ai_unit_value(e) for e in fighters)
+
+
+def ai_production(draft, me, level):
+    """Production complète de l'IA dans son brouillon privé."""
+    P = ai_params(level)
+    g = draft
+    start_gold, start_mana = ai_gold(g, me), ai_mana(g, me)
+
+    g = ai_move_workers(g, me)
+    g = ai_move_heroes(g, me)
+    urgent = False
+    if P["decisive_upgrades"] or is_vagabond(g, me):
+        # Améliorations décisives : contre-mesures (ex. Meute de tigres face à
+        # 10 Déferlants) et, pour les Vagabonds, toutes leurs améliorations.
+        owned = set(g["players"][me].get("upgrades", []))
+        g = ai_buy_upgrades(g, me, P, (0, 0), AI_DECISIVE)
+        bought = set(g["players"][me].get("upgrades", [])) - owned
+        urgent = any(
+            n not in AI_VAGABOND_UPGRADES and n not in VAG_AGE_UPGRADES.values() for n in bought
+        )
+    # Armée nettement plus faible et ennemis qui approchent : les unités
+    # passent avant le changement d'âge (Intermédiaire et Expert).
+    threatened = ai_under_threat(g, me, P)
+    if ai_age_due(g, me, P) and not threatened:
+        g = ai_try_age(g, me)
+    floors = (0, 0) if threatened else ai_age_floors(g, me, P)
+    if urgent or threatened:
+        # Contre-mesure achetée ou danger : les unités avant les chantiers.
+        g = ai_step_recruit(g, me, P, floors, ai_mana(g, me) > 0)
+    if faction_id(g, me) == DERNIERS_NES:
+        # Les ouvriers font tout le revenu : les postes de récolte d'abord.
+        g = ai_step_workers(g, me, P, floors, False)
+        g = ai_move_workers(g, me)
+    g = ai_key_constructions(g, me, P, floors)
+    goal_gold = max(floors[0], (1 - P["spend"]) * start_gold)
+    goal_mana = max(floors[1], (1 - P["spend"]) * start_mana)
+    steps = (
+        ai_step_recruit, ai_step_workers, ai_step_buildings, ai_step_upgrades,
+        ai_step_colony, ai_step_fusions, ai_step_fast_buildings,
+    )
+    for _ in range(8):
+        progress = False
+        for step in steps:
+            gold_over = ai_gold(g, me) > goal_gold
+            mana_over = ai_mana(g, me) > goal_mana
+            if not (gold_over or mana_over):
+                return g
+            new = step(g, me, P, floors, mana_over)
+            if new is not g:
+                g, progress = new, True
+        if not progress:
+            break
+    return g
+
+
+def ai_build_phase(bundle, me, level):
+    g = bundle["game"]
+    ensure_draft(bundle)
+    draft = bundle["draft"]
+    draft["remaining"] = g["remaining"]
+    draft["tick"] = g["tick"]
+    draft["active"] = g["active"]
+    try:
+        bundle["draft"] = ai_production(draft, me, level)
+    except Exception:
+        bundle["draft"] = draft
+    try:
+        commit_plan(bundle)
+    except ValueError:
+        # Plan impossible à fusionner : l'IA valide une production vide.
+        bundle["draft"] = None
+        ensure_draft(bundle)
+        commit_plan(bundle)
+
+
+# ------------------------------------------------------------
+# Pilotage d'un tour complet
+# ------------------------------------------------------------
+
+def ai_config(bundle):
+    config = bundle.get("ai") if isinstance(bundle, dict) else None
+    if not isinstance(config, dict) or config.get("seat") not in (0, 1):
+        return None
+    return config
+
+
+def ai_take_turn(bundle):
+    """Fait jouer l'IA jusqu'à ce que ce soit au joueur humain."""
+    config = ai_config(bundle)
+    if config is None:
+        return False
+    me, level = config["seat"], config.get("level", "intermediaire")
+    played = False
+    _AI_DEADLINE[0] = time.time() + AI_TURN_BUDGET
+    for _ in range(AI_MAX_STEPS):
+        g = bundle["game"]
+        if g["winner"] is not None or g["active"] != me:
+            break
+        g["curtain"] = False
+        signature = (g["turn"], g["phase"], g["active"], len(g["log"]), g.get("moving_unit_id"))
+        if g["phase"] == "build":
+            if me in g.get("ready", []):
+                break
+            ai_build_phase(bundle, me, level)
+        elif g["phase"] == "move":
+            if not ai_move_step(bundle, me, level):
+                break
+        else:
+            break
+        played = True
+        check_victory(bundle["game"])
+        after = bundle["game"]
+        if (after["turn"], after["phase"], after["active"], len(after["log"]), after.get("moving_unit_id")) == signature:
+            break  # plus rien ne bouge : on rend la main
+    return played
+
+
+def ai_force_pass(bundle):
+    """Secours : l'IA termine proprement sa phase."""
+    g = bundle["game"]
+    if g["phase"] == "move":
+        game_action(bundle, pass_turn)
+    elif g["phase"] == "build":
+        bundle["draft"] = None
+        ensure_draft(bundle)
+        commit_plan(bundle)
+
+
+# ------------------------------------------------------------
+# Interface : partie contre l'IA
+# ------------------------------------------------------------
+
+def ai_label(bundle):
+    config = ai_config(bundle)
+    if config is None:
+        return ""
+    g = bundle["game"]
+    return f"{AI_LEVELS.get(config.get('level'), 'IA')} · {faction_of(g, config['seat'])['name']}"
+
+
+def ai_autoplay():
+    """Avant l'affichage : si c'est à l'IA, elle joue jusqu'au tour du joueur."""
+    bundle = st.session_state.get("bundle")
+    config = ai_config(bundle)
+    if config is None or not isinstance(bundle.get("game"), dict):
+        return
+    g = bundle["game"]
+    tick(g)
+    if g["winner"] is not None or g["active"] != config["seat"]:
+        return
+
+    candidate = copy.deepcopy(bundle)
+    start = len(candidate["game"]["log"])
+    problem = None
+    try:
+        ai_take_turn(candidate)
+    except Exception as exc:  # l'IA ne doit jamais bloquer la partie
+        problem = exc
+        candidate = copy.deepcopy(bundle)
+        try:
+            ai_force_pass(candidate)
+        except Exception:
+            return
+
+    game = candidate["game"]
+    report = game.pop("_combat_report", None)
+    game.pop("_ui_message", None)
+    game["curtain"] = False
+    if report is not None:
+        st.session_state.ui_combat_report = report
+
+    name = faction_of(game, config["seat"])["name"]
+    lines = [line for line in game["log"][start:] if "passe pour le reste" not in line]
+    st.session_state.ai_last_actions = lines[-40:]
+    if problem is not None:
+        st.session_state.ui_message = f"🤖 L'IA a rencontré un problème ({problem}) : elle passe."
+    elif lines:
+        shown = [line.split(" — ", 1)[-1] for line in lines[-6:]]
+        st.session_state.ui_message = (
+            f"🤖 {name} (IA) a joué :\n\n" + "\n".join(f"- {line}" for line in shown)
+        )
+    st.session_state.bundle = candidate
+    bump_ui(clear_selection=True)
+
+
+_lw_ai_previous_main = main
+
+
+def main():
+    if not st.query_params.get("room"):
+        init_ui()
+        ai_autoplay()
+    _lw_ai_previous_main()
+
+
+_lw_ai_previous_render_sidebar = render_sidebar
+
+
+def render_sidebar(bundle):
+    if ai_config(bundle) is not None:
+        with st.sidebar:
+            st.markdown(f"**🤖 Adversaire : IA** — {ai_label(bundle)}")
+            lines = st.session_state.get("ai_last_actions") or []
+            if lines:
+                with st.expander("Derniers coups de l'IA"):
+                    st.markdown("\n".join(f"- {line}" for line in lines[-15:]))
+    _lw_ai_previous_render_sidebar(bundle)
+
+
+_lw_ai_previous_render_home = render_home
+
+
+def render_home():
+    with st.container(border=True):
+        st.markdown("### 🤖 Jouer contre l'IA")
+        st.caption("L'ordinateur joue l'autre faction, en respectant toutes les règles.")
+        faction_ids = list(FACTIONS)
+        mine_col, ai_col = st.columns(2)
+        with mine_col:
+            mine = st.selectbox(
+                "Ta faction", faction_ids, index=faction_ids.index(EXILES),
+                format_func=lambda fid: FACTIONS[fid]["name"], key="ai_home_mine",
+            )
+        with ai_col:
+            theirs = st.selectbox(
+                "Faction de l'IA", faction_ids, index=faction_ids.index(DEFERLANTS),
+                format_func=lambda fid: FACTIONS[fid]["name"], key="ai_home_theirs",
+            )
+        level = st.radio(
+            "Niveau de l'IA", list(AI_LEVELS), index=1, horizontal=True,
+            format_func=AI_LEVELS.get, key="ai_home_level",
+        )
+        st.caption(AI_LEVEL_TEXT[level])
+        first_col, mode_col = st.columns(2)
+        with first_col:
+            human_first = st.radio(
+                "Qui commence ?", [True, False], horizontal=True,
+                format_func=lambda v: "Moi" if v else "L'IA", key="ai_home_first",
+            )
+        with mode_col:
+            mode = st.radio(
+                "Victoire", list(VICTORY_MODES), index=list(VICTORY_MODES).index("bases"),
+                format_func=lambda m: VICTORY_MODES[m].split(" — ")[0], key="ai_home_mode",
+            )
+        minutes = 0
+        if mode == "time":
+            minutes = st.number_input("Durée en minutes", 5, 180, 60, 1, key="ai_home_minutes")
+        same = mine == theirs
+        if same:
+            st.error("Choisis deux factions différentes.")
+        if st.button("⚔️ Lancer la partie contre l'IA", type="primary", disabled=same, key="ai_home_start"):
+            # L'IA joue en haut du plateau (siège 0), toi en bas (siège 1).
+            bundle = new_bundle(1 if human_first else 0, 0, int(minutes), mode, (theirs, mine))
+            bundle["ai"] = {"seat": 0, "level": level}
+            reset_session(bundle)
+            st.rerun()
+    _lw_ai_previous_render_home()
+
+# ============================================================
+# UNITÉS VOLANTES : HORS D'ATTEINTE DU CORPS À CORPS
+# Une unité de corps à corps qui ne vole pas (Enragé, Tigre, Guerrier…)
+# ne peut pas attaquer une unité volante : seuls les tireurs et les
+# autres unités volantes le peuvent. Les dégâts de zone d'une attaque au
+# corps à corps (Enragé, 2e case du Molosse…) ne la touchent pas non plus.
+# ============================================================
+
+def melee_cannot_reach(attacker, target):
+    return (
+        target.get("kind") == "unit"
+        and is_flying(target)
+        and UNITS.get(attacker.get("name"), {}).get("range", 0) <= 0
+        and not is_flying(attacker)
+    )
+
+
+_lw_fly_previous_prepare_attack = prepare_attack
+
+
+def prepare_attack(g, attacker_ids, target_id):
+    target = entity(g, target_id)
+    for eid in attacker_ids:
+        attacker = entity(g, eid)
+        if melee_cannot_reach(attacker, target):
+            raise ValueError(
+                f"{attacker['name']} attaque au corps à corps : "
+                f"il ne peut pas atteindre {target['name']}, une unité volante."
+            )
+    return _lw_fly_previous_prepare_attack(g, attacker_ids, target_id)
+
+
+_lw_fly_previous_attack_map_preview = attack_map_preview
+
+
+def attack_map_preview(g, attackers):
+    zone, targets = _lw_fly_previous_attack_map_preview(g, attackers)
+    walkers = [a for a in attackers if UNITS.get(a["name"], {}).get("range", 0) <= 0 and not is_flying(a)]
+    if walkers and targets:
+        # Pas de case rouge sur une unité volante pour le corps à corps.
+        targets = {
+            pos: data for pos, data in targets.items()
+            if not any(
+                melee_cannot_reach(walkers[0], piece) for piece in pieces_at(g, pos)
+            )
+        }
+    return zone, targets
+
+
+_lw_fly_previous_apply_attack_effects = apply_attack_effects
+
+
+def apply_attack_effects(g, effects):
+    if effects and effects.get("splash"):
+        kept = []
+        for hit in effects["splash"]:
+            name = (hit.get("source") or {}).get("name")
+            melee = name in UNITS and UNITS[name].get("range", 0) <= 0 and name not in FLYING_UNITS
+            if melee and any(
+                victim["kind"] == "unit" and is_flying(victim)
+                for victim in pieces_at(g, hit["pos"])
+            ):
+                continue
+            kept.append(hit)
+        effects = dict(effects, splash=kept)
+    return _lw_fly_previous_apply_attack_effects(g, effects)
+
+
+# ============================================================
+# GOBELIN : VOL DE RESSOURCES
+# - Le Gobelin vole en s'arrêtant sur une case d'or ou de mana récoltée
+#   par une base ennemie (case voisine de la base, ou marqueur d'un héros
+#   vagabond) : il prend aussitôt, dans le trésor ennemi, ce que cette
+#   case rapporte à l'ennemi à chaque récolte.
+# - Il rapporte son butin en revenant à une de ses bases (case voisine,
+#   ou en traversant la base) : l'or ou le mana va dans le trésor.
+# - Un seul butin à la fois ; un Gobelin détruit perd son butin.
+# - Une pastille 💰 (or) ou 🔮 (mana) sur le pion montre son butin.
+# ============================================================
+
+def goblin_cell_yield(g, thief_owner, pos):
+    """(ressource, quantité) que cette case rapporte à l'ennemi, sinon None."""
+    resource = g["resources"].get(key(tuple(pos)))
+    if resource is None:
+        return None
+    kind, mult = resource
+    enemy = 1 - thief_owner
+    age = g["players"][enemy]["age"]
+    best = 0
+    for base in g["entities"]:
+        if base["owner"] != enemy or base["kind"] != "base" or base.get("wait"):
+            continue
+        if is_hero(base):
+            marker = base.get("marker")
+            if marker and tuple(marker) == tuple(pos):
+                _, _, _, gold, mana = hero_stats(g, base)
+                best = max(best, (gold if kind == "gold" else mana) * mult)
+        elif distance(tuple(base["pos"]), tuple(pos)) == 1:
+            if kind == "gold":
+                income = {1: faction_of(g, enemy)["income"], 2: 200, 3: 300}[age]
+            else:
+                income = {1: 1, 2: 2, 3: 3}[age]
+            best = max(best, income * mult)
+    return (kind, int(best)) if best else None
+
+
+def goblin_try_deposit(g, goblin, route):
+    gold, mana = goblin_loot(goblin)
+    if not gold and not mana:
+        return
+    owner = goblin["owner"]
+    crossed = {tuple(p) for p in route}
+    here = tuple(goblin["pos"])
+    home = [
+        base for base in g["entities"]
+        if base["owner"] == owner and base["kind"] == "base"
+        and (tuple(base["pos"]) in crossed or distance(here, tuple(base["pos"])) <= 1)
+    ]
+    if not home:
+        return
+    player = g["players"][owner]
+    player["gold"] += gold
+    player["mana"] += mana
+    goblin.pop("loot", None)
+    text = " et ".join(part for part in (f"{gold} or" if gold else "", f"{mana} mana" if mana else "") if part)
+    log(g, f"Gobelin #{goblin['id']} rapporte son butin à {home[0]['name']} : +{text}.")
+    g["_ui_message"] = f"💰 Le Gobelin rapporte son butin : +{text}."
+
+
+def goblin_try_steal(g, goblin):
+    if any(goblin_loot(goblin)):
+        return
+    found = goblin_cell_yield(g, goblin["owner"], tuple(goblin["pos"]))
+    if found is None:
+        return
+    kind, amount = found
+    victim = 1 - goblin["owner"]
+    taken = min(amount, int(g["players"][victim][kind]))
+    label = "or" if kind == "gold" else "mana"
+    if taken <= 0:
+        log(g, f"Gobelin #{goblin['id']} : le trésor ennemi est vide, rien à voler ({label}).")
+        return
+    g["players"][victim][kind] -= taken
+    goblin["loot"] = {"gold": taken if kind == "gold" else 0, "mana": taken if kind == "mana" else 0}
+    log(
+        g,
+        f"Gobelin #{goblin['id']} vole {taken} {label} aux {faction_of(g, victim)['name']} "
+        f"en {coord(goblin['pos'])}.",
+    )
+    g["_ui_message"] = (
+        f"🕵️ Le Gobelin vole {taken} {label} ! Ramène-le à une de tes bases pour l'encaisser."
+    )
+
+
+_lw_goblin2_previous_move_unit = move_unit
+
+
+def move_unit(g, eid, destination):
+    _lw_goblin2_previous_move_unit(g, eid, destination)
+    goblin = next((e for e in g["entities"] if e["id"] == eid), None)
+    if goblin is None or goblin["name"] != GOBLIN:
+        return
+    route = (g.get("last_move") or {}).get("route") or []
+    goblin_try_deposit(g, goblin, route)
+    goblin_try_steal(g, goblin)
+
+
+def render_goblin_controls(g, goblin, prefix):
+    st.markdown("#### 💰 Gobelin voleur")
+    gold, mana = goblin_loot(goblin)
+    if gold or mana:
+        st.success(
+            f"Butin transporté : {gold} or · {mana} mana. "
+            "Ramène le Gobelin à côté d'une de tes bases (ou traverse-la) pour l'encaisser."
+        )
+    else:
+        st.caption(
+            "Pour voler : arrête le Gobelin sur une case d'or ou de mana récoltée "
+            "par une base ennemie (ou marquée par un héros ennemi). Il prend aussitôt "
+            "ce que cette case rapporte à l'ennemi."
+        )
+
+# ============================================================
+# CONTRE L'IA : ANNULER SON DERNIER COUP
+# Avant chaque action du joueur (production ou manœuvre), la partie est
+# mémorisée. Le bouton « Annuler mon dernier coup » la remet dans l'état
+# d'avant cette action, réponse de l'IA comprise. Uniquement contre l'IA
+# (jamais en ligne ni à deux sur le même ordinateur).
+# ============================================================
+
+AI_UNDO_LIMIT = 30
+
+
+def ai_undo_stack():
+    return st.session_state.setdefault("ai_undo_stack", [])
+
+
+_lw_undo_previous_perform = perform
+
+
+def perform(fn, *args):
+    bundle = st.session_state.get("bundle")
+    snapshot = None
+    if (
+        ai_config(bundle) is not None
+        and not st.query_params.get("room")
+        and bundle["game"]["winner"] is None
+    ):
+        snapshot = copy.deepcopy(bundle)
+    try:
+        return _lw_undo_previous_perform(fn, *args)
+    finally:
+        # Seulement si l'action a réellement changé la partie.
+        if snapshot is not None and st.session_state.get("bundle") is not bundle:
+            stack = ai_undo_stack()
+            stack.append(snapshot)
+            del stack[:-AI_UNDO_LIMIT]
+
+
+def ai_undo_last_move():
+    stack = ai_undo_stack()
+    if not stack:
+        return
+    st.session_state.bundle = stack.pop()
+    st.session_state.ai_last_actions = []
+    st.session_state.ui_combat_report = None
+    st.session_state.ui_message = "↩️ Coup annulé : la partie revient juste avant ta dernière action."
+    bump_ui(clear_selection=True)
+
+
+_lw_undo_previous_render_sidebar = render_sidebar
+
+
+def render_sidebar(bundle):
+    if ai_config(bundle) is not None and not st.query_params.get("room"):
+        stack = ai_undo_stack()
+        with st.sidebar:
+            if st.button(
+                "↩️ Annuler mon dernier coup",
+                disabled=not stack,
+                width="stretch",
+                key="ai_undo_button",
+                help="Revient juste avant ta dernière action (la réponse de l'IA est annulée aussi).",
+            ):
+                ai_undo_last_move()
+                st.rerun()
+            if stack:
+                st.caption(f"{len(stack)} coup(s) peuvent être annulés.")
+    _lw_undo_previous_render_sidebar(bundle)
+
+# ============================================================
+# CONTRE L'IA : CE QUE L'IA A FAIT CE TOUR, EN SURBRILLANCE
+# Au début de chaque tour, la position des pièces de l'IA est notée.
+# Sur le plateau :
+# - orange (flèche en pointillés depuis le départ) : pièces déplacées ;
+# - vert « NOUVEAU » : unités apparues ce tour (recrutées, fusionnées) ;
+# - doré « NOUVEAU » : bâtiments, bases ou héros apparus ce tour.
+# ============================================================
+
+def ai_update_turn_marks(bundle):
+    """Nouveau tour : on repart de zéro, mais seulement après la première
+    action du joueur (il voit d'abord tout ce que l'IA a fait)."""
+    config = ai_config(bundle)
+    if config is None or not isinstance(bundle.get("game"), dict):
+        return
+    g = bundle["game"]
+    marks = st.session_state.get("ai_turn_marks")
+    new_turn = bool(marks) and marks.get("turn") != g["turn"] and st.session_state.get("ai_marks_seen", True)
+    if not marks or new_turn or marks.get("seat") != config["seat"]:
+        st.session_state.ai_turn_marks = {
+            "turn": g["turn"],
+            "seat": config["seat"],
+            "start": {
+                str(e["id"]): list(e["pos"]) for e in g["entities"] if e["owner"] == config["seat"]
+            },
+        }
+
+
+def ai_turn_marks_view(bundle):
+    config = ai_config(bundle)
+    marks = st.session_state.get("ai_turn_marks")
+    if config is None or not marks:
+        return None
+    start = marks["start"]
+    moved, new = {}, []
+    for e in bundle["game"]["entities"]:
+        if e["owner"] != config["seat"]:
+            continue
+        before = start.get(str(e["id"]))
+        if before is None:
+            new.append(e["id"])
+        elif list(before) != list(e["pos"]):
+            moved[str(e["id"])] = list(before)
+    return {"moved": moved, "new": new} if moved or new else None
+
+
+_lw_marks_previous_perform = perform
+
+
+def perform(fn, *args):
+    # Le joueur agit : il a vu ce que l'IA a fait.
+    st.session_state.ai_marks_seen = True
+    return _lw_marks_previous_perform(fn, *args)
+
+
+_lw_marks_previous_ai_autoplay = ai_autoplay
+
+
+def ai_autoplay():
+    before = st.session_state.get("bundle")
+    _lw_marks_previous_ai_autoplay()
+    if st.session_state.get("bundle") is not before:
+        # L'IA vient de jouer : le joueur ne l'a pas encore vu.
+        st.session_state.ai_marks_seen = False
+
+
+_lw_marks_previous_main = main
+
+
+def main():
+    if not st.query_params.get("room"):
+        ai_update_turn_marks(st.session_state.get("bundle"))
+    _lw_marks_previous_main()
+
+
+_lw_marks_previous_render_board = render_board
+
+
+def render_board(g, view, readonly=False):
+    bundle = st.session_state.get("bundle")
+    marks = None
+    if ai_config(bundle) is not None and not st.query_params.get("room"):
+        # L'IA a pu changer de tour pendant qu'elle jouait : on recale.
+        ai_update_turn_marks(bundle)
+        marks = ai_turn_marks_view(bundle)
+        if marks:
+            st.caption(
+                "🤖 Ce tour, l'IA : 🟠 a déplacé (flèche depuis le départ) · "
+                "🟢 a recruté · 🟡 a construit (bâtiment, base ou héros)."
+            )
+    st.session_state["_lw_ai_marks"] = marks
+    return _lw_marks_previous_render_board(g, view, readonly)
+
+# ============================================================
+# PROFILS DE JOUEURS ET STATISTIQUES
+# - Chaque joueur choisit un pseudo (accueil, ou salon en ligne).
+# - À la fin d'une partie en ligne ou contre l'IA, le résultat est ajouté
+#   à son profil (fichier profils.json à côté du jeu).
+# - Page « Profils » : statistiques contre l'IA et contre des joueurs.
+# - Export / import du profil (Streamlit Cloud efface les fichiers au
+#   redémarrage de l'application).
+# ============================================================
+
+PROFILES_FILE = Path(__file__).parent / "profils.json"
+
+
+_lw_profile_previous_new_bundle = new_bundle
+
+
+def new_bundle(*args, **kwargs):
+    bundle = _lw_profile_previous_new_bundle(*args, **kwargs)
+    bundle["game_id"] = uuid.uuid4().hex  # identifiant de partie (statistiques)
+    return bundle
+PROFILE_RESULTS = ("victoire", "défaite", "nul")
+
+
+@st.cache_resource
+def profiles_lock():
+    return threading.Lock()
+
+
+def profiles_load():
+    try:
+        data = json.loads(PROFILES_FILE.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def profiles_save(data):
+    tmp = PROFILES_FILE.with_suffix(".tmp")
+    tmp.write_text(json.dumps(data, ensure_ascii=False, indent=1), encoding="utf-8")
+    tmp.replace(PROFILES_FILE)
+
+
+def profile_add_games(name, games):
+    with profiles_lock():
+        data = profiles_load()
+        profile = data.setdefault(name, {"parties": []})
+        known = {(p.get("id"), p.get("joueur")) for p in profile["parties"]}
+        for game in games:
+            if (game.get("id"), game.get("joueur")) not in known:
+                profile["parties"].append(game)
+        profiles_save(data)
+
+
+def current_player_name():
+    return (st.session_state.get("player_name") or "").strip()
+
+
+def game_result_entry(bundle, seat, mode, opponent):
+    g = bundle["game"]
+    winner = g["winner"]
+    result = "nul" if winner == -1 else ("victoire" if winner == seat else "défaite")
+    loser = game_forfeiter(g)
+    return {
+        "id": bundle.get("game_id") or f"{g.get('tick', 0)}-{len(g['log'])}",
+        "joueur": seat,
+        "date": time.strftime("%Y-%m-%d %H:%M"),
+        "mode": mode,
+        "adversaire": opponent,
+        "faction": FACTIONS[faction_id(g, seat)]["name"],
+        "faction_adverse": FACTIONS[faction_id(g, 1 - seat)]["name"],
+        "resultat": result,
+        "abandon": loser is not None,
+        "abandon_par_moi": loser == seat,
+        "tours": g["turn"],
+        "bases_detruites": g["players"][seat].get("bases", 0),
+        "bases_perdues": g["players"][1 - seat].get("bases", 0),
+        "victoire": g.get("victory_mode"),
+    }
+
+
+def record_finished_game(bundle):
+    """Une seule fois par partie et par joueur : ajoute le résultat au profil."""
+    if not isinstance(bundle, dict) or bundle["game"].get("winner") is None:
+        return
+    done = bundle.setdefault("stats_recorded", [])
+    config = ai_config(bundle)
+    room = online_active_room() if st.session_state.get("online_code") else None
+    if room is not None:
+        seat = online_seat()
+        names = room.get("names") or {}
+        name = (names.get(seat) or "").strip()
+        opponent = (names.get(1 - seat) or "").strip() or "Adversaire en ligne"
+        mode = "humain"
+    elif config is not None:
+        seat = 1 - config["seat"]
+        name = (bundle.get("names") or {}).get(str(seat), "") or current_player_name()
+        opponent = f"IA {AI_LEVELS.get(config.get('level'), '').split(' ', 1)[-1]}"
+        mode = "ia"
+    else:
+        return  # partie à deux sur le même ordinateur : non comptée
+    if seat not in (0, 1) or not name or seat in done:
+        return
+    done.append(seat)
+    entry = game_result_entry(bundle, seat, mode, opponent)
+    if mode == "ia":
+        entry["niveau"] = opponent
+    profile_add_games(name, [entry])
+
+
+_lw_profile_previous_render_victory_screen = render_victory_screen
+
+
+def render_victory_screen(g):
+    _lw_profile_previous_render_victory_screen(g)
+    bundle = st.session_state.get("bundle")
+    if isinstance(bundle, dict) and isinstance(bundle.get("game"), dict) and bundle["game"].get("winner") is not None:
+        before = list(bundle.get("stats_recorded", []))
+        record_finished_game(bundle)
+        if bundle.get("stats_recorded", []) != before and current_player_name():
+            st.caption(f"📊 Résultat enregistré dans le profil de {current_player_name()}.")
+
+
+# ------------------------------------------------------------
+# Statistiques
+# ------------------------------------------------------------
+
+def profile_rate(won, played):
+    return f"{100 * won / played:.0f} %" if played else "—"
+
+
+def profile_rows(games, field):
+    rows = {}
+    for game in games:
+        row = rows.setdefault(game.get(field) or "?", {"parties": 0, "victoires": 0, "défaites": 0, "nuls": 0})
+        row["parties"] += 1
+        row[{"victoire": "victoires", "défaite": "défaites"}.get(game["resultat"], "nuls")] += 1
+    return [
+        {field.replace("_", " ").capitalize(): label, **row, "% victoires": profile_rate(row["victoires"], row["parties"])}
+        for label, row in sorted(rows.items(), key=lambda item: -item[1]["parties"])
+    ]
+
+
+def profile_streaks(games):
+    best = current = 0
+    for game in games:
+        if game["resultat"] == "victoire":
+            current += 1
+            best = max(best, current)
+        else:
+            current = 0
+    return current, best
+
+
+def render_profile_games(games, versus_ai):
+    if not games:
+        st.info("Aucune partie terminée pour l'instant.")
+        return
+    won = sum(g["resultat"] == "victoire" for g in games)
+    lost = sum(g["resultat"] == "défaite" for g in games)
+    played = len(games)
+    cols = st.columns(4)
+    cols[0].metric("Parties jouées", played)
+    cols[1].metric("Gagnées", won)
+    cols[2].metric("Perdues", lost)
+    cols[3].metric("Ratio de victoires", profile_rate(won, played))
+    current, best = profile_streaks(games)
+    wins = [g for g in games if g["resultat"] == "victoire"]
+    cols = st.columns(4)
+    cols[0].metric("Série en cours", f"{current} victoire(s)")
+    cols[1].metric("Meilleure série", f"{best} victoire(s)")
+    cols[2].metric("Durée moyenne", f"{sum(g['tours'] for g in games) / played:.1f} tours")
+    cols[3].metric("Victoire la plus rapide", f"tour {min(g['tours'] for g in wins)}" if wins else "—")
+    cols = st.columns(4)
+    cols[0].metric("Bases détruites", sum(g.get("bases_detruites", 0) for g in games))
+    cols[1].metric("Bases perdues", sum(g.get("bases_perdues", 0) for g in games))
+    cols[2].metric("Abandons (toi)", sum(g.get("abandon_par_moi", False) for g in games))
+    cols[3].metric("Abandons (adversaire)", sum(g.get("abandon", False) and not g.get("abandon_par_moi") for g in games))
+
+    favorite = max(profile_rows(games, "faction"), key=lambda r: r["parties"])
+    ranked = [r for r in profile_rows(games, "faction") if r["parties"] >= 3]
+    st.caption(
+        f"⭐ Faction la plus jouée : **{favorite['Faction']}**"
+        + (f" · 🏆 meilleure faction (3 parties ou plus) : **{max(ranked, key=lambda r: r['victoires'] / r['parties'])['Faction']}**" if ranked else "")
+    )
+
+    st.markdown("**Par faction jouée**")
+    st.dataframe(profile_rows(games, "faction"), hide_index=True, width="stretch")
+    st.markdown("**Contre chaque faction adverse**")
+    st.dataframe(profile_rows(games, "faction_adverse"), hide_index=True, width="stretch")
+
+    factions = [FACTIONS[f]["name"] for f in FACTIONS]
+    matrix = []
+    for mine in factions:
+        row = {"Ta faction ↓ / adverse →": mine}
+        for theirs in factions:
+            row[theirs] = sum(
+                1 for g in games
+                if g["faction"] == mine and g["faction_adverse"] == theirs and g["resultat"] == "défaite"
+            )
+        matrix.append(row)
+    st.markdown("**Défaites : ta faction contre chaque faction adverse**")
+    st.dataframe(matrix, hide_index=True, width="stretch")
+
+    if versus_ai:
+        st.markdown("**Par niveau de l'IA**")
+        st.dataframe(profile_rows(games, "niveau"), hide_index=True, width="stretch")
+    else:
+        st.markdown("**Par adversaire**")
+        st.dataframe(profile_rows(games, "adversaire"), hide_index=True, width="stretch")
+
+    st.markdown("**Dernières parties**")
+    st.dataframe(
+        [
+            {
+                "Date": g["date"], "Ta faction": g["faction"], "Adversaire": g["adversaire"],
+                "Faction adverse": g["faction_adverse"],
+                "Résultat": {"victoire": "🏆 victoire", "défaite": "💀 défaite"}.get(g["resultat"], "🤝 nul")
+                + (" (abandon)" if g.get("abandon") else ""),
+                "Tours": g["tours"],
+            }
+            for g in reversed(games[-15:])
+        ],
+        hide_index=True,
+        width="stretch",
+    )
+
+
+def render_profiles_page():
+    data = profiles_load()
+    names = sorted(data)
+    me = current_player_name()
+    if me and me not in names:
+        names.insert(0, me)
+    if not names:
+        st.info("Aucun profil pour l'instant : choisis un pseudo, puis termine une partie contre l'IA ou en ligne.")
+    else:
+        name = st.selectbox(
+            "Profil", names, index=names.index(me) if me in names else 0, key="profile_view_name",
+        )
+        games = (data.get(name) or {}).get("parties", [])
+        ai_tab, human_tab = st.tabs(["🤖 Contre l'IA", "🧑‍🤝‍🧑 Contre des joueurs"])
+        with ai_tab:
+            render_profile_games([g for g in games if g.get("mode") == "ia"], True)
+        with human_tab:
+            render_profile_games([g for g in games if g.get("mode") == "humain"], False)
+        st.download_button(
+            "📥 Télécharger ce profil",
+            data=json.dumps({name: data.get(name, {"parties": []})}, ensure_ascii=False, indent=1),
+            file_name=f"profil_{name}.json",
+            mime="application/json",
+            key="profile_download",
+        )
+    uploaded = st.file_uploader("📤 Importer un profil (fichier téléchargé auparavant)", type=["json"], key="profile_upload")
+    if uploaded is not None and st.button("Importer", key="profile_import"):
+        try:
+            imported = json.loads(uploaded.getvalue().decode("utf-8"))
+            for name, profile in imported.items():
+                games = [g for g in profile.get("parties", []) if isinstance(g, dict) and g.get("resultat") in PROFILE_RESULTS]
+                profile_add_games(str(name)[:24], games)
+            st.success("Profil importé.")
+        except (ValueError, AttributeError, UnicodeError):
+            st.error("Fichier de profil invalide.")
+
+
+# ------------------------------------------------------------
+# Accueil, salon en ligne, partie contre l'IA : le pseudo
+# ------------------------------------------------------------
+
+_lw_profile_previous_render_home = render_home
+
+
+def render_home():
+    with st.container(border=True):
+        cols = st.columns([2, 1])
+        with cols[0]:
+            name = st.text_input(
+                "👤 Ton pseudo (pour tes statistiques)",
+                value=st.session_state.get("player_name", ""),
+                max_chars=24,
+                key="home_player_name",
+            )
+            st.session_state.player_name = name.strip()
+        with cols[1]:
+            st.write("")
+            show = st.toggle("📊 Profils et statistiques", key="home_show_profiles")
+        if show:
+            render_profiles_page()
+    _lw_profile_previous_render_home()
+
+
+_lw_profile_previous_render_online_lobby = render_online_lobby
+
+
+def render_online_lobby(room, seat):
+    names = room.setdefault("names", {0: "", 1: ""})
+    name = st.text_input(
+        "👤 Ton pseudo (pour tes statistiques)",
+        value=names.get(seat) or st.session_state.get("player_name", ""),
+        max_chars=24,
+        key=f"lobby_name_{seat}",
+    ).strip()
+    if name != (names.get(seat) or ""):
+        with online_lock():
+            names[seat] = name
+            room["version"] += 1
+    if name:
+        st.session_state.player_name = name
+    _lw_profile_previous_render_online_lobby(room, seat)
+
+
+# Nouvelle partie : le pseudo est gardé (et inscrit dans la partie contre l'IA).
+_lw_profile_previous_reset_session = reset_session
+
+
+def reset_session(bundle=None):
+    name = current_player_name()
+    _lw_profile_previous_reset_session(bundle)
+    if name:
+        st.session_state.player_name = name
+        config = ai_config(bundle) if isinstance(bundle, dict) else None
+        if config is not None:
+            bundle.setdefault("names", {})[str(1 - config["seat"])] = name
+
+
+# L'annulation d'un coup ne peut pas effacer un résultat déjà enregistré.
+_lw_profile_previous_ai_undo_last_move = ai_undo_last_move
+
+
+def ai_undo_last_move():
+    recorded = list((st.session_state.get("bundle") or {}).get("stats_recorded", []))
+    _lw_profile_previous_ai_undo_last_move()
+    if recorded and isinstance(st.session_state.get("bundle"), dict):
+        st.session_state.bundle["stats_recorded"] = recorded
 
 
 if __name__ == "__main__":
