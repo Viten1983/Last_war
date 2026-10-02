@@ -827,6 +827,411 @@
       setTimeout(frame, 16);
     }
 
+    // ------------------------------------------------------------
+    // JOURNAL DE BORD SUR LE PLATEAU
+    // Marques persistantes : cases touchées et PF perdus en rouge, trait
+    // de l'attaquant vers sa cible, numéro de l'action (comme dans le
+    // journal au-dessus du plateau).
+    // Animations jouées une seule fois par action : flèche, rocher, boule
+    // de feu, nuage de poussière, sort, explosion…
+    // ------------------------------------------------------------
+    const fxLayer = svgNode("g", { class: "fx-layer", "pointer-events": "none" });
+    let playedFx = new Set();
+    try { playedFx = new Set(JSON.parse(sessionStorage.getItem("lw_played_fx") || "[]")); } catch (error) { /* ignoré */ }
+    const fxQueue = [];
+    let fxBusy = false;
+    const FX_COLORS = {
+      melee: "#dc2626", arrow: "#b91c1c", rock: "#57534e", fireball: "#ea580c", fire: "#f97316",
+      acid: "#65a30d", arcane: "#a855f7", ice: "#38bdf8", dark: "#6d28d9", buff: "#eab308",
+      summon: "#c026d3", mutation: "#16a34a", explosion: "#f59e0b", loot: "#ca8a04", impact: "#dc2626",
+      move: "#f97316",
+    };
+    const FX_ICONS = {
+      melee: "⚔️", arrow: "🏹", rock: "🪨", fireball: "☄️", fire: "🔥", acid: "🧪", arcane: "✨",
+      ice: "❄️", dark: "🌑", buff: "💪", summon: "🌀", mutation: "🧬", explosion: "💥", loot: "💰",
+      move: "🚶", impact: "💢",
+    };
+    const OWNER_INK = { 0: "#15803d", 1: "#1d4ed8", 2: "#b91c1c", 3: "#57534e" };
+
+    function fxGameId() { return args && args.fx ? args.fx.game || "" : ""; }
+    function rememberFx(seq) {
+      playedFx.add(seq);
+      try { sessionStorage.setItem("lw_played_fx", JSON.stringify([...playedFx].slice(-200))); } catch (error) { /* ignoré */ }
+    }
+    function pt(pos) { return center(pos[0], pos[1]); }
+    function tween(duration, step, done) {
+      const start = performance.now();
+      // Minuterie (comme l'animation des déplacements) plutôt que
+      // requestAnimationFrame, suspendu quand la page n'est pas affichée.
+      function frame() {
+        const t = Math.min(1, (performance.now() - start) / duration);
+        step(t);
+        if (t < 1) setTimeout(frame, 16);
+        else if (done) done();
+      }
+      setTimeout(frame, 16);
+    }
+    function easeOut(t) { return 1 - Math.pow(1 - t, 3); }
+
+    // Pastille « −3 PF » rouge (ou « +2 PF » verte) au-dessus d'une case.
+    function pfBadge(layer, x, y, label, fill) {
+      const w = 12 + label.length * 7.2;
+      layer.appendChild(svgNode("rect", { x: x - w / 2, y: y - 11, width: w, height: 22, rx: 11, fill, stroke: "#ffffff", "stroke-width": 2 }));
+      layer.appendChild(svgNode("text", { x, y: y + 0.5, "text-anchor": "middle", "dominant-baseline": "middle", "font-size": 13, "font-weight": 900, fill: "#ffffff" }, label));
+    }
+    function numberBadge(layer, x, y, n, ink) {
+      layer.appendChild(svgNode("circle", { cx: x, cy: y, r: 11, fill: ink, stroke: "#ffffff", "stroke-width": 2.2 }));
+      layer.appendChild(svgNode("text", { x, y: y + 0.5, "text-anchor": "middle", "dominant-baseline": "middle", "font-size": 12, "font-weight": 900, fill: "#ffffff" }, String(n)));
+    }
+    function arrowLine(layer, a, b, color, dashed, width = 3.5) {
+      const dx = b.x - a.x, dy = b.y - a.y, length = Math.hypot(dx, dy);
+      if (length < 1) return;
+      const ux = dx / length, uy = dy / length;
+      const stop = Math.max(0, length - 26);
+      const ex = a.x + ux * stop, ey = a.y + uy * stop;
+      const px = -uy, py = ux;
+      const head = `${ex + ux * 12},${ey + uy * 12} ${ex + px * 7.5},${ey + py * 7.5} ${ex - px * 7.5},${ey - py * 7.5}`;
+      // Liseré blanc : le trait reste lisible sur n'importe quel décor.
+      layer.appendChild(svgNode("line", { x1: a.x + ux * 14, y1: a.y + uy * 14, x2: ex, y2: ey, stroke: "#ffffff", "stroke-width": width + 3.5, "stroke-linecap": "round", opacity: 0.75 }));
+      layer.appendChild(svgNode("polygon", { points: head, fill: "#ffffff", stroke: "#ffffff", "stroke-width": 3.5, "stroke-linejoin": "round", opacity: 0.75 }));
+      layer.appendChild(svgNode("line", { x1: a.x + ux * 14, y1: a.y + uy * 14, x2: ex, y2: ey, stroke: color, "stroke-width": width, "stroke-linecap": "round", "stroke-dasharray": dashed ? "8 6" : "none", opacity: 0.95 }));
+      layer.appendChild(svgNode("polygon", { points: head, fill: color, opacity: 0.95 }));
+    }
+
+    function drawFxMarks() {
+      const fx = args.fx;
+      if (!fx || !fx.events || !fx.events.length) return;
+      const lines = svgNode("g", { class: "fx-marks", "pointer-events": "none" });
+      const cells = new Map();
+      const numbers = new Map();
+      for (const ev of fx.events) {
+        const ink = OWNER_INK[ev.faction] || "#dc2626";
+        for (const shot of ev.shots || []) {
+          arrowLine(lines, pt(shot.from), pt(shot.to), FX_COLORS[shot.kind] || ink, shot.kind !== "melee");
+        }
+        for (const move of ev.moves || []) {
+          if (move.from[0] === move.to[0] && move.from[1] === move.to[1]) continue;
+          arrowLine(lines, pt(move.from), pt(move.to), ink, true, 2.5);
+        }
+        for (const hit of ev.hits || []) {
+          const k = keyOf(hit.pos[0], hit.pos[1]);
+          if (!cells.has(k)) cells.set(k, { pos: hit.pos, damage: 0, heal: 0, destroyed: false, status: null });
+          const cell = cells.get(k);
+          cell.damage += hit.damage || 0;
+          cell.heal += hit.heal || 0;
+          cell.destroyed = cell.destroyed || Boolean(hit.destroyed);
+          if (hit.status) cell.status = hit.status;
+        }
+        for (const pos of ev.spawns || []) {
+          const c = pt(pos);
+          lines.appendChild(svgNode("polygon", { points: hexPoints(c.x, c.y, SIZE - 4), fill: "none", stroke: "#facc15", "stroke-width": 3, "stroke-dasharray": "5 4", opacity: 0.9 }));
+        }
+        // Numéro de l'action : sur la cible, sinon sur l'arrivée ou la pièce.
+        const anchor = (ev.shots && ev.shots[0] && ev.shots[0].to) || (ev.moves && ev.moves[0] && ev.moves[0].to)
+          || (ev.hits && ev.hits[0] && ev.hits[0].pos) || (ev.spawns && ev.spawns[0]) || (ev.auras && ev.auras[0] && ev.auras[0].pos);
+        if (anchor) {
+          const k = keyOf(anchor[0], anchor[1]);
+          if (!numbers.has(k)) numbers.set(k, []);
+          numbers.get(k).push({ n: ev.n, ink });
+        }
+      }
+      const badges = svgNode("g", { class: "fx-badges", "pointer-events": "none" });
+      cells.forEach(cell => {
+        const c = pt(cell.pos);
+        if (cell.damage > 0) {
+          badges.appendChild(svgNode("polygon", { points: hexPoints(c.x, c.y, SIZE - 2), fill: "#ef4444", "fill-opacity": 0.22, stroke: "#dc2626", "stroke-width": 4 }));
+          const dmg = String(Math.round(cell.damage * 10) / 10).replace(".", ",");
+          pfBadge(badges, c.x, c.y - SIZE * 0.93, `${cell.destroyed ? "💀 " : ""}−${dmg} PF`, "#dc2626");
+          if (cell.destroyed) {
+            // Pièce détruite : grande croix rouge sur la case.
+            const r = 15;
+            badges.appendChild(svgNode("path", { d: `M${c.x - r} ${c.y - r} L${c.x + r} ${c.y + r} M${c.x + r} ${c.y - r} L${c.x - r} ${c.y + r}`, stroke: "#dc2626", "stroke-width": 6, "stroke-linecap": "round", opacity: 0.75 }));
+          }
+        } else if (cell.heal > 0) {
+          const heal = String(Math.round(cell.heal * 10) / 10).replace(".", ",");
+          pfBadge(badges, c.x, c.y - SIZE * 0.93, `+${heal} PF`, "#16a34a");
+        }
+        if (cell.status) pfBadge(badges, c.x, c.y + SIZE * 0.93, cell.status, "#0369a1");
+      });
+      numbers.forEach((list, k) => {
+        const [q, r] = k.split(",").map(Number);
+        const c = center(q, r);
+        // À gauche de la pièce, empilés vers le bas si plusieurs actions.
+        list.forEach((item, i) => numberBadge(badges, c.x - SIZE * 0.92, c.y - 12 + i * 23, item.n, item.ink));
+      });
+      board.appendChild(lines);
+      board.appendChild(badges);
+    }
+
+    // --- Animations -------------------------------------------------
+    function fade(node, duration, done) {
+      tween(duration, t => node.setAttribute("opacity", String(1 - t)), () => { node.remove(); if (done) done(); });
+    }
+    function floatText(c, label, color, delay = 0) {
+      setTimeout(() => {
+        const node = svgNode("text", { x: c.x, y: c.y - 10, "text-anchor": "middle", "font-size": 22, "font-weight": 900, fill: color, stroke: "#ffffff", "stroke-width": 4, "paint-order": "stroke" }, label);
+        fxLayer.appendChild(node);
+        tween(1400, t => {
+          node.setAttribute("y", String(c.y - 10 - 34 * easeOut(t)));
+          node.setAttribute("opacity", String(t < 0.7 ? 1 : 1 - (t - 0.7) / 0.3));
+        }, () => node.remove());
+      }, delay);
+    }
+    function shakeAt(pos) {
+      const piece = (args.entities || []).find(p => p.pos[0] === pos[0] && p.pos[1] === pos[1]);
+      if (!piece) return;
+      tween(380, t => {
+        const layer = pieceGroups[piece.id];
+        if (!layer) return;
+        const dx = t < 1 ? Math.sin(t * Math.PI * 9) * 5 * (1 - t) : 0;
+        if (t < 1) layer.setAttribute("transform", `translate(${dx},0)`);
+        else layer.removeAttribute("transform");
+      });
+    }
+    function flashHex(c, color) {
+      const node = svgNode("polygon", { points: hexPoints(c.x, c.y, SIZE - 2), fill: color, "fill-opacity": 0.55 });
+      fxLayer.appendChild(node);
+      fade(node, 600);
+    }
+    // Nuage de poussière : bouffées brunes qui s'étalent et s'estompent.
+    function dust(c, scale = 1, colors = ["#a8a29e", "#d6d3d1", "#92400e", "#78716c"]) {
+      for (let i = 0; i < 12; i++) {
+        const angle = (i / 12) * Math.PI * 2 + Math.random() * 0.5;
+        const dist = (18 + Math.random() * 22) * scale;
+        const puff = svgNode("circle", { cx: c.x, cy: c.y, r: 6 * scale, fill: colors[i % colors.length], opacity: 0.85 });
+        fxLayer.appendChild(puff);
+        tween(700 + Math.random() * 300, t => {
+          const e = easeOut(t);
+          puff.setAttribute("cx", String(c.x + Math.cos(angle) * dist * e));
+          puff.setAttribute("cy", String(c.y + Math.sin(angle) * dist * e - 6 * e));
+          puff.setAttribute("r", String((6 + 10 * e) * scale));
+          puff.setAttribute("opacity", String(0.85 * (1 - t)));
+        }, () => puff.remove());
+      }
+    }
+    function emojiPop(c, emoji, size = 30, duration = 800) {
+      const node = svgNode("text", { x: c.x, y: c.y, "text-anchor": "middle", "dominant-baseline": "middle", "font-size": size }, emoji);
+      fxLayer.appendChild(node);
+      tween(duration, t => {
+        const s = t < 0.3 ? 0.4 + 2 * t : 1;
+        node.setAttribute("transform", `translate(${c.x},${c.y}) scale(${s}) translate(${-c.x},${-c.y})`);
+        node.setAttribute("opacity", String(t < 0.6 ? 1 : 1 - (t - 0.6) / 0.4));
+      }, () => node.remove());
+    }
+    function rings(c, color, count = 3, maxR = 50, duration = 700, width = 5) {
+      for (let i = 0; i < count; i++) {
+        setTimeout(() => {
+          const ring = svgNode("circle", { cx: c.x, cy: c.y, r: 4, fill: "none", stroke: color, "stroke-width": width, opacity: 0.9 });
+          fxLayer.appendChild(ring);
+          tween(duration, t => {
+            ring.setAttribute("r", String(4 + maxR * easeOut(t)));
+            ring.setAttribute("opacity", String(0.9 * (1 - t)));
+          }, () => ring.remove());
+        }, i * 120);
+      }
+    }
+    function sparkles(c, color, count = 10, rise = 40, glyph = "✦") {
+      for (let i = 0; i < count; i++) {
+        const x = c.x + (Math.random() - 0.5) * 50;
+        const y = c.y + (Math.random() - 0.3) * 30;
+        const node = svgNode("text", { x, y, "text-anchor": "middle", "font-size": 10 + Math.random() * 10, fill: color, stroke: "#ffffff", "stroke-width": 1, "paint-order": "stroke" }, glyph);
+        fxLayer.appendChild(node);
+        const delay = Math.random() * 350;
+        setTimeout(() => tween(900, t => {
+          node.setAttribute("y", String(y - rise * t));
+          node.setAttribute("opacity", String(1 - t));
+        }, () => node.remove()), delay);
+      }
+    }
+    // Cercle magique tournant (sorts).
+    function magicCircle(c, color, duration = 1100) {
+      const g = svgNode("g", {});
+      g.appendChild(svgNode("circle", { cx: c.x, cy: c.y, r: 30, fill: color, "fill-opacity": 0.12, stroke: color, "stroke-width": 3, "stroke-dasharray": "6 5" }));
+      g.appendChild(svgNode("circle", { cx: c.x, cy: c.y, r: 20, fill: "none", stroke: color, "stroke-width": 2 }));
+      const star = [];
+      for (let i = 0; i < 5; i++) {
+        const a = -Math.PI / 2 + i * 4 * Math.PI / 5;
+        star.push(`${c.x + Math.cos(a) * 20},${c.y + Math.sin(a) * 20}`);
+      }
+      g.appendChild(svgNode("polygon", { points: star.join(" "), fill: "none", stroke: color, "stroke-width": 1.8 }));
+      fxLayer.appendChild(g);
+      tween(duration, t => {
+        g.setAttribute("transform", `rotate(${t * 160} ${c.x} ${c.y})`);
+        g.setAttribute("opacity", String(t < 0.75 ? 1 : 1 - (t - 0.75) / 0.25));
+      }, () => g.remove());
+    }
+    // Projectile : trajectoire droite (flèche, sort) ou en cloche (rocher, feu).
+    function projectile(kind, a, b, done) {
+      const dx = b.x - a.x, dy = b.y - a.y, length = Math.hypot(dx, dy) || 1;
+      const arc = ["rock", "fireball", "acid"].includes(kind);
+      const height = arc ? Math.min(130, 40 + length * 0.35) : 0;
+      const duration = arc ? 650 + length * 0.6 : 260 + length * 0.9;
+      const node = svgNode("g", {});
+      const angle = Math.atan2(dy, dx) * 180 / Math.PI;
+      if (kind === "arrow") {
+        node.appendChild(svgNode("line", { x1: -16, y1: 0, x2: 10, y2: 0, stroke: "#3f2a14", "stroke-width": 3, "stroke-linecap": "round" }));
+        node.appendChild(svgNode("polygon", { points: "16,0 7,-5 7,5", fill: "#1c1917" }));
+        node.appendChild(svgNode("polygon", { points: "-16,0 -21,-5 -13,0 -21,5", fill: "#fef3c7", stroke: "#92400e", "stroke-width": 1 }));
+      } else if (kind === "rock") {
+        node.appendChild(svgNode("circle", { cx: 0, cy: 0, r: 9, fill: "#78716c", stroke: "#292524", "stroke-width": 2 }));
+        node.appendChild(svgNode("circle", { cx: -3, cy: -3, r: 3, fill: "#a8a29e" }));
+      } else if (kind === "fireball" || kind === "fire") {
+        node.appendChild(svgNode("circle", { cx: 0, cy: 0, r: 14, fill: "#fde047", opacity: 0.45 }));
+        node.appendChild(svgNode("circle", { cx: 0, cy: 0, r: 9, fill: "#f97316", stroke: "#b91c1c", "stroke-width": 2 }));
+        node.appendChild(svgNode("circle", { cx: -2, cy: -2, r: 4, fill: "#fef08a" }));
+      } else if (kind === "acid") {
+        node.appendChild(svgNode("circle", { cx: 0, cy: 0, r: 8, fill: "#84cc16", stroke: "#365314", "stroke-width": 2 }));
+      } else {
+        const color = FX_COLORS[kind] || "#a855f7";
+        node.appendChild(svgNode("circle", { cx: 0, cy: 0, r: 15, fill: color, opacity: 0.35 }));
+        node.appendChild(svgNode("circle", { cx: 0, cy: 0, r: 8, fill: color, stroke: "#ffffff", "stroke-width": 2 }));
+      }
+      const shadow = arc ? svgNode("ellipse", { cx: a.x, cy: a.y, rx: 8, ry: 3.5, fill: "#000000", opacity: 0.3 }) : null;
+      if (shadow) fxLayer.appendChild(shadow);
+      fxLayer.appendChild(node);
+      let lastTrail = 0;
+      tween(duration, t => {
+        const x = a.x + dx * t;
+        const yLine = a.y + dy * t;
+        const y = yLine - height * 4 * t * (1 - t);
+        const rot = kind === "arrow" ? angle : (arc ? t * 540 : 0);
+        node.setAttribute("transform", `translate(${x},${y}) rotate(${rot})`);
+        if (shadow) { shadow.setAttribute("cx", String(x)); shadow.setAttribute("cy", String(yLine)); }
+        // Traînée de particules (feu, sorts).
+        if (kind !== "arrow" && kind !== "rock" && t - lastTrail > 0.05) {
+          lastTrail = t;
+          const color = kind === "acid" ? "#a3e635" : (kind === "fireball" || kind === "fire") ? "#fb923c" : (FX_COLORS[kind] || "#c084fc");
+          const spark = svgNode("circle", { cx: x, cy: y, r: 5, fill: color, opacity: 0.8 });
+          fxLayer.appendChild(spark);
+          tween(450, s => { spark.setAttribute("r", String(5 * (1 - s))); spark.setAttribute("opacity", String(0.8 * (1 - s))); }, () => spark.remove());
+        }
+      }, () => { node.remove(); if (shadow) shadow.remove(); if (done) done(); });
+    }
+    // Souffle de feu (Dragon, Aramil) : flammes en rafale.
+    function flameStream(a, b, done) {
+      const count = 16;
+      for (let i = 0; i < count; i++) {
+        setTimeout(() => {
+          const flame = svgNode("circle", { cx: a.x, cy: a.y, r: 6, fill: i % 2 ? "#f97316" : "#facc15", opacity: 0.9 });
+          fxLayer.appendChild(flame);
+          const jitter = (Math.random() - 0.5) * 18;
+          tween(420, t => {
+            flame.setAttribute("cx", String(a.x + (b.x - a.x) * t + jitter * t));
+            flame.setAttribute("cy", String(a.y + (b.y - a.y) * t + jitter * t));
+            flame.setAttribute("r", String(6 + 8 * t));
+            flame.setAttribute("opacity", String(0.9 * (1 - t * 0.7)));
+          }, () => flame.remove());
+        }, i * 28);
+      }
+      setTimeout(done, count * 28 + 380);
+    }
+    function impact(kind, c) {
+      if (kind === "melee") { dust(c, 1.1); emojiPop(c, "⚔️", 32, 850); }
+      else if (kind === "arrow") { dust(c, 0.6); }
+      else if (kind === "rock") { dust(c, 1.3, ["#78716c", "#a8a29e", "#57534e", "#d6d3d1"]); rings(c, "#57534e", 1, 40, 500, 4); }
+      else if (kind === "fireball" || kind === "fire") { rings(c, "#f97316", 2, 46, 600, 6); dust(c, 1, ["#f97316", "#facc15", "#ef4444", "#78716c"]); }
+      else if (kind === "explosion") { flashHex(c, "#fde047"); rings(c, "#f59e0b", 3, 70, 700, 8); dust(c, 1.6, ["#f97316", "#facc15", "#ef4444", "#44403c"]); emojiPop(c, "💥", 44, 900); }
+      else if (kind === "acid") { dust(c, 0.9, ["#84cc16", "#a3e635", "#4d7c0f", "#d9f99d"]); }
+      else if (kind === "ice") { magicCircle(c, "#38bdf8", 1000); sparkles(c, "#0ea5e9", 9, 30, "❄"); }
+      else if (kind === "arcane") { magicCircle(c, "#a855f7"); sparkles(c, "#c084fc", 10, 40); }
+      else if (kind === "dark") { magicCircle(c, "#6d28d9"); rings(c, "#4c1d95", 2, 36, 700, 5); }
+      else if (kind === "buff") { sparkles(c, "#eab308", 12, 45, "✚"); rings(c, "#facc15", 1, 34, 700, 4); }
+      else if (kind === "summon") {
+        const pillar = svgNode("rect", { x: c.x - 14, y: c.y - 120, width: 28, height: 130, rx: 14, fill: "#e879f9", opacity: 0.55 });
+        fxLayer.appendChild(pillar);
+        fade(pillar, 1100);
+        rings(c, "#c026d3", 3, 50, 800, 5);
+        sparkles(c, "#f0abfc", 12, 60);
+      }
+      else if (kind === "mutation") { rings(c, "#16a34a", 3, 40, 700, 4); sparkles(c, "#4ade80", 10, 35, "🧬"); }
+      else if (kind === "loot") { sparkles(c, "#ca8a04", 8, 45, "💰"); }
+      else { dust(c, 0.8); }
+    }
+
+    function hitTexts(ev) {
+      (ev.hits || []).forEach((hit, i) => {
+        const c = pt(hit.pos);
+        if (hit.damage) {
+          const dmg = String(Math.round(hit.damage * 10) / 10).replace(".", ",");
+          floatText(c, `${hit.destroyed ? "💀 " : ""}−${dmg} PF`, "#dc2626", i * 120);
+          shakeAt(hit.pos);
+          if (hit.destroyed) flashHex(c, "#dc2626");
+        } else if (hit.heal) {
+          floatText(c, `+${String(Math.round(hit.heal * 10) / 10).replace(".", ",")} PF`, "#16a34a", i * 120);
+        } else if (hit.status) {
+          floatText(c, hit.status, "#0369a1", i * 120);
+        }
+      });
+    }
+
+    function playEvent(ev, done) {
+      const shots = (ev.shots || []).filter(s => s.from && s.to);
+      const auras = ev.auras || [];
+      const hasHits = (ev.hits || []).length > 0;
+      if (!shots.length && !auras.length && !hasHits) { done(); return; }
+      // Bandeau : ce qui se passe, en clair, pendant l'animation.
+      const banner = svgNode("g", {});
+      const label = `${ev.n}. ${FX_ICONS[ev.kind] || "•"} ${ev.text}`.slice(0, 110);
+      const bx = baseW / 2, by = 26;
+      const width = Math.min(baseW - 20, 30 + label.length * 7.4);
+      banner.appendChild(svgNode("rect", { x: bx - width / 2, y: by - 15, width, height: 30, rx: 15, fill: "rgba(12,18,28,0.85)", stroke: OWNER_INK[ev.faction] || "#dc2626", "stroke-width": 2.5 }));
+      banner.appendChild(svgNode("text", { x: bx, y: by + 1, "text-anchor": "middle", "dominant-baseline": "middle", "font-size": 14, "font-weight": 800, fill: "#ffffff" }, label));
+      fxLayer.appendChild(banner);
+      let pending = 0;
+      let finished = false;
+      function landed() {
+        pending -= 1;
+        if (pending > 0) return;
+        auras.forEach(a => impact(a.kind, pt(a.pos)));
+        hitTexts(ev);
+        if (!finished) { finished = true; setTimeout(() => { fade(banner, 300); done(); }, 1000); }
+      }
+      if (!shots.length) { pending = 1; landed(); return; }
+      pending = shots.length;
+      shots.forEach((shot, i) => {
+        const a = pt(shot.from), b = pt(shot.to);
+        const go = () => {
+          if (shot.kind === "melee") {
+            // Corps à corps : charge, puis nuage de poussière sur les combattants.
+            const mid = { x: (a.x * 0.35 + b.x * 0.65), y: (a.y * 0.35 + b.y * 0.65) };
+            dust(mid, 1.2);
+            dust(b, 1.5);
+            impact("melee", b);
+            setTimeout(landed, 450);
+          } else if (shot.kind === "explosion") {
+            impact("explosion", b);
+            setTimeout(landed, 500);
+          } else if (shot.kind === "fire") {
+            flameStream(a, b, () => { impact("fire", b); landed(); });
+          } else {
+            projectile(shot.kind, a, b, () => { impact(shot.kind, b); landed(); });
+          }
+        };
+        setTimeout(go, i * 180);
+      });
+    }
+
+    function pumpFx() {
+      if (fxBusy) return;
+      const ev = fxQueue.shift();
+      if (!ev) return;
+      fxBusy = true;
+      playEvent(ev, () => { fxBusy = false; pumpFx(); });
+    }
+
+    function queueFx() {
+      const fx = args.fx;
+      if (!fx || !fx.events) return;
+      for (const ev of fx.events) {
+        const id = `${fxGameId()}:${ev.seq}`;
+        if (playedFx.has(id)) continue;
+        rememberFx(id);
+        fxQueue.push(ev);
+      }
+      // Après un déplacement animé, on laisse la pièce arriver.
+      setTimeout(pumpFx, 450);
+    }
+
     function render(newArgs) {
       const previousScrollLeft = wrapper.scrollLeft;
       const previousScrollTop = wrapper.scrollTop;
@@ -1024,7 +1429,12 @@ if (reachable || placed) {
         "pointer-events": "none",
       }));
       drawAiArrows();
+      drawFxMarks();
+      // Calque des animations : conservé d'un rendu à l'autre (une animation
+      // en cours continue même si Streamlit redessine le plateau).
+      board.appendChild(fxLayer);
       animateLastMove();
+      queueFx();
       wrapper.scrollLeft = previousScrollLeft;
       wrapper.scrollTop = previousScrollTop;
       requestAnimationFrame(resizeFrame);

@@ -648,6 +648,7 @@ Prototype âge I : Déferlants contre Exilés.
 - Les unités, bases et bâtiments alliés peuvent être traversés (chaque case traversée compte comme un déplacement), mais pas occupés à l'arrivée.
 - Un tir subit une riposte égale aux PF de la cible (au contact, c'est un corps à corps).
 - Une unité invisible non détectée attaque sans subir de riposte.
+- La Catapulte et la Catapulte de l'enfer ne ripostent jamais (ni au corps à corps, ni aux tirs). Seul le Trébuchet tire automatiquement sur les unités qui traversent sa zone.
 - Bâtiment technique (Bassin de mutation, Marché, Forge) : seulement en J5 pour le joueur du haut, P12 pour celui du bas.
 - Vagabonds : 3 héros mobiles servent de bases ; ils bougent, produisent et attaquent pendant la production (attaque immédiate, sans riposte ; l'adversaire la voit au dévoilement). Détruire 3 héros fait gagner.
 - Les ennemis et les constructions bloquent le déplacement.
@@ -4468,6 +4469,7 @@ def render_board(g, view, readonly=False):
         turn=g["turn"],
         last_move=view.get("last_move"),
         ai_marks=st.session_state.get("_lw_ai_marks"),
+        fx=st.session_state.get("_lw_fx"),
         key=f"board_component_{st.session_state.ui_board_key}",
         default=None,
     )
@@ -5251,10 +5253,16 @@ def render_move_controls(g):
             valid = True  
   
             if values.get("hidden") and not values["winnable"]:  
-                # Attaquant invisible et non détecté : aucune riposte.  
-                st.info(  
-                    "👻 Attaque invisible : l'ennemi n'a aucune détection "  
-                    "à portée. Tes unités infligent "  
+                # Attaquant invisible et non détecté, ou cible qui ne
+                # riposte jamais (catapultes) : aucune riposte.
+                st.info(
+                    (
+                        f"🛡️ {values['no_riposte']} ne riposte pas. "
+                        if values.get("no_riposte")
+                        else "👻 Attaque invisible : l'ennemi n'a aucune "
+                        "détection à portée. "
+                    )
+                    + "Tes unités infligent "
                     f"{values['defender_damage']:g} PF sans subir de dégâts. "  
                     f"Le défenseur gardera {values['defender_remaining']:g} PF."  
                 )  
@@ -5286,8 +5294,11 @@ def render_move_controls(g):
                 st.success(  
                     "Le défenseur sera détruit. "  
                     + (  
-                        "👻 Attaque invisible : aucune perte pour tes unités."  
-                        if values.get("hidden")  
+                        f"🛡️ {values['no_riposte']} ne riposte pas : "
+                        "aucune perte pour tes unités."
+                        if values.get("no_riposte")
+                        else "👻 Attaque invisible : aucune perte pour tes unités."
+                        if values.get("hidden")
                         else f"Tu dois répartir {total_losses:g} PF "  
                         "de pertes entre tes unités."  
                     )  
@@ -5950,8 +5961,11 @@ def main():
             "Contour jaune : sélection · "  
             "Cases vertes : déplacement ou placement possible · "  
             "Cases rouges : cible ennemie accessible · "  
-            "Pièce grise : action déjà effectuée · "  
-            "Attente N : pièce disponible dans N fins de tour"  
+            "Pièce grise : action déjà effectuée · "
+            "Attente N : pièce disponible dans N fins de tour · "
+            "Numéros sur le plateau : actions du journal de bord · "
+            "Case rouge et « −N PF » : dégâts subis · "
+            "Contour jaune pointillé : pièce apparue"
         )  
   
     with st.container(key="lw_page_board"):  
@@ -7528,6 +7542,12 @@ def attack(
             if occupier_id is not None
             else None
         ),
+        # Chemin de l'occupant jusqu'à la cible (case de frappe en avant-dernier).
+        "occupier_route": (
+            [list(p) for p in routes.get(occupier_id) or []]
+            if occupier_id is not None
+            else None
+        ),
         "destination": list(target_pos),
     }
 
@@ -7579,8 +7599,10 @@ def apply_attack_effects(g, effects):
     })
     owner = effects["owner"]
 
-    # Un ouvrier tué dans une pile : l'attaquant ne peut pas
-    # rejoindre les ouvriers restants et revient sur sa case.
+    # Un ouvrier tué dans une pile : l'attaquant ne peut pas rejoindre
+    # les ouvriers restants. Il s'arrête sur la dernière case libre de
+    # son chemin (au contact de la pile si possible), sinon sur sa case
+    # de départ.
     occupier = next(
         (e for e in g["entities"] if e["id"] == effects.get("occupier_id")),
         None,
@@ -7591,8 +7613,21 @@ def apply_attack_effects(g, effects):
         and tuple(occupier["pos"]) == tuple(effects["destination"])
         and len(pieces_at(g, occupier["pos"])) > 1
     ):
-        occupier["pos"] = list(effects["occupier_origin"])
-        log(g, "D'autres ouvriers tiennent encore la case : l'attaquant reste en place.")
+        origin = effects["occupier_origin"]
+        route = effects.get("occupier_route") or []
+        strike = next(
+            (
+                p for p in reversed(route[1:-1])
+                if at(g, tuple(p)) is None and not blocked(g, tuple(p))
+            ),
+            origin,
+        )
+        occupier["pos"] = list(strike)
+        log(
+            g,
+            "D'autres ouvriers tiennent encore la case : "
+            f"{occupier['name']} s'arrête en {coord(strike)}.",
+        )
 
     for hit in effects["splash"]:
         for victim in pieces_at(g, hit["pos"]):
@@ -10125,12 +10160,13 @@ def attack(g, attacker_ids, target_id, occupier_id=None, losses=None, *args, **k
         a["acted"] = True
         report["participants"].append({
             "id": a["id"], "owner": a["owner"], "name": a["name"],
-            "role": "Attaquant invisible", "before": float(a["pf"]),
-            "damage": 0.0, "after": float(a["pf"]),
+            "role": "Attaquant" if values.get("no_riposte") else "Attaquant invisible",
+            "before": float(a["pf"]), "damage": 0.0, "after": float(a["pf"]),
         })
     log(
         g,
-        f"Attaque invisible en {coord(target['pos'])} : "
+        f"{'Attaque' if values.get('no_riposte') else 'Attaque invisible'} "
+        f"en {coord(target['pos'])} : "
         f"{target['name']} perd {values['defender_damage']:g} PF, aucune riposte.",
     )
     g["_combat_report"] = report
@@ -12173,8 +12209,13 @@ def set_hero_attack(g, owner, hero_id, target_id):
     if target["pf"] <= 0:
         g["entities"].remove(target)
         result = f"{target['name']} est détruit"
-        # Corps à corps : le héros prend la case de sa victime (pas un tireur).
-        if hero_stats(g, hero)[2] == 0 and not blocked(g, tuple(target_cell)):
+        # Corps à corps : le héros prend la case de sa victime (pas un tireur),
+        # sauf si d'autres ouvriers ennemis tiennent encore la case.
+        if (
+            hero_stats(g, hero)[2] == 0
+            and not blocked(g, tuple(target_cell))
+            and not pieces_at(g, tuple(target_cell))
+        ):
             hero["strike_from"] = list(hero["pos"])
             hero["pos"] = target_cell
             result += f", {hero['name']} prend sa case"
@@ -16793,6 +16834,713 @@ def ai_undo_last_move():
     _lw_profile_previous_ai_undo_last_move()
     if recorded and isinstance(st.session_state.get("bundle"), dict):
         st.session_state.bundle["stats_recorded"] = recorded
+
+
+# ============================================================
+# CATAPULTES : AUCUNE RIPOSTE
+# Une Catapulte ou une Catapulte de l'enfer ne riposte jamais, ni à une
+# attaque au corps à corps, ni à un tir. (Seul le Trébuchet a un tir
+# automatique sur les unités qui traversent sa zone.)
+# ============================================================
+
+NO_RIPOSTE_UNITS = {CATAPULT, HELL_CATAPULT}
+
+
+def never_ripostes(target):
+    return target.get("kind") == "unit" and target.get("name") in NO_RIPOSTE_UNITS
+
+
+_lw_noriposte_previous_combat_values = combat_values
+
+
+def combat_values(attackers, target):
+    values = _lw_noriposte_previous_combat_values(attackers, target)
+    if not never_ripostes(target):
+        return values
+    # Même traitement qu'une attaque invisible : aucune perte pour les
+    # attaquants, la cible perd les PF de l'attaque si elle survit.
+    values = dict(values, hidden=True, no_riposte=target["name"], losses=0.0)
+    if not values["winnable"]:
+        values["defender_damage"] = values["power"]
+        values["defender_remaining"] = values["defense"] - values["power"]
+    return values
+
+
+_lw_noriposte_previous_ranged_riposte = ranged_riposte
+
+
+def ranged_riposte(g, attacker, target):
+    if never_ripostes(target):
+        return 0.0
+    return _lw_noriposte_previous_ranged_riposte(g, attacker, target)
+
+
+_lw_noriposte_previous_ranged_riposte_text = ranged_riposte_text
+
+
+def ranged_riposte_text(g, attacker, target):
+    if never_ripostes(target):
+        return f"{target['name']} ne riposte pas."
+    return _lw_noriposte_previous_ranged_riposte_text(g, attacker, target)
+
+
+# ============================================================
+# JOURNAL DE BORD ET EFFETS DE COMBAT SUR LE PLATEAU
+# - Chaque action (manœuvre, attaque, sort, production dévoilée) ajoute
+#   UNE ligne au journal de bord de la partie (g["journal"]), avec ce
+#   qu'il faut au plateau pour la montrer : tirs, cases touchées, PF
+#   perdus, pièces apparues.
+# - Le journal est affiché juste au-dessus du plateau ; les actions faites
+#   depuis ta dernière manœuvre sont numérotées, et les mêmes numéros
+#   apparaissent sur le plateau (PF perdus en rouge sur les cases touchées).
+# - Le plateau anime chaque nouvelle action une fois : flèche, rocher,
+#   boule de feu, nuage de poussière, sort…
+# ============================================================
+
+JOURNAL_KEEP = 150
+JOURNAL_SHOWN = 14
+FX_RECENT_MAX = 25
+
+# Le journal est remplacé (jamais modifié en place) : les copies de travail
+# de l'IA peuvent donc le partager sans le recopier.
+AI_SHARED_FIELDS = tuple(AI_SHARED_FIELDS) + ("journal",)
+
+FX_SHOT_KINDS = {
+    CATAPULT: "rock", TREBUCHET: "rock", HELL_CATAPULT: "fireball",
+    "Golem de pierre": "rock", "Dragon": "fire",
+    "Aspergeur": "acid", "Rampant": "acid",
+    "Voyant": "arcane", "Errant": "arcane", "Super Errant": "arcane", "Parfait": "arcane",
+}
+FX_SPELL_KINDS = {
+    ("cast_mage_spell", "slow"): "ice", ("cast_mage_spell", "damage"): "arcane",
+    ("cast_sorcerer_spell", "freeze"): "ice", ("cast_sorcerer_spell", "stalactites"): "ice",
+    ("cast_decimant_spell", "block"): "dark", ("cast_decimant_spell", "attract"): "dark",
+    ("cast_airship_spell", "boost"): "buff", ("cast_airship_spell", "harvest"): "buff",
+}
+FX_SPELL_LABELS = {
+    ("cast_mage_spell", "slow"): "🐌 Ralentissement",
+    ("cast_mage_spell", "damage"): "💥 Sort de dégâts",
+    **{("cast_sorcerer_spell", k): v for k, v in SORCERER_SPELLS.items()},
+    **{("cast_decimant_spell", k): v for k, v in DECIMANT_SPELLS.items()},
+    **{("cast_airship_spell", k): v for k, v in AIRSHIP_SPELLS.items()},
+}
+FX_ICONS = {
+    "melee": "⚔️", "arrow": "🏹", "rock": "🪨", "fireball": "☄️", "fire": "🔥",
+    "acid": "🧪", "arcane": "✨", "ice": "❄️", "dark": "🌑", "buff": "💪",
+    "summon": "🌀", "mutation": "🧬", "explosion": "💥", "loot": "💰",
+    "move": "🚶", "build": "🏗️", "recruit": "🪖", "upgrade": "🔬", "age": "⏫",
+    "pass": "⏭️", "impact": "💢", "info": "•",
+}
+# Couleur des factions (identique aux pions du plateau).
+FX_FACTION_COLORS = {0: "#23945a", 1: "#2d6cc4", 2: "#c62828", 3: "#78716c"}
+
+
+def fx_state(g):
+    """Photo des pièces avant une action : position, PF, gel, tir auto."""
+    return {
+        e["id"]: {
+            "name": e["name"], "owner": e["owner"], "kind": e["kind"],
+            "pos": [int(v) for v in e["pos"]], "pf": float(e["pf"]),
+            "frozen": e.get("frozen_until_turn"), "auto": e.get("auto_fired_turn"),
+        }
+        for e in g["entities"]
+    }
+
+
+def fx_push(g, entry):
+    seq = int(g.get("fx_seq", 0)) + 1
+    g["fx_seq"] = seq
+    entry["seq"] = seq
+    g["journal"] = (list(g.get("journal") or []) + [entry])[-JOURNAL_KEEP:]
+
+
+def fx_hits(before, g, actor_owner):
+    """PF perdus (ou gagnés), pièces détruites ou gelées par l'action."""
+    after = {e["id"]: e for e in g["entities"]}
+    destroyed = set(g.get("_fx_destroyed") or [])
+    hits = []
+    for eid, old in before.items():
+        new = after.get(eid)
+        if new is None:
+            # Une pièce ennemie qui disparaît est détruite ; une pièce alliée
+            # peut aussi embarquer ou fusionner : seulement si destroy() l'a dit.
+            if old["pf"] > 0 and (eid in destroyed or old["owner"] != actor_owner):
+                hits.append({
+                    "id": eid, "name": old["name"], "owner": old["owner"], "pos": old["pos"],
+                    "damage": old["pf"], "destroyed": True,
+                })
+            continue
+        pf = float(new["pf"])
+        pos = [int(v) for v in new["pos"]]
+        if pf < old["pf"] - 1e-9:
+            hits.append({
+                "id": eid, "name": old["name"], "owner": old["owner"], "pos": pos,
+                "damage": old["pf"] - pf, "left": pf, "destroyed": False,
+            })
+        elif pf > old["pf"] + 1e-9:
+            hits.append({
+                "id": eid, "name": old["name"], "owner": old["owner"], "pos": pos,
+                "heal": pf - old["pf"], "left": pf,
+            })
+        if new.get("frozen_until_turn") != old["frozen"] and new.get("frozen_until_turn"):
+            hits.append({"id": eid, "name": old["name"], "owner": old["owner"], "pos": pos, "status": "❄ GELÉ"})
+    return hits
+
+
+def fx_num(value):
+    return f"{float(value):g}".replace(".", ",")
+
+
+def fx_hit_text(hit):
+    if hit.get("status"):
+        return f"{hit['name']} {hit['status'].split(' ', 1)[-1].lower()}"
+    if hit.get("heal"):
+        return f"{hit['name']} +{fx_num(hit['heal'])} PF"
+    if hit.get("destroyed"):
+        return f"{hit['name']} détruit (−{fx_num(hit['damage'])} PF)"
+    return f"{hit['name']} −{fx_num(hit['damage'])} PF (reste {fx_num(hit['left'])})"
+
+
+def fx_result_text(hits, owner):
+    enemy = [h for h in hits if h["owner"] != owner]
+    own = [h for h in hits if h["owner"] == owner]
+    parts = []
+    if enemy:
+        parts.append(", ".join(fx_hit_text(h) for h in enemy))
+    losses = [h for h in own if h.get("damage")]
+    gains = [h for h in own if not h.get("damage")]
+    if gains:
+        parts.append(", ".join(fx_hit_text(h) for h in gains))
+    if losses:
+        parts.append("pertes : " + ", ".join(fx_hit_text(h) for h in losses))
+    return " · ".join(parts)
+
+
+def fx_strip_log(line):
+    return line.split(" — ", 1)[-1]
+
+
+def fx_label(piece):
+    return f"{piece['name']} ({coord(piece['pos'])})"
+
+
+def fx_action_ids(name, args):
+    """(acteurs, cibles) d'une action, d'après ses arguments."""
+    def ids(value):
+        if isinstance(value, (list, tuple)):
+            return [v for v in value if isinstance(v, int)]
+        return [value] if isinstance(value, int) else []
+
+    if not args:
+        return [], []
+    if name == "attack":
+        return ids(args[0]), ids(args[1]) if len(args) > 1 else []
+    if name in ("ranged_attack", "kamikaze_attack", "goblin_steal"):
+        return ids(args[0]), ids(args[1]) if len(args) > 1 else []
+    if name == "cast_mage_spell":
+        return ids(args[0]), ids(args[2]) if len(args) > 2 else []
+    if name in ("cast_decimant_spell", "cast_airship_spell", "cast_sorcerer_spell"):
+        return ids(args[0]), ids(args[2]) if len(args) > 2 else []
+    if name == "aramil_burn":
+        return ids(args[0]), ids(args[1]) if len(args) > 1 else []
+    if name == "board_airship":
+        return ids(args[1]) if len(args) > 1 else [], ids(args[0])
+    return ids(args[0]), []
+
+
+def fx_describe(g, before, owner, label, turn, name, args, new_log):
+    """Une ligne de journal (et ses effets) pour une manœuvre."""
+    hits = fx_hits(before, g, owner)
+    actor_ids, target_ids = fx_action_ids(name, args)
+    actors = [before[i] for i in actor_ids if i in before]
+    targets = [before[i] for i in target_ids if i in before]
+    entry = {
+        "turn": label, "round": turn, "owner": owner, "phase": "move",
+        "kind": "info", "text": "", "shots": [], "moves": [], "hits": hits,
+        "spawns": [], "auras": [],
+    }
+    result = fx_result_text(hits, owner)
+    spell = args[1] if len(args) > 1 and isinstance(args[1], str) else None
+
+    if name == "attack" and actors and targets:
+        entry["kind"] = "melee"
+        entry["shots"] = [{"from": a["pos"], "to": targets[0]["pos"], "kind": "melee"} for a in actors]
+        who = ", ".join(fx_label(a) for a in actors)
+        verb = "attaquent" if len(actors) > 1 else "attaque"
+        entry["text"] = f"{who} {verb} {targets[0]['name']} en {coord(targets[0]['pos'])}"
+    elif name == "ranged_attack" and actors and targets:
+        kind = FX_SHOT_KINDS.get(actors[0]["name"], "arrow")
+        entry["kind"] = kind
+        entry["shots"] = [{"from": actors[0]["pos"], "to": targets[0]["pos"], "kind": kind}]
+        verb = "bombarde" if kind in ("rock", "fireball") else "tire sur"
+        entry["text"] = f"{fx_label(actors[0])} {verb} {targets[0]['name']} en {coord(targets[0]['pos'])}"
+    elif name == "kamikaze_attack" and actors and targets:
+        entry["kind"] = "explosion"
+        entry["shots"] = [{"from": actors[0]["pos"], "to": targets[0]["pos"], "kind": "explosion"}]
+        entry["auras"] = [{"pos": targets[0]["pos"], "kind": "explosion"}]
+        entry["text"] = f"{fx_label(actors[0])} explose sur {targets[0]['name']} en {coord(targets[0]['pos'])}"
+    elif (name, spell) in FX_SPELL_KINDS and actors:
+        kind = FX_SPELL_KINDS[(name, spell)]
+        entry["kind"] = kind
+        spell_label = FX_SPELL_LABELS.get((name, spell), spell)
+        entry["shots"] = [{"from": actors[0]["pos"], "to": t["pos"], "kind": kind} for t in targets]
+        entry["auras"] = [{"pos": t["pos"], "kind": kind} for t in targets] or [{"pos": actors[0]["pos"], "kind": kind}]
+        if name == "cast_sorcerer_spell":
+            # Sort de zone : toutes les pièces touchées montrent l'effet.
+            entry["auras"] += [{"pos": h["pos"], "kind": kind} for h in hits]
+        entry["text"] = f"{fx_label(actors[0])} lance « {spell_label} »" + (
+            f" sur {', '.join(fx_label(t) for t in targets)}" if targets else ""
+        )
+    elif name == "aramil_burn" and actors:
+        entry["kind"] = "fire"
+        entry["shots"] = [{"from": actors[0]["pos"], "to": t["pos"], "kind": "fire"} for t in targets]
+        entry["auras"] = [{"pos": t["pos"], "kind": "fire"} for t in targets]
+        entry["text"] = f"{fx_label(actors[0])} brûle " + ", ".join(fx_label(t) for t in targets)
+    elif name == "aramil_summon_titan" and actors:
+        entry["kind"] = "summon"
+        titan = [e for e in g["entities"] if e["id"] not in before and e["owner"] == owner]
+        entry["spawns"] = [[int(v) for v in e["pos"]] for e in titan]
+        entry["auras"] = [{"pos": p, "kind": "summon"} for p in entry["spawns"]]
+        entry["text"] = f"{fx_label(actors[0])} invoque " + (
+            ", ".join(fx_label(e) for e in titan) if titan else "le Titan"
+        )
+    elif name == "battle_mutation" and actors:
+        entry["kind"] = "mutation"
+        mutant = next((e for e in g["entities"] if e["id"] == actors[0].get("id", actor_ids[0])), None)
+        pos = [int(v) for v in (mutant or actors[0])["pos"]]
+        entry["auras"] = [{"pos": pos, "kind": "mutation"}]
+        entry["text"] = f"{fx_label(actors[0])} mute en combat" + (
+            f" en {mutant['name']}" if mutant is not None and mutant["name"] != actors[0]["name"] else ""
+        )
+    elif name == "goblin_steal" and actors:
+        entry["kind"] = "loot"
+        entry["auras"] = [{"pos": actors[0]["pos"], "kind": "loot"}]
+        entry["text"] = f"{fx_label(actors[0])} vole des ressources"
+    elif name in ("move_unit", "move_unit_path") and actors:
+        entry["kind"] = "move"
+        mover = next((e for e in g["entities"] if e["id"] == actor_ids[0]), None)
+        last = g.get("last_move") or {}
+        route = last.get("route") or []
+        start = actors[0]["pos"]
+        end = [int(v) for v in (mover["pos"] if mover is not None else (route[-1] if route else start))]
+        entry["moves"] = [{"from": start, "to": end}]
+        entry["unit_id"] = actor_ids[0]
+        entry["path"] = [start, end]
+        entry["text"] = f"{actors[0]['name']} : {coord(start)} → {coord(end)}"
+        # Tir automatique d'un Trébuchet ennemi pendant le trajet.
+        shooters = [
+            e for e in g["entities"]
+            if e["name"] == TREBUCHET and e["owner"] != owner
+            and e["id"] in before and e.get("auto_fired_turn") != before[e["id"]]["auto"]
+        ]
+        if shooters and hits:
+            target_pos = hits[0]["pos"]
+            entry["shots"] = [{"from": [int(v) for v in t["pos"]], "to": target_pos, "kind": "rock"} for t in shooters]
+            entry["text"] += " · 🪨 tir automatique du Trébuchet"
+    elif name == "pass_turn":
+        entry["kind"] = "pass"
+        entry["text"] = "passe la main"
+    else:
+        lines = [fx_strip_log(line) for line in new_log]
+        if actors:
+            entry["auras"] = []
+        entry["text"] = lines[0] if lines else name.replace("_", " ")
+
+    if result:
+        entry["text"] += " → " + result
+    entry["icon"] = FX_ICONS.get(entry["kind"], "•")
+    return entry
+
+
+# --- Destructions : notées pour le journal (une pièce alliée qui disparaît
+#     peut aussi avoir embarqué ou fusionné).
+_lw_fx_previous_destroy = destroy
+
+
+def destroy(g, victim, credited_owner, killer=None):
+    g["_fx_destroyed"] = list(g.get("_fx_destroyed") or []) + [victim["id"]]
+    return _lw_fx_previous_destroy(g, victim, credited_owner, killer)
+
+
+_lw_fx_previous_game_action = game_action
+
+
+def game_action(bundle, fn, *args):
+    g = bundle["game"]
+    before = fx_state(g)
+    owner, label, turn = g["active"], turn_label(g), g["turn"]
+    log_start = len(g["log"])
+    g.pop("_fx_destroyed", None)
+    result = _lw_fx_previous_game_action(bundle, fn, *args)
+    g = bundle["game"]
+    try:
+        entry = fx_describe(
+            g, before, owner, label, turn, getattr(fn, "__name__", ""), args, g["log"][log_start:]
+        )
+    except Exception:  # le journal ne doit jamais bloquer une action
+        entry = None
+    g.pop("_fx_destroyed", None)
+    if entry is None or not entry["text"] or getattr(fn, "__name__", "") in FX_SILENT_ACTIONS:
+        return result
+    journal = list(g.get("journal") or [])
+    last = journal[-1] if journal else None
+    if (
+        entry["kind"] == "move" and not entry["hits"] and not entry["shots"]
+        and last is not None and last.get("kind") == "move" and not last.get("hits")
+        and last.get("unit_id") == entry.get("unit_id") and last.get("owner") == owner
+        and last.get("turn") == label and last.get("path")
+    ):
+        # Même unité, même activation : une seule ligne pour tout le trajet.
+        path = list(last["path"]) + [entry["path"][-1]]
+        merged = dict(last)
+        merged["path"] = path
+        merged["moves"] = [{"from": path[0], "to": path[-1]}]
+        merged["text"] = f"{entry['text'].split(' : ')[0]} : " + " → ".join(coord(p) for p in path)
+        g["journal"] = journal[:-1] + [merged]
+        return result
+    fx_push(g, entry)
+    return result
+
+
+# Actions sans effet visible : pas de ligne dans le journal.
+FX_SILENT_ACTIONS = {"finish_unit_activation"}
+
+
+def fx_production_entries(g, before, players_before, hero_orders, label, turn):
+    """Lignes du journal au dévoilement des productions."""
+    entries = []
+    after = {e["id"]: e for e in g["entities"]}
+    for owner in (g["first"], 1 - g["first"]):
+        def entry(kind, text, **extra):
+            data = {
+                "turn": label, "round": turn, "owner": owner, "phase": "build",
+                "kind": kind, "icon": FX_ICONS.get(kind, "•"), "text": text,
+                "shots": [], "moves": [], "hits": [], "spawns": [], "auras": [],
+            }
+            data.update(extra)
+            entries.append(data)
+
+        new = [e for e in g["entities"] if e["owner"] == owner and e["id"] not in before]
+        gone = [old for eid, old in before.items() if old["owner"] == owner and eid not in after]
+        # Mutations : une pièce remplacée par une autre sur la même case.
+        for piece in list(new):
+            old = next((o for o in gone if o["pos"] == [int(v) for v in piece["pos"]] and o["kind"] == piece["kind"]), None)
+            if old is not None and old["name"] != piece["name"]:
+                gone.remove(old)
+                new.remove(piece)
+                pos = [int(v) for v in piece["pos"]]
+                entry("mutation", f"{old['name']} mute en {piece['name']} ({coord(pos)})",
+                      spawns=[pos], auras=[{"pos": pos, "kind": "mutation"}])
+        # Recrues regroupées par type ; bâtiments et bases un par un.
+        groups = {}
+        for piece in new:
+            groups.setdefault((piece["kind"], piece["name"]), []).append([int(v) for v in piece["pos"]])
+        for (kind, name), cells in groups.items():
+            where = ", ".join(coord(p) for p in cells)
+            if kind == "unit":
+                count = f"{len(cells)} × " if len(cells) > 1 else ""
+                entry("recruit", f"Recrute {count}{name} ({where})", spawns=cells)
+            else:
+                entry("build", f"Construit {name} ({where})", spawns=cells)
+        # Déplacements de production (ouvriers, héros).
+        for eid, old in before.items():
+            piece = after.get(eid)
+            if piece is None or old["owner"] != owner:
+                continue
+            pos = [int(v) for v in piece["pos"]]
+            if pos != old["pos"]:
+                entry("move", f"{old['name']} : {coord(old['pos'])} → {coord(pos)}",
+                      moves=[{"from": old["pos"], "to": pos}])
+        # Améliorations et âge.
+        old_upgrades, old_age = players_before[owner]
+        player = g["players"][owner]
+        for name in player.get("upgrades", []):
+            if name not in old_upgrades:
+                entry("upgrade", f"Achète l'amélioration « {name} »")
+        if player.get("age", 1) > old_age:
+            entry("age", f"Passe à l'âge {player['age']}")
+
+    # Attaques des héros pendant la production (et autres dégâts).
+    hits = [h for h in fx_hits(before, g, -1) if h.get("damage")]
+    for hit in hits:
+        order = hero_orders.get(hit["id"])
+        if order is not None:
+            hero_name, hero_pos, owner = order
+            kind = "melee" if distance(tuple(hero_pos), tuple(hit["pos"])) <= 1 else "arrow"
+            entries.append({
+                "turn": label, "round": turn, "owner": owner, "phase": "build",
+                "kind": kind, "icon": FX_ICONS[kind],
+                "text": f"{hero_name} ({coord(hero_pos)}) frappe {hit['name']} en {coord(hit['pos'])} → {fx_hit_text(hit)}",
+                "shots": [{"from": hero_pos, "to": hit["pos"], "kind": kind}],
+                "moves": [], "hits": [hit], "spawns": [], "auras": [],
+            })
+        else:
+            entries.append({
+                "turn": label, "round": turn, "owner": 1 - hit["owner"], "phase": "build",
+                "kind": "impact", "icon": FX_ICONS["impact"], "text": fx_hit_text(hit),
+                "shots": [], "moves": [], "hits": [hit], "spawns": [], "auras": [],
+            })
+    return entries
+
+
+_lw_fx_previous_commit_plan = commit_plan
+
+
+def commit_plan(bundle):
+    g = bundle["game"]
+    revealing = g["phase"] == "build" and bool(g.get("ready"))
+    if not revealing:
+        return _lw_fx_previous_commit_plan(bundle)
+
+    before = fx_state(g)
+    players_before = [
+        (list(p.get("upgrades", [])), int(p.get("age", 1))) for p in g["players"]
+    ]
+    hero_orders = {}
+    for draft in (bundle.get("committed"), bundle.get("draft")):
+        for e in (draft or {}).get("entities", []):
+            order = e.get("attack_order")
+            if order and order.get("turn") == g["turn"]:
+                hero_orders[order.get("target_id")] = (e["name"], [int(v) for v in e["pos"]], e["owner"])
+    label, turn = turn_label(g), g["turn"]
+    _lw_fx_previous_commit_plan(bundle)
+    g = bundle["game"]
+    g.pop("_fx_destroyed", None)
+    if g["phase"] != "move":
+        return
+    try:
+        entries = fx_production_entries(g, before, players_before, hero_orders, label, turn)
+    except Exception:
+        entries = []
+    for entry in entries:
+        fx_push(g, entry)
+
+
+# --- Qui regarde le plateau : le joueur de cet écran.
+
+def fx_viewer(bundle, g):
+    if st.query_params.get("room"):
+        seat = online_seat()
+        return seat if seat in (0, 1) else g["active"]
+    config = ai_config(bundle)
+    if config is not None:
+        return 1 - config["seat"]
+    return g["active"]
+
+
+def fx_recent(g, viewer):
+    """Actions depuis la dernière manœuvre du joueur (elle comprise)."""
+    journal = list(g.get("journal") or [])
+    last_own = max(
+        (i for i, e in enumerate(journal) if e.get("owner") == viewer and e.get("phase") == "move"),
+        default=None,
+    )
+    if last_own is None:
+        recent = journal[-FX_RECENT_MAX:]
+    else:
+        recent = journal[last_own:]
+    # Rien de plus vieux que le tour précédent.
+    recent = [e for e in recent if int(e.get("round", 0)) >= g["turn"] - 1]
+    return recent[-FX_RECENT_MAX:]
+
+
+def fx_owner_name(bundle, g, owner):
+    faction = faction_of(g, owner)["name"]
+    config = ai_config(bundle)
+    if config is not None and owner == config["seat"]:
+        return f"🤖 {faction}"
+    names = (bundle or {}).get("names") or {}
+    pseudo = names.get(str(owner)) or names.get(owner)
+    room = online_active_room() if st.session_state.get("online_code") else None
+    if room is not None:
+        pseudo = (room.get("names") or {}).get(owner) or (room.get("names") or {}).get(str(owner)) or pseudo
+    return f"{pseudo} · {faction}" if pseudo else faction
+
+
+def fx_board_payload(bundle, g, viewer, recent):
+    events = []
+    for number, e in enumerate(recent, 1):
+        events.append({
+            "seq": e["seq"], "n": number, "kind": e.get("kind", "info"),
+            "owner": e.get("owner"), "mine": e.get("owner") == viewer,
+            "faction": faction_id(g, e["owner"]) if e.get("owner") in (0, 1) else None,
+            "shots": e.get("shots", []), "moves": e.get("moves", []),
+            "hits": e.get("hits", []), "spawns": e.get("spawns", []),
+            "auras": e.get("auras", []), "text": e.get("text", ""),
+        })
+    game_id = (bundle or {}).get("game_id") or (bundle or {}).get("code") or ""
+    return {"events": events, "viewer": viewer, "game": str(game_id)}
+
+
+def render_journal(bundle, g, viewer, recent):
+    journal = list(g.get("journal") or [])
+    numbers = {e["seq"]: n for n, e in enumerate(recent, 1)}
+    shown = journal[-JOURNAL_SHOWN:]
+
+    def line_html(e, highlight=True):
+        owner = e.get("owner")
+        color = FX_FACTION_COLORS.get(faction_id(g, owner) if owner in (0, 1) else None, "#6b7280")
+        number = numbers.get(e["seq"]) if highlight else None
+        fresh = number is not None and owner != viewer
+        badge = (
+            f'<span class="lw-j-num" style="background:{color}">{number}</span>'
+            if number is not None else '<span class="lw-j-num lw-j-old"></span>'
+        )
+        text = escape(e.get("text", ""))
+        # PF perdus en rouge, PF gagnés en vert.
+        for token in sorted({t for t in text.replace("(", " ").replace(")", " ").split() if t.startswith("−") or (t.startswith("+") and t[1:2].isdigit())}, key=len, reverse=True):
+            css = "lw-j-loss" if token.startswith("−") else "lw-j-gain"
+            text = text.replace(token, f'<b class="{css}">{token}</b>')
+        text = text.replace("détruit", '<b class="lw-j-loss">détruit</b>')
+        return (
+            f'<div class="lw-j-line{" lw-j-fresh" if fresh else ""}" style="border-left-color:{color}">'
+            f'{badge}<span class="lw-j-turn">T{escape(str(e.get("turn", "")))}</span>'
+            f'<span class="lw-j-who" style="color:{color}">{escape(fx_owner_name(bundle, g, owner))}</span>'
+            f'<span class="lw-j-icon">{e.get("icon", "•")}</span>'
+            f'<span class="lw-j-text">{text}</span>'
+            + ('<span class="lw-j-new">NOUVEAU</span>' if fresh else "")
+            + "</div>"
+        )
+
+    style = """
+    <style>
+    .lw-journal { border: 1px solid #d6d3d1; border-radius: 10px; padding: 8px 10px; margin: 4px 0 10px;
+                  background: #fffdf7; max-height: 290px; overflow-y: auto; }
+    .lw-journal h4 { margin: 0 0 6px; font-size: 15px; color: #1c1917; }
+    .lw-j-line { display: flex; align-items: baseline; gap: 7px; padding: 3px 6px; margin: 2px 0;
+                 border-left: 4px solid #6b7280; border-radius: 4px; font-size: 13.5px; line-height: 1.35;
+                 color: #1c1917; background: #ffffff; }
+    .lw-j-fresh { background: #fff7ed; box-shadow: inset 0 0 0 1px #fdba74; }
+    .lw-j-num { flex: 0 0 auto; min-width: 20px; height: 20px; border-radius: 10px; color: #fff; font-weight: 800;
+                font-size: 12px; text-align: center; line-height: 20px; align-self: center; }
+    .lw-j-old { background: transparent; }
+    .lw-j-turn { flex: 0 0 auto; color: #78716c; font-size: 12px; font-variant-numeric: tabular-nums; }
+    .lw-j-who { flex: 0 0 auto; font-weight: 800; font-size: 12.5px; }
+    .lw-j-icon { flex: 0 0 auto; }
+    .lw-j-text { flex: 1 1 auto; }
+    .lw-j-loss { color: #dc2626; }
+    .lw-j-gain { color: #15803d; }
+    .lw-j-new { flex: 0 0 auto; background: #ea580c; color: #fff; font-size: 10px; font-weight: 800;
+                padding: 1px 6px; border-radius: 8px; align-self: center; }
+    .lw-j-empty { color: #78716c; font-size: 13px; }
+    @media (prefers-color-scheme: dark) {
+      .lw-journal { background: #1c1917; border-color: #44403c; }
+      .lw-journal h4 { color: #f5f5f4; }
+      .lw-j-line { background: #292524; color: #f5f5f4; }
+      .lw-j-fresh { background: #431407; box-shadow: inset 0 0 0 1px #9a3412; }
+      .lw-j-loss { color: #f87171; }
+      .lw-j-gain { color: #4ade80; }
+    }
+    </style>
+    """
+    if shown:
+        body = "".join(line_html(e) for e in reversed(shown))
+    else:
+        body = '<div class="lw-j-empty">Aucune action pour l\'instant.</div>'
+    st.markdown(
+        style
+        + '<div class="lw-journal"><h4>📜 Journal de bord — une ligne par action '
+        + '<span style="font-weight:400;font-size:12px;color:#78716c">(les numéros renvoient au plateau)</span></h4>'
+        + body + "</div>",
+        unsafe_allow_html=True,
+    )
+    if len(journal) > len(shown):
+        with st.expander(f"📜 Tout le journal de bord ({len(journal)} actions)"):
+            st.markdown(
+                style + '<div class="lw-journal" style="max-height:none">'
+                + "".join(line_html(e, highlight=False) for e in reversed(journal)) + "</div>",
+                unsafe_allow_html=True,
+            )
+
+
+_lw_fx_previous_render_board = render_board
+
+
+def render_board(g, view, readonly=False):
+    bundle = st.session_state.get("bundle")
+    room = online_active_room() if st.query_params.get("room") else None
+    if room is not None:
+        bundle = room.get("bundle") or bundle
+    viewer = fx_viewer(bundle, g)
+    recent = fx_recent(g, viewer)
+    render_journal(bundle, g, viewer, recent)
+    st.session_state["_lw_fx"] = fx_board_payload(bundle, g, viewer, recent) if recent else None
+    return _lw_fx_previous_render_board(g, view, readonly)
+
+
+# --- Contre l'IA : le message résume, le détail est dans le journal.
+_lw_fx_previous_ai_autoplay = ai_autoplay
+
+
+def ai_autoplay():
+    before = st.session_state.get("bundle")
+    seq = int(((before or {}).get("game") or {}).get("fx_seq", 0)) if isinstance(before, dict) else 0
+    _lw_fx_previous_ai_autoplay()
+    bundle = st.session_state.get("bundle")
+    config = ai_config(bundle)
+    if bundle is before or config is None:
+        return
+    message = st.session_state.get("ui_message") or ""
+    if "problème" in message:
+        return
+    g = bundle["game"]
+    done = [e for e in g.get("journal") or [] if e.get("seq", 0) > seq and e.get("owner") == config["seat"]]
+    if done:
+        st.session_state.ui_message = (
+            f"🤖 {faction_of(g, config['seat'])['name']} (IA) a joué {len(done)} action(s) : "
+            "détail ligne par ligne dans le journal de bord, au-dessus du plateau."
+        )
+
+
+# ============================================================
+# PSEUDO OBLIGATOIRE
+# Sans pseudo, impossible de lancer, charger ou rejoindre une partie.
+# ============================================================
+
+START_BUTTON_KEYS = {"home_start", "home_load", "ai_home_start", "online_create"}
+_lw_pseudo_original_button = st.button
+_lw_pseudo_original_checkbox = st.checkbox
+
+
+def _lw_pseudo_button(*args, **kwargs):
+    if kwargs.get("key") in START_BUTTON_KEYS and not current_player_name():
+        kwargs["disabled"] = True
+        kwargs["help"] = "Indique d'abord ton pseudo, en haut de la page."
+    return _lw_pseudo_original_button(*args, **kwargs)
+
+
+def _lw_pseudo_checkbox(*args, **kwargs):
+    if str(kwargs.get("key", "")).startswith("lobby_ready_") and not current_player_name():
+        kwargs["disabled"] = True
+        kwargs["value"] = False
+        kwargs["help"] = "Indique d'abord ton pseudo."
+    return _lw_pseudo_original_checkbox(*args, **kwargs)
+
+
+_lw_pseudo_previous_render_home = render_home
+
+
+def render_home():
+    st.button = _lw_pseudo_button
+    try:
+        if not (st.session_state.get("home_player_name") or st.session_state.get("player_name") or "").strip():
+            st.warning("👤 Indique ton pseudo ci-dessous pour pouvoir lancer une partie.")
+        _lw_pseudo_previous_render_home()
+    finally:
+        st.button = _lw_pseudo_original_button
+
+
+_lw_pseudo_previous_render_online_lobby = render_online_lobby
+
+
+def render_online_lobby(room, seat):
+    st.checkbox = _lw_pseudo_checkbox
+    try:
+        _lw_pseudo_previous_render_online_lobby(room, seat)
+        if not current_player_name():
+            st.warning("👤 Indique ton pseudo pour pouvoir te déclarer prêt.")
+    finally:
+        st.checkbox = _lw_pseudo_original_checkbox
 
 
 if __name__ == "__main__":
