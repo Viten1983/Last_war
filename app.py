@@ -9852,7 +9852,7 @@ def render_victory_screen(g):
 
     st.markdown(
         f"""
-        <div style="position: relative; width: 100%; aspect-ratio: 1024 / 559;
+        <div style="position: relative; width: 100%; aspect-ratio: 4 / 3;
                     border-radius: 14px; overflow: hidden;
                     background: {background};
                     box-shadow: 0 8px 28px #00000066;">
@@ -15239,7 +15239,13 @@ def ai_age_ready(g, me):
     needed = AGE_PREREQUISITES.get((faction_id(g, me), age + 1))
     if needed and not building_is_completed(g, me, needed):
         return False
-    return True
+    # Inutile d'économiser l'or si le mana manque.
+    mana = AGE_COSTS[age + 1]["mana"]
+    if is_vagabond(g, me):
+        upgrade = VAG_AGE_UPGRADES.get(age + 1)
+        if upgrade and not owns_upgrade(g, me, upgrade):
+            mana += UPGRADES[upgrade]["mana"]
+    return g["players"][me]["mana"] >= mana
 
 
 def ai_reserve(g, me, profile):
@@ -15410,7 +15416,7 @@ def ai_try_upgrades(g, me, profile, rng):
     return g
 
 
-def ai_recruit_all(g, me, profile, rng, level, passes=3):
+def ai_recruit_all(g, me, profile, rng, level, passes=3, keep_reserve=True):
     producers = [
         e for e in g["entities"]
         if e["owner"] == me and (e["kind"] == "building" or is_hero(e)) and not e["wait"]
@@ -15422,7 +15428,8 @@ def ai_recruit_all(g, me, profile, rng, level, passes=3):
             current = next((e for e in g["entities"] if e["id"] == producer["id"]), None)
             if current is None:
                 continue
-            budget = g["players"][me]["gold"] - ai_reserve(g, me, profile)
+            reserve = ai_reserve(g, me, profile) if keep_reserve else 0
+            budget = g["players"][me]["gold"] - reserve
             new = ai_try_recruit(g, me, current, profile, rng, level, budget)
             if new is not None:
                 g, progress = new, True
@@ -15432,23 +15439,41 @@ def ai_recruit_all(g, me, profile, rng, level, passes=3):
 
 
 def ai_production(draft, me, level):
-    """Construit, recrute et améliore dans le brouillon privé de l'IA."""
+    """Construit, recrute et améliore dans le brouillon privé de l'IA.
+    Priorité aux unités militaires : chaque bâtiment prêt produit d'abord."""
     profile = ai_profile(level)
     rng = ai_rng(draft, 17 + me)
     g = draft
     g["_ai_profile"] = profile
     try:
-        g = ai_try_age(g, me, profile, rng)
-        g["_ai_profile"] = profile
         g = ai_scout_mana(g, me, profile)
         g = ai_workers(g, me, profile)
         g = ai_heroes(g, me, profile, rng)
+
+        # Passage d'âge immédiat seulement si l'or suffit largement.
+        age = g["players"][me]["age"]
+        if age < 3 and g["players"][me]["gold"] >= 1.6 * AGE_COSTS[age + 1]["gold"]:
+            g = ai_try_age(g, me, profile, rng)
+            g["_ai_profile"] = profile
+
+        if level == "debutant":
+            g = ai_try_age(g, me, profile, rng)
+            g["_ai_profile"] = profile
+
+        # 1. Tous les bâtiments prêts produisent des unités militaires.
+        g = ai_fusions(g, me, profile)
+        g = ai_recruit_all(g, me, profile, rng, level, passes=1, keep_reserve=(level != "expert"))
+
+        # 2. Âge suivant avec ce qui reste.
+        if level != "debutant":
+            g = ai_try_age(g, me, profile, rng)
+            g["_ai_profile"] = profile
+
+        # 3. Nouveaux bâtiments de production.
         if is_vagabond(g, me) and level != "debutant":
-            # Les héros produisent davantage avec ces améliorations.
             g = ai_try_upgrades(g, me, profile, rng)
         if not ai_has_mana_base(g, me):
             g = ai_try_colony(g, me, profile)
-
         wanted = ai_wanted_buildings(g, me, profile)
         if level == "debutant":
             rng.shuffle(wanted)
@@ -15461,16 +15486,29 @@ def ai_production(draft, me, level):
             if new is not None:
                 g = new
 
-        g = ai_fusions(g, me, profile)
-        g = ai_recruit_all(g, me, profile, rng, level)
+        # 4. Le reste : encore des unités, puis améliorations et colonies.
+        g = ai_recruit_all(g, me, profile, rng, level, passes=3)
         g = ai_try_upgrades(g, me, profile, rng)
         g = ai_try_colony(g, me, profile)
-        if level == "expert":
-            # Rien ne dort en banque : un dernier passage de production.
-            g = ai_recruit_all(g, me, profile, rng, level, passes=2)
+        g = ai_recruit_all(g, me, profile, rng, level, passes=2)
     finally:
         g.pop("_ai_profile", None)
     return g
+
+
+# Détruire 3 bases ennemies gagne la partie : chaque base détruite compte beaucoup.
+AI_BASE_KILL_VALUE = 3500.0
+
+_lw_ai3_previous_ai_material = ai_material
+
+
+def ai_material(g, me):
+    score = _lw_ai3_previous_ai_material(g, me)
+    if g.get("winner") is not None:
+        return score
+    return score + AI_BASE_KILL_VALUE * (
+        g["players"][me].get("bases", 0) - g["players"][1 - me].get("bases", 0)
+    )
 
 
 # ------------------------------------------------------------
