@@ -645,7 +645,7 @@ Prototype âge I : Déferlants contre Exilés.
 - Bâtiment : attente de 1 tour, ou disponibilité immédiate avec +50 %.
 - Chaque bâtiment de production recrute une fois par tour.
 - Une activation permet un déplacement OU une attaque.
-- Les unités alliées peuvent être traversées (chaque case traversée compte comme un déplacement), mais pas occupées à l'arrivée.
+- Les unités, bases et bâtiments alliés peuvent être traversés (chaque case traversée compte comme un déplacement), mais pas occupés à l'arrivée.
 - Un tir subit une riposte égale aux PF de la cible (au contact, c'est un corps à corps).
 - Une unité invisible non détectée attaque sans subir de riposte.
 - Bâtiment technique (Bassin de mutation, Marché, Forge) : seulement en J5 pour le joueur du haut, P12 pour celui du bas.
@@ -1733,8 +1733,8 @@ def paths(g, unit, allow_attack=False):
                 if enemy:
                     if not allow_attack:
                         continue
-                elif occupant["kind"] not in ("unit", "base"):
-                    # Un bâtiment allié reste un obstacle ; une base alliée se traverse.
+                elif occupant["kind"] not in ("unit", "base", "building"):
+                    # Unités, bases et bâtiments alliés se traversent.
                     continue
 
             step = 2 if terrain(g, nxt) == "mountain" else 1
@@ -6040,7 +6040,7 @@ def paths(g, unit, allow_attack=False):
                 if enemy:  
                     if not allow_attack:  
                         continue  
-                elif occupant["kind"] not in ("unit", "base"):  
+                elif occupant["kind"] not in ("unit", "base", "building"):  
                     continue  
   
             new_cost = cost + step  
@@ -8797,7 +8797,7 @@ def paths(g, unit, allow_attack=False):
                         if not allow_attack:
                             continue
                         passable = False
-                elif occupant["kind"] not in ("unit", "base"):
+                elif occupant["kind"] not in ("unit", "base", "building"):
                     continue
 
             new_cost = cost + (2 if terrain(g, nxt) == "mountain" else 1)
@@ -10719,7 +10719,7 @@ def can_move(g, unit):
 # ------------------------------------------------------------
 
 def hero_paths(g, hero):
-    """Déplacement du héros : traverse ses unités, pas les ennemis ni les bâtiments."""
+    """Déplacement du héros : traverse ses unités, ses bases et ses bâtiments, pas les ennemis."""
     start = tuple(hero["pos"])
     # Déplacements restants ce tour (on peut bouger en plusieurs fois).
     budget = hero_stats(g, hero)[1] - hero_spent(g, hero)
@@ -10735,7 +10735,7 @@ def hero_paths(g, hero):
                 continue
             occupant = occupants.get(nxt)
             if occupant is not None and (
-                occupant["owner"] != hero["owner"] or occupant["kind"] not in ("unit", "base")
+                occupant["owner"] != hero["owner"] or occupant["kind"] not in ("unit", "base", "building")
             ):
                 continue
             new_cost = cost + (2 if terrain(g, nxt) == "mountain" else 1)
