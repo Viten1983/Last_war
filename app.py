@@ -9163,6 +9163,7 @@ def render_worker_controls(view, worker, prefix):
             st.info(f"Clique sur une case verte ({remaining_actions(view, worker)} déplacement(s) restant(s)).")
         if st.button("✕ Annuler", key=f"{prefix}_worker_move_cancel_{worker['id']}"):
             clear_placement()
+            st.session_state.ui_selected_id = None
             bump_ui()
             st.rerun()
     elif st.button("🚶 Déplacer l'ouvrier", key=f"{prefix}_worker_move_{worker['id']}"):
@@ -11328,6 +11329,7 @@ def render_hero_controls(view, hero, prefix):
         st.info("Clique sur une case verte : le héros s'y rend aussitôt.")
         if st.button("✕ Annuler le déplacement", key=f"{prefix}_hero_move_cancel_{hero['id']}"):
             clear_placement()
+            st.session_state.ui_selected_id = None
             bump_ui()
             st.rerun()
     elif hero_destinations(view, hero):
@@ -15140,6 +15142,63 @@ def combat_values(attackers, target):
     if bonus and values.get("winnable") and values.get("losses", 0) > 0:
         values = dict(values, losses=max(0.0, float(values["losses"]) - bonus))
     return values
+
+# ============================================================
+# PIÉTINEMENT : seulement contre des unités
+# Attaquer une base ou un bâtiment arrête toujours l'attaquant,
+# même s'il a le piétinement (Chevalier, Molosse, Roi, Barbare…).
+# ============================================================
+
+_lw_trample_previous_can_trample = can_trample
+
+
+def can_trample(unit, target):
+    if target is None or target.get("kind") != "unit":
+        return False
+    return _lw_trample_previous_can_trample(unit, target)
+
+# ============================================================
+# OUVRIERS ET HÉROS : DÉPLACEMENT DIRECT
+# Un clic sur un ouvrier (Derniers nés) ou un héros (Vagabonds) affiche
+# aussitôt ses cases de déplacement en vert : plus besoin du bouton
+# « Déplacer ». Le menu de construction / production reste disponible.
+# ============================================================
+
+def auto_piece_move_mode():
+    bundle = st.session_state.get("bundle")
+    if not isinstance(bundle, dict) or not isinstance(bundle.get("game"), dict):
+        return
+    g = bundle["game"]
+    if g["phase"] != "build" or g["winner"] is not None or g.get("curtain"):
+        return
+    if st.session_state.get("ui_plan_mode") is not None:
+        return
+    selected = st.session_state.get("ui_selected_id")
+    if selected is None:
+        return
+    ensure_draft(bundle)
+    view = bundle["draft"] or g
+    piece = next((e for e in view["entities"] if e["id"] == selected), None)
+    if piece is None or piece["owner"] != g["active"]:
+        return
+    if piece["name"] == WORKER and not piece["wait"] and worker_destinations(view, piece):
+        mode, name = "worker_move", WORKER
+    elif is_hero(piece) and hero_destinations(view, piece):
+        mode, name = "hero_move", piece["name"]
+    else:
+        return
+    st.session_state.ui_plan_mode = mode
+    st.session_state.ui_plan_name = name
+    st.session_state.ui_plan_positions = []
+
+
+_lw_automove_previous_main = main
+
+
+def main():
+    init_ui()
+    auto_piece_move_mode()
+    _lw_automove_previous_main()
 
 
 
