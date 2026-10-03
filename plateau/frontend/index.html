@@ -1433,6 +1433,36 @@
       }
     }
 
+    // Exilés : coût de la construction sur chaque case de placement.
+    // De l'autre côté de la ligne noire (×3 + 3 mana) : en surbrillance.
+    function drawCellCosts() {
+      const costs = args.cell_costs;
+      if (!costs) return;
+      const layer = svgNode("g", { class: "cell-costs", "pointer-events": "none" });
+      for (const [cellKey, cost] of Object.entries(costs)) {
+        const [q, r] = cellKey.split(",").map(Number);
+        const c = center(q, r);
+        // Une ligne par ressource, pour tenir dans la case.
+        const lines = [`${cost.gold} or`].concat(cost.mana ? [`+${cost.mana} mana`] : []);
+        if (cost.far) {
+          layer.appendChild(svgNode("polygon", { points: hexPoints(c.x, c.y, SIZE - 4), fill: "#f97316", "fill-opacity": 0.22, stroke: "#ea580c", "stroke-width": 4 }));
+        }
+        const size = 11.5;
+        const w = 12 + Math.max(...lines.map(l => l.length)) * size * 0.58;
+        const h = 6 + lines.length * 13;
+        const top = c.y + SIZE * 0.42 - 10 - (lines.length - 1) * 13;
+        layer.appendChild(svgNode("rect", {
+          x: c.x - w / 2, y: top, width: w, height: h, rx: 9,
+          fill: cost.far ? "#ea580c" : "rgba(28,25,23,0.82)", stroke: "#ffffff", "stroke-width": 1.5,
+        }));
+        lines.forEach((line, i) => layer.appendChild(svgNode("text", {
+          x: c.x, y: top + 10 + i * 13, "text-anchor": "middle", "dominant-baseline": "middle",
+          "font-size": size, "font-weight": 900, fill: cost.far ? "#ffffff" : "#facc15",
+        }, line)));
+      }
+      board.appendChild(layer);
+    }
+
     // Récolte : au-dessus de chaque base (ou héros), l'or récolté en jaune
     // et le mana en orange, comme les PF lors des attaques.
     const HARVEST_GOLD = "#eab308";
@@ -1700,6 +1730,7 @@ if (reachable || placed) {
       // Calque des animations : conservé d'un rendu à l'autre (une animation
       // en cours continue même si Streamlit redessine le plateau).
       drawHarvest();
+      drawCellCosts();
       board.appendChild(fxLayer);
       drawVictoryBanner();
       animateLastMove();

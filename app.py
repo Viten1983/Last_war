@@ -4459,6 +4459,7 @@ def render_board(g, view, readonly=False):
         ai_marks=st.session_state.get("_lw_ai_marks"),
         fx=st.session_state.get("_lw_fx"),
         banner=st.session_state.get("_lw_victory_banner"),
+        cell_costs=st.session_state.get("_lw_cell_costs"),
         key=f"board_component_{st.session_state.ui_board_key}",
         default=None,
     )
@@ -18057,6 +18058,42 @@ def recruit(g, owner, producer_id, name, positions, *args, **kwargs):
                 f"{limit} au total ({built} déjà recrutés)."
             )
     return _lw_agelimit_previous_recruit(g, owner, producer_id, name, positions, *args, **kwargs)
+
+
+# ============================================================
+# EXILÉS : COÛT DE LA CONSTRUCTION SUR CHAQUE CASE DE PLACEMENT
+# Pendant le placement d'un bâtiment ou d'une base, chaque case verte
+# affiche ce qu'elle coûterait : prix normal, ou ×3 + 3 mana (en
+# surbrillance) de l'autre côté de la ligne noire.
+# ============================================================
+
+def exile_build_costs(g, view, readonly):
+    if readonly or g["phase"] != "build" or st.session_state.get("ui_plan_mode") != "build":
+        return None
+    owner = g["active"]
+    name = st.session_state.get("ui_plan_name")
+    if not name or faction_id(view, owner) != EXILES:
+        return None
+    accelerated = bool(st.session_state.get("ui_plan_accelerated"))
+    costs = {}
+    for pos in planning_slots(g, view):
+        try:
+            gold, mana = placement_cost(view, owner, "build", name, [pos], accelerated)
+        except (ValueError, KeyError):
+            continue
+        costs[key(pos)] = {"gold": gold, "mana": mana, "far": enemy_side_of_line(owner, tuple(pos))}
+    return costs or None
+
+
+_lw_cellcost_previous_render_board = render_board
+
+
+def render_board(g, view, readonly=False):
+    st.session_state["_lw_cell_costs"] = exile_build_costs(g, view, readonly)
+    try:
+        return _lw_cellcost_previous_render_board(g, view, readonly)
+    finally:
+        st.session_state.pop("_lw_cell_costs", None)
 
 
 # ============================================================
