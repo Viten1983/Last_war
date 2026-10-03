@@ -15377,10 +15377,25 @@ def ai_has_mana_base(g, me):
     )
 
 
+def ai_mana_weight(g, me):
+    """Poids d'une case de mana face à une case d'or pour une nouvelle base :
+    le mana est précieux tant qu'il en manque (âge III : 2 mana), mais une
+    IA qui en a déjà beaucoup et manque d'or s'installe plutôt sur l'or."""
+    player = g["players"][me]
+    mana, age = player["mana"], player["age"]
+    if mana < 2 or (age < 3 and mana < 4):
+        return 3.0
+    if mana >= 8:
+        return 0.35
+    return 1.0
+
+
 def ai_colony_value(g, p):
-    # Le mana compte triple : il débloque l'âge III et les meilleures unités.
+    # Mana pondéré selon les réserves (voir ai_mana_weight, fixé en début de
+    # production) ; 3 par défaut : il débloque l'âge III et les meilleures unités.
+    mana_weight = g.get("_ai_mana_weight", 3.0)
     return sum(
-        (3 if g["resources"][key(q)][0] == "mana" else 1) * g["resources"][key(q)][1]
+        (mana_weight if g["resources"][key(q)][0] == "mana" else 1) * g["resources"][key(q)][1]
         for q in neighbors(p)
         if key(q) in g["resources"] and at(g, q) is None
     )
@@ -15941,6 +15956,7 @@ def ai_production(draft, me, level):
     """Production complète de l'IA dans son brouillon privé."""
     P = ai_params(level)
     g = draft
+    g["_ai_mana_weight"] = ai_mana_weight(g, me)
     g["_ai_colonies"] = 0
     g["_ai_key_builds"] = 0
     g["_ai_builds"] = 0
@@ -15995,6 +16011,7 @@ def ai_production(draft, me, level):
         if not progress:
             break
     g.pop("_ai_colonies", None)
+    g.pop("_ai_mana_weight", None)
     g.pop("_ai_key_builds", None)
     g.pop("_ai_builds", None)
     return g
