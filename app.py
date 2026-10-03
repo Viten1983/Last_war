@@ -15,13 +15,13 @@ from pathlib import Path
 # ============================================================
 
 st.set_page_config(
-    page_title="Last War",
+    page_title="The Four Realms",
     page_icon="⚔️",
     layout="wide",
 )
 
 BOARD_COMPONENT = components.declare_component(
-    "last_war_board",
+    "the_four_realms_board",
     path=str(Path(__file__).resolve().parent / "plateau" / "frontend"),
 )
 
@@ -5818,7 +5818,7 @@ def render_sidebar(bundle):
                 indent=2,  
                 allow_nan=False,  
             ),  
-            file_name="last_war.json",  
+            file_name="the_four_realms.json",  
             mime="application/json",  
             key="download_save",  
         )  
@@ -10324,7 +10324,7 @@ def render_faction_sheet():
 
 
 # ============================================================
-# LOGO « LAST WAR — WARGAME »
+# LOGO « THE FOUR REALMS — WARGAME »
 # Grand logo sur l'accueil, bandeau compact pendant la partie.
 # ============================================================
 
@@ -10347,11 +10347,11 @@ def image_base64(path_text):
 def render_logo_header(home):
     data = image_base64(str(LOGO_FULL if home else LOGO_BANNER))
     if data is None:
-        st.title("⚔️ Last War")
+        st.title("⚔️ The Four Realms")
         return
 
     if home:
-        # Menu principal : titre centré, puis « Last War » et ses deux épées
+        # Menu principal : titre centré, puis « The Four Realms » et ses deux épées
         # dorées sur fond brun.
         title = image_base64(str(LOGO_TITLE)) or data
         st.markdown(
@@ -10361,7 +10361,7 @@ def render_logo_header(home):
               <div style="background:#18120e; border:1px solid #b8913f; border-radius:16px;
                           padding:14px 28px; width:100%; max-width:760px;
                           box-shadow:0 12px 34px #00000059, inset 0 0 0 4px #18120e, inset 0 0 0 5px #b8913f55;">
-                <img src="data:image/jpeg;base64,{title}" alt="Last War"
+                <img src="data:image/jpeg;base64,{title}" alt="The Four Realms"
                      style="width:100%; display:block; border-radius:8px;">
               </div>
             </div>
