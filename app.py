@@ -16968,7 +16968,8 @@ def fx_hits(before, g, actor_owner):
             if old["pf"] > 0 and (eid in destroyed or old["owner"] != actor_owner):
                 hits.append({
                     "id": eid, "name": old["name"], "owner": old["owner"], "pos": old["pos"],
-                    "damage": old["pf"], "destroyed": True,
+                    "damage": old["pf"], "destroyed": True, "kind": old["kind"],
+                    "faction": faction_id(g, old["owner"]),
                 })
             continue
         pf = float(new["pf"])
@@ -17065,7 +17066,23 @@ def fx_describe(g, before, owner, label, turn, name, args, new_log):
 
     if name == "attack" and actors and targets:
         entry["kind"] = "melee"
-        entry["shots"] = [{"from": a["pos"], "to": targets[0]["pos"], "kind": "melee"} for a in actors]
+        routes = g.get("_fx_routes") or {}
+        entry["shots"] = [
+            {
+                "from": a["pos"], "to": targets[0]["pos"], "kind": "melee",
+                "route": routes.get(a_id) or [a["pos"], targets[0]["pos"]],
+                "actor": {"id": a_id, "name": a["name"], "faction": faction_id(g, a["owner"])},
+            }
+            for a_id, a in zip([i for i in actor_ids if i in before], actors)
+        ]
+        # Un attaquant tué tombe sur sa case de frappe, pas à son départ.
+        strike_cells = {
+            s["actor"]["id"]: s["route"][-2] for s in entry["shots"] if len(s["route"]) >= 2
+        }
+        for hit in hits:
+            if hit.get("destroyed") and hit["id"] in strike_cells:
+                hit["pos"] = strike_cells[hit["id"]]
+                hit["attacker"] = True
         who = ", ".join(fx_label(a) for a in actors)
         verb = "attaquent" if len(actors) > 1 else "attaque"
         entry["text"] = f"{who} {verb} {targets[0]['name']} en {coord(targets[0]['pos'])}"
@@ -17124,7 +17141,11 @@ def fx_describe(g, before, owner, label, turn, name, args, new_log):
         route = last.get("route") or []
         start = actors[0]["pos"]
         end = [int(v) for v in (mover["pos"] if mover is not None else (route[-1] if route else start))]
-        entry["moves"] = [{"from": start, "to": end}]
+        entry["moves"] = [{
+            "from": start, "to": end,
+            "route": [[int(v) for v in p] for p in route] if route and list(route[-1]) == end else [start, end],
+            "actor": {"id": actor_ids[0], "name": actors[0]["name"], "faction": faction_id(g, owner)},
+        }]
         entry["unit_id"] = actor_ids[0]
         entry["path"] = [start, end]
         entry["text"] = f"{actors[0]['name']} : {coord(start)} → {coord(end)}"
@@ -17153,6 +17174,20 @@ def fx_describe(g, before, owner, label, turn, name, args, new_log):
     return entry
 
 
+# --- Trajets des attaquants (corps à corps), notés quand l'attaque les calcule.
+_lw_fx_previous_prepare_attack = prepare_attack
+
+
+def prepare_attack(g, attacker_ids, target_id):
+    result = _lw_fx_previous_prepare_attack(g, attacker_ids, target_id)
+    routes = result[2] if isinstance(result, tuple) and len(result) > 2 else None
+    if isinstance(routes, dict):
+        g["_fx_routes"] = {
+            eid: [[int(v) for v in p] for p in route] for eid, route in routes.items() if route
+        }
+    return result
+
+
 # --- Destructions : notées pour le journal (une pièce alliée qui disparaît
 #     peut aussi avoir embarqué ou fusionné).
 _lw_fx_previous_destroy = destroy
@@ -17172,6 +17207,7 @@ def game_action(bundle, fn, *args):
     owner, label, turn = g["active"], turn_label(g), g["turn"]
     log_start = len(g["log"])
     g.pop("_fx_destroyed", None)
+    g.pop("_fx_routes", None)
     result = _lw_fx_previous_game_action(bundle, fn, *args)
     g = bundle["game"]
     try:
@@ -17181,6 +17217,7 @@ def game_action(bundle, fn, *args):
     except Exception:  # le journal ne doit jamais bloquer une action
         entry = None
     g.pop("_fx_destroyed", None)
+    g.pop("_fx_routes", None)
     if entry is None or not entry["text"] or getattr(fn, "__name__", "") in FX_SILENT_ACTIONS:
         return result
     journal = list(g.get("journal") or [])
@@ -17195,9 +17232,12 @@ def game_action(bundle, fn, *args):
         path = list(last["path"]) + [entry["path"][-1]]
         merged = dict(last)
         merged["path"] = path
-        merged["moves"] = [{"from": path[0], "to": path[-1]}]
+        old_route = (last.get("moves") or [{}])[0].get("route") or path[:-1]
+        new_route = entry["moves"][0].get("route") or entry["path"]
+        merged["moves"] = [dict(entry["moves"][0], **{"from": path[0], "to": path[-1], "route": list(old_route) + list(new_route[1:])})]
         merged["text"] = f"{entry['text'].split(' : ')[0]} : " + " → ".join(coord(p) for p in path)
-        g["journal"] = journal[:-1] + [merged]
+        g["journal"] = journal[:-1]
+        fx_push(g, merged)
         return result
     fx_push(g, entry)
     return result

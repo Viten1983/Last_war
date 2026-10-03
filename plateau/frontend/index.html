@@ -57,7 +57,7 @@
     // Animation des déplacements : chaque mouvement n'est joué qu'une fois.
     let animatedMoves = new Set();
     try { animatedMoves = new Set(JSON.parse(sessionStorage.getItem("lw_animated_moves") || "[]")); } catch (error) { /* ignoré */ }
-    const STEP_MS = 140;
+    const STEP_MS = 330;
     let pieceGroups = {};
     let offsetX = 0;
     let offsetY = 0;
@@ -801,6 +801,8 @@
     function animateLastMove() {
       const move = args.last_move;
       if (!move || !move.seq || animatedMoves.has(move.seq)) return;
+      // Le journal de bord anime déjà les trajets, case par case.
+      if (args.fx && args.fx.events && args.fx.events.some(ev => (ev.moves || []).length || (ev.shots || []).some(s => s.route))) { animatedMoves.add(move.seq); return; }
       animatedMoves.add(move.seq);
       try { sessionStorage.setItem("lw_animated_moves", JSON.stringify([...animatedMoves].slice(-40))); } catch (error) { /* ignoré */ }
       const layer = pieceGroups[move.unit_id];
@@ -905,6 +907,7 @@
       const cells = new Map();
       const numbers = new Map();
       for (const ev of fx.events) {
+        if (pendingSeqs.has(ev.seq)) continue;  // marques après l'animation
         const ink = OWNER_INK[ev.faction] || "#dc2626";
         for (const shot of ev.shots || []) {
           arrowLine(lines, pt(shot.from), pt(shot.to), FX_COLORS[shot.kind] || ink, shot.kind !== "melee");
@@ -1126,7 +1129,7 @@
       setTimeout(done, count * 28 + 380);
     }
     function impact(kind, c) {
-      if (kind === "melee") { dust(c, 1.1); emojiPop(c, "⚔️", 32, 850); }
+      if (kind === "melee") { dust(c, 1.4); }
       else if (kind === "arrow") { dust(c, 0.6); }
       else if (kind === "rock") { dust(c, 1.3, ["#78716c", "#a8a29e", "#57534e", "#d6d3d1"]); rings(c, "#57534e", 1, 40, 500, 4); }
       else if (kind === "fireball" || kind === "fire") { rings(c, "#f97316", 2, 46, 600, 6); dust(c, 1, ["#f97316", "#facc15", "#ef4444", "#78716c"]); }
@@ -1164,12 +1167,62 @@
       });
     }
 
-    function playEvent(ev, done) {
-      const shots = (ev.shots || []).filter(s => s.from && s.to);
-      const auras = ev.auras || [];
-      const hasHits = (ev.hits || []).length > 0;
-      if (!shots.length && !auras.length && !hasHits) { done(); return; }
-      // Bandeau : ce qui se passe, en clair, pendant l'animation.
+    // --- Pions « fantômes » : copie animée d'une pièce (trajet, charge),
+    //     ou pièce détruite montrée jusqu'au coup qui l'abat.
+    const hiddenPieces = new Map();   // id de pièce -> nombre d'actions en attente
+    const pendingSeqs = new Set();    // actions pas encore jouées : pas encore de marques
+    const preGhosts = new Map();      // seq -> pièces détruites affichées en attendant
+    const GHOST_STEP_MS = 330;        // par case : on suit le trajet à l'œil
+
+    function hidePiece(id) {
+      hiddenPieces.set(id, (hiddenPieces.get(id) || 0) + 1);
+      const g = pieceGroups[id];
+      if (g) g.setAttribute("opacity", "0");
+    }
+    function showPiece(id) {
+      const left = (hiddenPieces.get(id) || 1) - 1;
+      if (left > 0) { hiddenPieces.set(id, left); return; }
+      hiddenPieces.delete(id);
+      const g = pieceGroups[id];
+      if (g) g.removeAttribute("opacity");
+    }
+    function ghostToken(name, faction, c) {
+      const R = IMAGE_RADIUS;
+      const colors = FACTION_COLORS[faction] || FACTION_COLORS[0];
+      const node = svgNode("g", { transform: `translate(${c.x},${c.y})` });
+      node.appendChild(svgNode("circle", { cx: 0, cy: 0, r: R + 2, fill: "#0b0f14" }));
+      const image = PIECE_IMAGES[name];
+      if (image) {
+        node.appendChild(svgNode("image", { href: `assets/${image}.jpg`, x: -R, y: -R, width: 2 * R, height: 2 * R, preserveAspectRatio: "xMidYMid slice", "clip-path": "url(#piece-clip)" }));
+      } else {
+        node.appendChild(svgNode("circle", { cx: 0, cy: 0, r: R, fill: colors.fill }));
+        node.appendChild(svgNode("text", { x: 0, y: 1, "text-anchor": "middle", "dominant-baseline": "middle", "font-size": 10, "font-weight": 900, fill: colors.ink }, shortName(name)));
+      }
+      node.appendChild(svgNode("circle", { cx: 0, cy: 0, r: R, fill: "none", stroke: colors.fill, "stroke-width": 4 }));
+      fxLayer.appendChild(node);
+      return node;
+    }
+    function placeGhost(node, c) { node.setAttribute("transform", `translate(${c.x},${c.y})`); }
+    // Glisse le fantôme de case en case le long du trajet.
+    function walkGhost(node, route, done) {
+      const points = route.map(p => pt(p));
+      if (points.length < 2) { if (points[0]) placeGhost(node, points[0]); done(); return; }
+      tween((points.length - 1) * GHOST_STEP_MS, t => {
+        const pos = t * (points.length - 1);
+        const i = Math.min(points.length - 2, Math.floor(pos));
+        const f = pos - i;
+        const e = f < 0.5 ? 2 * f * f : 1 - Math.pow(-2 * f + 2, 2) / 2;
+        placeGhost(node, { x: points[i].x + (points[i + 1].x - points[i].x) * e, y: points[i].y + (points[i + 1].y - points[i].y) * e });
+      }, done);
+    }
+    function eventActorIds(ev) {
+      const ids = [];
+      (ev.shots || []).forEach(s => { if (s.kind === "melee" && s.actor) ids.push(s.actor.id); });
+      (ev.moves || []).forEach(m => { if (m.actor && m.route && m.route.length > 1) ids.push(m.actor.id); });
+      return ids;
+    }
+
+    function showBanner(ev) {
       const banner = svgNode("g", {});
       const label = `${ev.n}. ${FX_ICONS[ev.kind] || "•"} ${ev.text}`.slice(0, 110);
       const bx = baseW / 2, by = 26;
@@ -1177,27 +1230,90 @@
       banner.appendChild(svgNode("rect", { x: bx - width / 2, y: by - 15, width, height: 30, rx: 15, fill: "rgba(12,18,28,0.85)", stroke: OWNER_INK[ev.faction] || "#dc2626", "stroke-width": 2.5 }));
       banner.appendChild(svgNode("text", { x: bx, y: by + 1, "text-anchor": "middle", "dominant-baseline": "middle", "font-size": 14, "font-weight": 800, fill: "#ffffff" }, label));
       fxLayer.appendChild(banner);
-      let pending = 0;
+      return banner;
+    }
+
+    // Corps à corps : l'attaquant marche jusqu'à la cible, charge, puis
+    // nuage de poussière (et PF perdus) sur la case attaquée.
+    function playMelee(shot, done) {
+      const route = (shot.route && shot.route.length >= 2) ? shot.route : [shot.from, shot.to];
+      const approach = route.slice(0, -1);
+      const target = pt(shot.to);
+      const actor = shot.actor || {};
+      const ghost = ghostToken(actor.name || "", actor.faction, pt(approach[0]));
+      walkGhost(ghost, approach, () => {
+        const strike = pt(approach[approach.length - 1]);
+        tween(260, t => placeGhost(ghost, { x: strike.x + (target.x - strike.x) * 0.45 * t, y: strike.y + (target.y - strike.y) * 0.45 * t }), () => {
+          dust({ x: (strike.x + target.x) / 2, y: (strike.y + target.y) / 2 }, 1.2);
+          dust(target, 1.6);
+          done(ghost, { x: strike.x + (target.x - strike.x) * 0.45, y: strike.y + (target.y - strike.y) * 0.45 });
+        });
+      });
+    }
+
+    // Fin de la charge : le fantôme rejoint la case finale de la pièce
+    // (case conquise, ou case de frappe), puis la vraie pièce réapparaît.
+    function finishGhost(ghost, actor, from) {
+      const piece = (args.entities || []).find(p => p.id === actor.id);
+      if (!piece) { fade(ghost, 500); return; }
+      const end = pt(piece.pos);
+      tween(Math.hypot(end.x - from.x, end.y - from.y) > 2 ? 380 : 120, t => placeGhost(ghost, { x: from.x + (end.x - from.x) * t, y: from.y + (end.y - from.y) * t }), () => {
+        ghost.remove();
+        showPiece(actor.id);
+      });
+    }
+
+    function playEvent(ev, done) {
+      const shots = (ev.shots || []).filter(s => s.from && s.to);
+      const moves = (ev.moves || []).filter(m => m.actor && m.route && m.route.length > 1);
+      const auras = ev.auras || [];
+      const hasHits = (ev.hits || []).length > 0;
+      if (!shots.length && !auras.length && !hasHits && !moves.length) { done(); return; }
+      const banner = showBanner(ev);
+
+      // Déplacement simple : la pièce parcourt son trajet case par case.
+      if (moves.length && !shots.length) {
+        let left = moves.length;
+        moves.forEach(move => {
+          const ghost = ghostToken(move.actor.name, move.actor.faction, pt(move.route[0]));
+          walkGhost(ghost, move.route, () => {
+            ghost.remove();
+            showPiece(move.actor.id);
+            left -= 1;
+            if (left === 0) {
+              auras.forEach(a => impact(a.kind, pt(a.pos)));
+              hitTexts(ev);
+              setTimeout(() => { fade(banner, 300); done(); }, hasHits ? 1300 : 350);
+            }
+          });
+        });
+        return;
+      }
+
+      let pending = shots.length || 1;
       let finished = false;
       function landed() {
         pending -= 1;
         if (pending > 0) return;
+        // Les pièces abattues disparaissent au moment du coup.
+        (preGhosts.get(ev.seq) || []).forEach(node => { flashHex(pt(node.__pos), "#dc2626"); fade(node, 450); });
+        preGhosts.delete(ev.seq);
         auras.forEach(a => impact(a.kind, pt(a.pos)));
         hitTexts(ev);
-        if (!finished) { finished = true; setTimeout(() => { fade(banner, 300); done(); }, 1000); }
+        if (!finished) {
+          finished = true;
+          setTimeout(() => { fade(banner, 300); done(); }, 1500);
+        }
       }
-      if (!shots.length) { pending = 1; landed(); return; }
-      pending = shots.length;
+      if (!shots.length) { landed(); return; }
       shots.forEach((shot, i) => {
         const a = pt(shot.from), b = pt(shot.to);
         const go = () => {
           if (shot.kind === "melee") {
-            // Corps à corps : charge, puis nuage de poussière sur les combattants.
-            const mid = { x: (a.x * 0.35 + b.x * 0.65), y: (a.y * 0.35 + b.y * 0.65) };
-            dust(mid, 1.2);
-            dust(b, 1.5);
-            impact("melee", b);
-            setTimeout(landed, 450);
+            playMelee(shot, (ghost, from) => {
+              landed();
+              setTimeout(() => finishGhost(ghost, shot.actor || {}, from), 700);
+            });
           } else if (shot.kind === "explosion") {
             impact("explosion", b);
             setTimeout(landed, 500);
@@ -1207,7 +1323,8 @@
             projectile(shot.kind, a, b, () => { impact(shot.kind, b); landed(); });
           }
         };
-        setTimeout(go, i * 180);
+        // Plusieurs attaquants au corps à corps : l'un après l'autre.
+        setTimeout(go, shot.kind === "melee" ? i * 500 : i * 180);
       });
     }
 
@@ -1216,20 +1333,44 @@
       const ev = fxQueue.shift();
       if (!ev) return;
       fxBusy = true;
-      playEvent(ev, () => { fxBusy = false; pumpFx(); });
+      playEvent(ev, () => {
+        fxBusy = false;
+        pendingSeqs.delete(ev.seq);
+        // Les marques (PF perdus, numéro) de cette action apparaissent.
+        if (args) render(args);
+        pumpFx();
+      });
     }
 
     function queueFx() {
       const fx = args.fx;
       if (!fx || !fx.events) return;
+      let added = false;
       for (const ev of fx.events) {
         const id = `${fxGameId()}:${ev.seq}`;
         if (playedFx.has(id)) continue;
         rememberFx(id);
         fxQueue.push(ev);
+        pendingSeqs.add(ev.seq);
+        added = true;
+        // En attendant son tour : la pièce qui va bouger est cachée à
+        // l'arrivée, les pièces qu'elle va détruire restent visibles.
+        eventActorIds(ev).forEach(hidePiece);
+        // (L'attaquant tué, lui, est déjà le fantôme qui marche.)
+        const ghosts = (ev.hits || []).filter(h => h.destroyed && !h.attacker && h.kind !== "building" && h.kind !== "base").map(h => {
+          const node = ghostToken(h.name, h.faction, pt(h.pos));
+          node.__pos = h.pos;
+          return node;
+        });
+        if (ghosts.length) preGhosts.set(ev.seq, ghosts);
       }
-      // Après un déplacement animé, on laisse la pièce arriver.
-      setTimeout(pumpFx, 450);
+      if (added) {
+        // Marques des actions en attente retirées jusqu'à leur animation.
+        board.querySelectorAll(".fx-marks, .fx-badges").forEach(node => node.remove());
+        drawFxMarks();
+        board.appendChild(fxLayer);
+        setTimeout(pumpFx, 300);
+      }
     }
 
     function render(newArgs) {
@@ -1358,6 +1499,7 @@ if (reachable || placed) {
           drawPiece(pieceGroup, piece, x, y);
           group.appendChild(pieceGroup);
           pieceGroups[piece.id] = pieceGroup;
+          if (hiddenPieces.has(piece.id)) pieceGroup.setAttribute("opacity", "0");
           drawAiMark(group, piece, x, y);
         }
         // Marqueurs de récolte des héros vagabonds (dernière ressource traversée).
