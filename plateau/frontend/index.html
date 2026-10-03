@@ -954,14 +954,9 @@
       const badges = svgNode("g", { class: "fx-badges", "pointer-events": "none" });
       cells.forEach(cell => {
         const c = pt(cell.pos);
-        // Case rouge pour une pièce touchée ; une pièce morte a déjà sa
-        // case rouge et sa croix (drawDeaths), qui restent un tour.
-        if (cell.damage > 0 && !deathCells.has(keyOf(cell.pos[0], cell.pos[1]))) {
-          badges.appendChild(svgNode("polygon", { points: hexPoints(c.x, c.y, SIZE - 2), fill: "#ef4444", "fill-opacity": 0.22, stroke: "#dc2626", "stroke-width": 4 }));
-        }
-        // PF sur une seule ligne, à gauche de la pièce : rouge = infligés
-        // par l'attaquant, orange = infligés par le défenseur (riposte).
-        if (cell.labels.length) pfLine(badges, c.x - IMAGE_RADIUS - 5, c.y, cell.labels);
+        // Combat terminé : les PF de l'attaquant et du défenseur ne sont
+        // montrés que pendant l'animation. Seules les morts restent
+        // marquées (case rouge et croix, drawDeaths) pendant un tour.
       });
       numbers.forEach((list, k) => {
         const [q, r] = k.split(",").map(Number);
@@ -1197,6 +1192,44 @@
     const hiddenPieces = new Map();   // id de pièce -> nombre d'actions en attente
     const pendingSeqs = new Set();    // actions pas encore jouées : pas encore de marques
     const preGhosts = new Map();      // seq -> pièces détruites affichées en attendant
+    const actorGhosts = new Map();    // id de pièce -> son fantôme (attend à sa case de départ)
+
+    // Fantôme d'une pièce qui va agir : créé à sa case de départ dès que
+    // l'action est en attente, pour que la pièce ne disparaisse jamais.
+    function takeGhost(actor, start) {
+      let node = actorGhosts.get(actor.id);
+      if (!node) {
+        node = ghostToken(actor.name || "", actor.faction, pt(start));
+        actorGhosts.set(actor.id, node);
+      }
+      return node;
+    }
+    // Fin d'une action : le fantôme reste en place si la pièce rejoue
+    // ensuite ; sinon la vraie pièce reprend sa place.
+    function releaseGhost(actorId, node) {
+      const again = fxQueue.some(ev => eventActorIds(ev).includes(actorId));
+      if (again) { showPiece(actorId); return; }
+      actorGhosts.delete(actorId);
+      const alive = (args.entities || []).some(p => p.id === actorId);
+      // Abattue plus tard dans la file : elle reste visible jusqu'au coup.
+      const killer = alive ? null : fxQueue.find(ev => (ev.hits || []).some(h => h.id === actorId && h.destroyed));
+      if (killer) {
+        const hit = killer.hits.find(h => h.id === actorId && h.destroyed);
+        node.__pos = hit.pos;
+        preGhosts.set(killer.seq, (preGhosts.get(killer.seq) || []).concat([node]));
+      } else if (alive) {
+        node.remove();
+      } else {
+        fade(node, 500);
+      }
+      showPiece(actorId);
+    }
+    function actorStarts(ev) {
+      const starts = [];
+      (ev.shots || []).forEach(s => { if (s.kind === "melee" && s.actor) starts.push({ actor: s.actor, pos: (s.route && s.route[0]) || s.from }); });
+      (ev.moves || []).forEach(m => { if (m.actor && m.route && m.route.length > 1) starts.push({ actor: m.actor, pos: m.route[0] }); });
+      return starts;
+    }
     const GHOST_STEP_MS = 330;        // par case : on suit le trajet à l'œil
 
     function hidePiece(id) {
@@ -1265,7 +1298,8 @@
       const approach = route.slice(0, -1);
       const target = pt(shot.to);
       const actor = shot.actor || {};
-      const ghost = ghostToken(actor.name || "", actor.faction, pt(approach[0]));
+      const ghost = takeGhost(actor, approach[0]);
+      placeGhost(ghost, pt(approach[0]));
       walkGhost(ghost, approach, () => {
         const strike = pt(approach[approach.length - 1]);
         tween(260, t => placeGhost(ghost, { x: strike.x + (target.x - strike.x) * 0.45 * t, y: strike.y + (target.y - strike.y) * 0.45 * t }), () => {
@@ -1280,11 +1314,10 @@
     // (case conquise, ou case de frappe), puis la vraie pièce réapparaît.
     function finishGhost(ghost, actor, from) {
       const piece = (args.entities || []).find(p => p.id === actor.id);
-      if (!piece) { fade(ghost, 500); return; }
+      if (!piece) { releaseGhost(actor.id, ghost); return; }
       const end = pt(piece.pos);
       tween(Math.hypot(end.x - from.x, end.y - from.y) > 2 ? 380 : 120, t => placeGhost(ghost, { x: from.x + (end.x - from.x) * t, y: from.y + (end.y - from.y) * t }), () => {
-        ghost.remove();
-        showPiece(actor.id);
+        releaseGhost(actor.id, ghost);
       });
     }
 
@@ -1300,10 +1333,10 @@
       if (moves.length && !shots.length) {
         let left = moves.length;
         moves.forEach(move => {
-          const ghost = ghostToken(move.actor.name, move.actor.faction, pt(move.route[0]));
+          const ghost = takeGhost(move.actor, move.route[0]);
+          placeGhost(ghost, pt(move.route[0]));
           walkGhost(ghost, move.route, () => {
-            ghost.remove();
-            showPiece(move.actor.id);
+            releaseGhost(move.actor.id, ghost);
             left -= 1;
             if (left === 0) {
               auras.forEach(a => impact(a.kind, pt(a.pos)));
@@ -1378,11 +1411,13 @@
         fxQueue.push(ev);
         pendingSeqs.add(ev.seq);
         added = true;
-        // En attendant son tour : la pièce qui va bouger est cachée à
-        // l'arrivée, les pièces qu'elle va détruire restent visibles.
+        // En attendant son tour : la pièce qui va bouger reste affichée à
+        // sa case de départ (fantôme), et non à son arrivée ; les pièces
+        // qu'elle va détruire restent visibles.
         eventActorIds(ev).forEach(hidePiece);
+        actorStarts(ev).forEach(({ actor, pos }) => takeGhost(actor, pos));
         // (L'attaquant tué, lui, est déjà le fantôme qui marche.)
-        const ghosts = (ev.hits || []).filter(h => h.destroyed && !h.attacker && h.kind !== "building" && h.kind !== "base").map(h => {
+        const ghosts = (ev.hits || []).filter(h => h.destroyed && !h.attacker && !actorGhosts.has(h.id) && h.kind !== "building" && h.kind !== "base").map(h => {
           const node = ghostToken(h.name, h.faction, pt(h.pos));
           node.__pos = h.pos;
           return node;
@@ -1396,6 +1431,37 @@
         board.appendChild(fxLayer);
         setTimeout(pumpFx, 300);
       }
+    }
+
+    // Fin de partie : grande banderole aux couleurs du vainqueur, en travers
+    // du plateau, avant l'image de victoire.
+    function drawVictoryBanner() {
+      const banner = args.banner;
+      if (!banner || !banner.text) return;
+      const colors = FACTION_COLORS[banner.faction] || FACTION_COLORS[0];
+      const layer = svgNode("g", { class: "victory-banner", "pointer-events": "none" });
+      const width = baseW * 0.84, height = Math.max(90, baseH * 0.13);
+      const x = (baseW - width) / 2, y = baseH * 0.42 - height / 2;
+      // Voile sombre sur le plateau, puis le ruban et ses deux queues.
+      layer.appendChild(svgNode("rect", { x: 0, y: 0, width: baseW, height: baseH, fill: "#000000", opacity: 0.35 }));
+      const tail = height * 0.55;
+      layer.appendChild(svgNode("polygon", { points: `${x - tail},${y + height * 0.25} ${x + 10},${y + height * 0.25} ${x + 10},${y + height * 1.1} ${x - tail},${y + height * 1.1} ${x - tail * 0.6},${y + height * 0.68}`, fill: colors.stroke, stroke: "#facc15", "stroke-width": 3 }));
+      layer.appendChild(svgNode("polygon", { points: `${x + width + tail},${y + height * 0.25} ${x + width - 10},${y + height * 0.25} ${x + width - 10},${y + height * 1.1} ${x + width + tail},${y + height * 1.1} ${x + width + tail * 0.6},${y + height * 0.68}`, fill: colors.stroke, stroke: "#facc15", "stroke-width": 3 }));
+      layer.appendChild(svgNode("rect", { x, y, width, height, rx: 14, fill: colors.fill, stroke: "#facc15", "stroke-width": 6 }));
+      layer.appendChild(svgNode("rect", { x: x + 10, y: y + 10, width: width - 20, height: height - 20, rx: 9, fill: "none", stroke: "#fde68a", "stroke-width": 2, opacity: 0.8 }));
+      const label = `🏆 ${banner.text}`;
+      const size = Math.min(height * 0.42, (width * 0.94) / (label.length * 0.56));
+      layer.appendChild(svgNode("text", {
+        x: baseW / 2, y: y + height / 2 + 2, "text-anchor": "middle", "dominant-baseline": "middle",
+        "font-size": size, "font-weight": 900, fill: "#ffffff", stroke: "rgba(0,0,0,0.75)", "stroke-width": 5, "paint-order": "stroke",
+      }, label));
+      board.appendChild(layer);
+      // Apparition : le ruban se déploie depuis le centre.
+      tween(700, t => {
+        const s = 0.6 + 0.4 * easeOut(t);
+        layer.setAttribute("transform", `translate(${baseW / 2},${baseH * 0.42}) scale(${s}) translate(${-baseW / 2},${-baseH * 0.42})`);
+        layer.setAttribute("opacity", String(Math.min(1, t * 1.6)));
+      });
     }
 
     function render(newArgs) {
@@ -1599,6 +1665,7 @@ if (reachable || placed) {
       // Calque des animations : conservé d'un rendu à l'autre (une animation
       // en cours continue même si Streamlit redessine le plateau).
       board.appendChild(fxLayer);
+      drawVictoryBanner();
       animateLastMove();
       queueFx();
       wrapper.scrollLeft = previousScrollLeft;

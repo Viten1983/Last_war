@@ -4471,6 +4471,7 @@ def render_board(g, view, readonly=False):
         last_move=view.get("last_move"),
         ai_marks=st.session_state.get("_lw_ai_marks"),
         fx=st.session_state.get("_lw_fx"),
+        banner=st.session_state.get("_lw_victory_banner"),
         key=f"board_component_{st.session_state.ui_board_key}",
         default=None,
     )
@@ -9889,7 +9890,7 @@ def render_victory_screen(g):
 
     st.markdown(
         f"""
-        <div style="position: relative; width: min(100%, 560px); margin: 0 auto;
+        <div style="position: relative; width: min(100%, 760px); margin: 0 auto;
                     aspect-ratio: 4 / 3;
                     border-radius: 14px; overflow: hidden;
                     background: {background};
@@ -9899,7 +9900,7 @@ def render_victory_screen(g):
           <div style="position: absolute; top: 6%; left: 0; right: 0;
                       text-align: center; padding: 0 4%;
                       color: #ffffff; font-weight: 900;
-                      font-size: clamp(17px, 2.5vw, 30px); line-height: 1.15;
+                      font-size: clamp(19px, 3vw, 38px); line-height: 1.15;
                       text-shadow: 0 3px 12px #000000, 0 0 4px #000000;">
             🏆 {escape(title)}
           </div>
@@ -14321,7 +14322,7 @@ def render_victory_screen(g):
     )
     st.markdown(
         f"""
-        <div style="position: relative; width: min(100%, 560px); margin: 0 auto;
+        <div style="position: relative; width: min(100%, 760px); margin: 0 auto;
                     aspect-ratio: 4 / 3;
                     border-radius: 14px; overflow: hidden;
                     background: url('data:image/jpeg;base64,{image}') center 45% / cover no-repeat;
@@ -14331,7 +14332,7 @@ def render_victory_screen(g):
           <div style="position: absolute; top: 6%; left: 0; right: 0;
                       text-align: center; padding: 0 4%;
                       color: #ffffff; font-weight: 900;
-                      font-size: clamp(16px, 2.3vw, 27px); line-height: 1.15;
+                      font-size: clamp(18px, 2.8vw, 34px); line-height: 1.15;
                       text-shadow: 0 3px 12px #000000, 0 0 4px #000000;">
             🏳️ {escape(title)}
           </div>
@@ -16489,17 +16490,13 @@ _lw_marks_previous_render_board = render_board
 
 def render_board(g, view, readonly=False):
     bundle = st.session_state.get("bundle")
-    marks = None
     if ai_config(bundle) is not None and not st.query_params.get("room"):
         # L'IA a pu changer de tour pendant qu'elle jouait : on recale.
         ai_update_turn_marks(bundle)
-        marks = ai_turn_marks_view(bundle)
-        if marks and marks.get("new"):
-            st.caption(
-                "🤖 Ce tour : 🟢 unités recrutées par l'IA · "
-                "🟠 bâtiments, bases ou héros construits."
-            )
-    st.session_state["_lw_ai_marks"] = marks
+    # Les ronds « NOUVEAU » viennent du journal de bord : ils marquent ce que
+    # l'adversaire vient de produire, jusqu'à la première manœuvre du joueur
+    # (et non plus pendant tout le tour).
+    st.session_state["_lw_ai_marks"] = None
     return _lw_marks_previous_render_board(g, view, readonly)
 
 # ============================================================
@@ -17705,6 +17702,77 @@ def attack(g, attacker_ids, target_id, occupier_id=None, losses=None, *args, **k
         fx_routes[eid] = [list(p) for p in options[spot][1]] + [list(target_pos)]
         log(g, f"{unit['name']} #{eid} s'arrête au contact, en {coord(spot)}.")
     g["_fx_routes"] = fx_routes
+
+
+# ============================================================
+# FIN DE PARTIE : BANDEROLE SUR LE PLATEAU, PUIS IMAGE DE VICTOIRE
+# Pendant 10 secondes, le plateau final reste affiché avec une banderole
+# qui dit pourquoi la partie est gagnée ; ensuite l'image de victoire.
+# ============================================================
+
+VICTORY_BANNER_SECONDS = 10
+
+
+def victory_banner_text(g):
+    winner = g["winner"]
+    faction = faction_of(g, winner)["name"]
+    loser = game_forfeiter(g)
+    if loser is not None:
+        return f"Les {faction_of(g, loser)['name']} abandonnent : les {faction} remportent la victoire !"
+    if g.get("victory_mode") == "bases":
+        count = int(g["players"][winner].get("bases", 0))
+        return f"Les {faction} ont détruit {count} bases ennemies : ils remportent la victoire !"
+    points = g["players"][winner].get("pv", 0)
+    return f"Fin du temps : les {faction} remportent la victoire avec {float(points):g} PV !"
+
+
+@st.fragment(run_every=1.0)
+def victory_banner_timer(deadline):
+    # Toutes les secondes : à l'échéance, la page passe à l'image de victoire.
+    if time.time() >= deadline:
+        st.rerun(scope="app")
+
+
+_lw_banner_previous_render_victory_screen = render_victory_screen
+
+
+def render_victory_screen(g):
+    bundle = st.session_state.get("bundle") or {}
+    key = f"{bundle.get('game_id') or st.query_params.get('room') or ''}:{g['winner']}"
+    seen = st.session_state.setdefault("lw_victory_seen", {})
+    started = seen.setdefault(key, time.time())
+    deadline = started + VICTORY_BANNER_SECONDS
+    if time.time() >= deadline:
+        return _lw_banner_previous_render_victory_screen(g)
+
+    st.session_state["_lw_victory_banner"] = {"text": victory_banner_text(g), "faction": faction_id(g, g["winner"])}
+    try:
+        render_board(g, g, readonly=True)
+    finally:
+        st.session_state.pop("_lw_victory_banner", None)
+    victory_banner_timer(deadline)
+
+
+def victory_banner_active(g):
+    """Vrai pendant les 10 secondes de banderole de cette partie."""
+    if g.get("winner") not in (0, 1):
+        return False
+    bundle = st.session_state.get("bundle") or {}
+    key = f"{bundle.get('game_id') or st.query_params.get('room') or ''}:{g['winner']}"
+    started = st.session_state.get("lw_victory_seen", {}).get(key)
+    return started is not None and time.time() < started + VICTORY_BANNER_SECONDS
+
+
+_lw_banner_previous_render_board = render_board
+
+
+def render_board(g, view, readonly=False):
+    # Pendant la banderole, seul le plateau qui la porte est affiché
+    # (pas de second plateau « final » avec la même clé).
+    if victory_banner_active(g) and not st.session_state.get("_lw_victory_banner"):
+        st.caption("Le plateau final est affiché ci-dessus.")
+        return None
+    return _lw_banner_previous_render_board(g, view, readonly)
 
 
 # ============================================================
