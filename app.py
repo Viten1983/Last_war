@@ -17867,6 +17867,29 @@ def combat_values(attackers, target):
     return values
 
 # ============================================================
+# LIMITES D'UNITÉS : +30 % POUR TOUTES LES FACTIONS
+# Arrondi à l'entier le plus proche (les unités uniques restent à 1) ;
+# pour les unités recrutées par lots, au multiple du lot le plus proche
+# (le dernier lot reste toujours recrutable).
+# ============================================================
+
+UNIT_LIMIT_BONUS = 1.30
+
+
+def raised_limit(limit, batch=1):
+    batch = max(1, int(batch))
+    return max(int(limit), batch * math.floor(limit * UNIT_LIMIT_BONUS / batch + 0.5))
+
+
+for _name, _data in UNITS.items():
+    if _name == WORKER:
+        continue
+    _data["limit"] = raised_limit(_data["limit"], _data.get("batch", 1))
+WORKER_LIMIT = raised_limit(WORKER_LIMIT)
+UNITS[WORKER]["limit"] = WORKER_LIMIT
+
+
+# ============================================================
 # PSEUDO OBLIGATOIRE
 # Sans pseudo, impossible de lancer, charger ou rejoindre une partie.
 # ============================================================
