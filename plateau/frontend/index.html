@@ -876,12 +876,6 @@
     }
     function easeOut(t) { return 1 - Math.pow(1 - t, 3); }
 
-    // Pastille « −3 PF » rouge (ou « +2 PF » verte) au-dessus d'une case.
-    function pfBadge(layer, x, y, label, fill) {
-      const w = 12 + label.length * 7.2;
-      layer.appendChild(svgNode("rect", { x: x - w / 2, y: y - 11, width: w, height: 22, rx: 11, fill, stroke: "#ffffff", "stroke-width": 2 }));
-      layer.appendChild(svgNode("text", { x, y: y + 0.5, "text-anchor": "middle", "dominant-baseline": "middle", "font-size": 13, "font-weight": 900, fill: "#ffffff" }, label));
-    }
     function numberBadge(layer, x, y, n, ink) {
       layer.appendChild(svgNode("circle", { cx: x, cy: y, r: 11, fill: ink, stroke: "#ffffff", "stroke-width": 2.2 }));
       layer.appendChild(svgNode("text", { x, y: y + 0.5, "text-anchor": "middle", "dominant-baseline": "middle", "font-size": 12, "font-weight": 900, fill: "#ffffff" }, String(n)));
@@ -913,12 +907,12 @@
         // Pas de traits ni de flèches : seulement les effets des combats.
         for (const hit of ev.hits || []) {
           const k = keyOf(hit.pos[0], hit.pos[1]);
-          if (!cells.has(k)) cells.set(k, { pos: hit.pos, damage: 0, heal: 0, destroyed: false, status: null });
+          if (!cells.has(k)) cells.set(k, { pos: hit.pos, damage: 0, destroyed: false, labels: [] });
           const cell = cells.get(k);
           cell.damage += hit.damage || 0;
-          cell.heal += hit.heal || 0;
           cell.destroyed = cell.destroyed || Boolean(hit.destroyed);
-          if (hit.status) cell.status = hit.status;
+          const label = hitLabel(hit, ev);
+          if (label) cell.labels.push(label);
         }
         for (const pos of ev.spawns || []) {
           const piece = (args.entities || []).find(p => p.pos[0] === pos[0] && p.pos[1] === pos[1]);
@@ -941,18 +935,18 @@
         const c = pt(cell.pos);
         if (cell.damage > 0) {
           badges.appendChild(svgNode("polygon", { points: hexPoints(c.x, c.y, SIZE - 2), fill: "#ef4444", "fill-opacity": 0.22, stroke: "#dc2626", "stroke-width": 4 }));
-          const dmg = String(Math.round(cell.damage * 10) / 10).replace(".", ",");
-          pfBadge(badges, c.x, c.y - SIZE * 0.93, `${cell.destroyed ? "💀 " : ""}−${dmg} PF`, "#dc2626");
+
           if (cell.destroyed) {
             // Pièce détruite : grande croix rouge sur la case.
             const r = 15;
             badges.appendChild(svgNode("path", { d: `M${c.x - r} ${c.y - r} L${c.x + r} ${c.y + r} M${c.x + r} ${c.y - r} L${c.x - r} ${c.y + r}`, stroke: "#dc2626", "stroke-width": 6, "stroke-linecap": "round", opacity: 0.75 }));
           }
-        } else if (cell.heal > 0) {
-          const heal = String(Math.round(cell.heal * 10) / 10).replace(".", ",");
-          pfBadge(badges, c.x, c.y - SIZE * 0.93, `+${heal} PF`, "#16a34a");
         }
-        if (cell.status) pfBadge(badges, c.x, c.y + SIZE * 0.93, cell.status, "#0369a1");
+        // PF au-dessus de la pièce : vert = infligés par l'attaquant,
+        // rouge = infligés par le défenseur (riposte).
+        cell.labels.forEach((label, i) => {
+          pfText(badges, c.x, c.y - SIZE * 0.9 - i * 17, label.text, label.color);
+        });
       });
       numbers.forEach((list, k) => {
         const [q, r] = k.split(",").map(Number);
@@ -1149,12 +1143,24 @@
       else { dust(c, 0.8); }
     }
 
+    const PF_DEALT = "#16a34a";     // PF infligés par l'attaquant
+    const PF_TAKEN = "#dc2626";     // PF infligés par le défenseur
+    function pfNumber(value) { return String(Math.round(value * 10) / 10).replace(".", ","); }
+    function hitLabel(hit, ev) {
+      if (hit.damage) return { text: `−${pfNumber(hit.damage)} PF`, color: hit.owner === ev.owner ? PF_TAKEN : PF_DEALT };
+      if (hit.heal) return { text: `+${pfNumber(hit.heal)} PF`, color: PF_DEALT };
+      if (hit.status) return { text: hit.status, color: "#0369a1" };
+      return null;
+    }
+    function pfText(layer, x, y, text, color) {
+      layer.appendChild(svgNode("text", { x, y, "text-anchor": "middle", "dominant-baseline": "middle", "font-size": 15, "font-weight": 900, fill: color, stroke: "#ffffff", "stroke-width": 4, "paint-order": "stroke" }, text));
+    }
+
     function hitTexts(ev) {
       (ev.hits || []).forEach((hit, i) => {
         const c = pt(hit.pos);
         if (hit.damage) {
-          const dmg = String(Math.round(hit.damage * 10) / 10).replace(".", ",");
-          floatText(c, `${hit.destroyed ? "💀 " : ""}−${dmg} PF`, "#dc2626", i * 120);
+          floatText(c, hitLabel(hit, ev).text, hitLabel(hit, ev).color, i * 120);
           shakeAt(hit.pos);
           if (hit.destroyed) flashHex(c, "#dc2626");
         } else if (hit.heal) {

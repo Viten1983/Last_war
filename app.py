@@ -17413,6 +17413,17 @@ def fx_board_payload(bundle, g, viewer, recent):
     return {"events": events, "viewer": viewer, "game": str(game_id)}
 
 
+def fx_color_pf(text, css):
+    """Met en couleur les « −N PF », « +N PF » et « détruit » d'un texte."""
+    tokens = {
+        t for t in text.replace("(", " ").replace(")", " ").split()
+        if t.startswith("−") or (t.startswith("+") and t[1:2].isdigit())
+    }
+    for token in sorted(tokens, key=len, reverse=True):
+        text = text.replace(token, f'<b class="{css}">{token}</b>')
+    return text.replace("détruit", f'<b class="{css}">détruit</b>')
+
+
 def render_journal(bundle, g, viewer, recent):
     journal = list(g.get("journal") or [])
     numbers = {e["seq"]: n for n, e in enumerate(recent, 1)}
@@ -17427,12 +17438,12 @@ def render_journal(bundle, g, viewer, recent):
             f'<span class="lw-j-num" style="background:{color}">{number}</span>'
             if number is not None else '<span class="lw-j-num lw-j-old"></span>'
         )
-        text = escape(e.get("text", ""))
-        # PF perdus en rouge, PF gagnés en vert.
-        for token in sorted({t for t in text.replace("(", " ").replace(")", " ").split() if t.startswith("−") or (t.startswith("+") and t[1:2].isdigit())}, key=len, reverse=True):
-            css = "lw-j-loss" if token.startswith("−") else "lw-j-gain"
-            text = text.replace(token, f'<b class="{css}">{token}</b>')
-        text = text.replace("détruit", '<b class="lw-j-loss">détruit</b>')
+        # En vert : ce que l'attaquant inflige ; en rouge : ce que le défenseur
+        # lui inflige en retour (après « pertes : »).
+        dealt, _, taken = e.get("text", "").partition(" · pertes : ")
+        text = fx_color_pf(escape(dealt), "lw-j-gain")
+        if taken:
+            text += " · pertes : " + fx_color_pf(escape(taken), "lw-j-loss")
         return (
             f'<div class="lw-j-line{" lw-j-fresh" if fresh else ""}" style="border-left-color:{color}">'
             f'{badge}<span class="lw-j-turn">T{escape(str(e.get("turn", "")))}</span>'
