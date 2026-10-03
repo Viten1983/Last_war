@@ -1433,6 +1433,41 @@
       }
     }
 
+    // Récolte : au-dessus de chaque base (ou héros), l'or récolté en jaune
+    // et le mana en orange, comme les PF lors des attaques.
+    const HARVEST_GOLD = "#eab308";
+    const HARVEST_MANA = "#f97316";
+    function drawHarvest() {
+      const harvest = args.fx && args.fx.harvest;
+      if (!harvest || !harvest.items) return;
+      const layer = svgNode("g", { class: "harvest-marks", "pointer-events": "none" });
+      const fresh = !playedFx.has(`harvest:${fxGameId()}:${harvest.id}`);
+      if (fresh) rememberFx(`harvest:${fxGameId()}:${harvest.id}`);
+      for (const item of harvest.items) {
+        const c = pt(item.pos);
+        const lines = [];
+        if (item.gold) lines.push({ text: `+${item.gold} or`, color: HARVEST_GOLD });
+        if (item.mana) lines.push({ text: `+${item.mana} mana`, color: HARVEST_MANA });
+        lines.forEach((line, i) => {
+          const y = c.y - SIZE * 0.95 - i * 17;
+          const node = svgNode("text", {
+            x: c.x, y, "text-anchor": "middle", "dominant-baseline": "middle",
+            "font-size": 15, "font-weight": 900, fill: line.color,
+            stroke: "#1c1917", "stroke-width": 3.5, "paint-order": "stroke",
+          }, line.text);
+          layer.appendChild(node);
+          if (fresh) {
+            // Première apparition : le montant monte depuis la base.
+            tween(900, t => {
+              node.setAttribute("y", String(y + 22 * (1 - easeOut(t))));
+              node.setAttribute("opacity", String(Math.min(1, t * 2)));
+            });
+          }
+        });
+      }
+      board.appendChild(layer);
+    }
+
     // Fin de partie : grande banderole aux couleurs du vainqueur, en travers
     // du plateau, avant l'image de victoire.
     function drawVictoryBanner() {
@@ -1664,6 +1699,7 @@ if (reachable || placed) {
       drawFxMarks();
       // Calque des animations : conservé d'un rendu à l'autre (une animation
       // en cours continue même si Streamlit redessine le plateau).
+      drawHarvest();
       board.appendChild(fxLayer);
       drawVictoryBanner();
       animateLastMove();

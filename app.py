@@ -1641,17 +1641,8 @@ def collect_adjacent_resources(g, base):
     owner = base["owner"]  
     age = g["players"][owner]["age"]  
   
-    gold_income = {
-        1: faction_of(g, owner)["income"],
-        2: 200,  
-        3: 300,  
-    }[age]  
-  
-    mana_income = {  
-        1: 1,  
-        2: 2,  
-        3: 3,  
-    }[age]  
+    # Barème par faction et par âge (voir HARVEST_BY_AGE en fin de fichier).
+    gold_income, mana_income = harvest_income(g, owner)
   
     resources = []  
   
@@ -4571,8 +4562,8 @@ def render_build_controls(g, view, local=False, on_board=False):
   
     if faction_id(view, owner) == EXILES:  
         st.caption(  
-            "Côté adverse de la ligne noire A17-Y1 : "  
-            "+50 % sur le coût en or."  
+            "Côté adverse de la ligne noire A17-Y1 : construction ×3 en or "
+            "+ 3 mana ; recrutement +50 % sur l'or."
         )  
   
     if current_age >= 3:  
@@ -16301,10 +16292,8 @@ def goblin_cell_yield(g, thief_owner, pos):
                 _, _, _, gold, mana = hero_stats(g, base)
                 best = max(best, (gold if kind == "gold" else mana) * mult)
         elif distance(tuple(base["pos"]), tuple(pos)) == 1:
-            if kind == "gold":
-                income = {1: faction_of(g, enemy)["income"], 2: 200, 3: 300}[age]
-            else:
-                income = {1: 1, 2: 2, 3: 3}[age]
+            gold_income, mana_income = harvest_income(g, enemy)
+            income = gold_income if kind == "gold" else mana_income
             best = max(best, income * mult)
     return (kind, int(best)) if best else None
 
@@ -17457,7 +17446,17 @@ def fx_board_payload(bundle, g, viewer, recent):
     return {
         "events": events, "viewer": viewer, "game": str(game_id),
         "deaths": fx_deaths(g),
+        "harvest": fx_harvest(g),
     }
+
+
+def fx_harvest(g):
+    """Récolte de chaque base (ou héros), montrée pendant la production qui
+    la suit : or en jaune, mana en orange au-dessus de la base."""
+    h = g.get("last_harvest")
+    if not h or h.get("turn") != g["turn"] or g["phase"] != "build" or not h.get("items"):
+        return None
+    return {"id": f"{h['turn']}:{h.get('seq', 0)}", "items": h["items"]}
 
 
 def fx_phase_index(round_number, phase):
@@ -17589,7 +17588,7 @@ def render_board(g, view, readonly=False):
     recent = fx_recent(g, viewer)
     render_journal(bundle, g, viewer, recent)
     payload = fx_board_payload(bundle, g, viewer, recent)
-    st.session_state["_lw_fx"] = payload if recent or payload["deaths"] else None
+    st.session_state["_lw_fx"] = payload if recent or payload["deaths"] or payload["harvest"] else None
     return _lw_fx_previous_render_board(g, view, readonly)
 
 
@@ -17887,6 +17886,144 @@ for _name, _data in UNITS.items():
     _data["limit"] = raised_limit(_data["limit"], _data.get("batch", 1))
 WORKER_LIMIT = raised_limit(WORKER_LIMIT)
 UNITS[WORKER]["limit"] = WORKER_LIMIT
+
+
+# ============================================================
+# RÉCOLTE : BARÈME PAR FACTION ET PAR ÂGE
+# Chaque base récolte, par tour, l'or OU le mana des cases voisines
+# (× le multiplicateur de la meilleure case de ce type).
+# Derniers nés : il faut au moins un ouvrier sur la case pour récolter.
+# Vagabonds : chaque héros récolte la case de son marqueur.
+# ============================================================
+
+HARVEST_BY_AGE = {
+    #              âge : (or, mana) par base et par tour
+    DEFERLANTS: {1: (100, 1), 2: (150, 1), 3: (200, 2)},
+    EXILES: {1: (125, 1), 2: (150, 1), 3: (200, 2)},
+    DERNIERS_NES: {1: (125, 1), 2: (200, 1), 3: (250, 2)},
+}
+for _fid, _table in HARVEST_BY_AGE.items():
+    FACTIONS[_fid]["income"] = _table[1][0]
+
+
+def harvest_income(g, owner):
+    """(or, mana) que rapporte une base de ce joueur, à son âge actuel."""
+    age = int(g["players"][owner].get("age", 1))
+    table = HARVEST_BY_AGE.get(faction_id(g, owner))
+    if table is None:
+        return {1: (faction_of(g, owner)["income"], 1), 2: (200, 2), 3: (300, 3)}[age]
+    return table[age]
+
+
+def dn_collect(g, base):
+    """Derniers nés : la base récolte l'or (ou le mana) d'une case voisine
+    où se tient au moins un de ses ouvriers."""
+    owner = base["owner"]
+    cells = {"gold": [], "mana": []}
+    for pos in neighbors(tuple(base["pos"])):
+        resource = g["resources"].get(key(pos))
+        if resource is None:
+            continue
+        if any(o["owner"] == owner and o["name"] == WORKER for o in pieces_at(g, pos)):
+            cells[resource[0]].append(resource[1])
+    gold_income, mana_income = harvest_income(g, owner)
+    for kind, income in (("gold", gold_income), ("mana", mana_income)):
+        if cells[kind]:
+            g["players"][owner][kind] += income * max(cells[kind])
+
+
+# Héros Vagabonds : (or, mana) récoltés par tour sur la case du marqueur.
+HERO_HARVEST = {
+    "De Marbourg": {1: (200, 1), 2: (250, 1)},
+    "Sayn": {1: (125, 1), 2: (150, 1)},
+    "Wulfoad": {1: (125, 1), 2: (150, 1)},
+    "Campbell": {2: (250, 1)},
+}
+for _hero, _ages in HERO_HARVEST.items():
+    for _age, (_gold, _mana) in _ages.items():
+        if _age in HERO_STATS[_hero]:
+            _pf, _move, _reach, _, _ = HERO_STATS[_hero][_age]
+            HERO_STATS[_hero][_age] = (_pf, _move, _reach, _gold, _mana)
+
+
+# --- Ce que chaque base (ou héros) récolte : affiché sur le plateau.
+_lw_harvestfx_previous_collect = collect_adjacent_resources
+
+
+def collect_adjacent_resources(g, base):
+    player = g["players"][base["owner"]]
+    before = (player["gold"], player["mana"])
+    result = _lw_harvestfx_previous_collect(g, base)
+    gold, mana = player["gold"] - before[0], player["mana"] - before[1]
+    items = g.get("_harvest_items")
+    if items is not None and (gold or mana):
+        items.append({
+            "pos": [int(v) for v in base["pos"]], "owner": base["owner"],
+            "gold": gold, "mana": mana,
+        })
+    return result
+
+
+_lw_harvestfx_previous_harvest = harvest
+
+
+def harvest(g):
+    g["_harvest_items"] = []
+    try:
+        _lw_harvestfx_previous_harvest(g)
+    finally:
+        items = g.pop("_harvest_items", [])
+    g["last_harvest"] = {"turn": g["turn"], "seq": int(g.get("fx_seq", 0)), "items": items}
+
+
+# --- Textes de référence (âges) alignés sur le barème de récolte.
+import re as _re
+
+
+def _harvest_text(gold, mana):
+    return f"récolte {gold} or ou {mana} mana par tour"
+
+
+_BASE_NAMES = {"Incubateur", "Habitations", "Colonie", "Ville", "Forteresse"}
+for _fname, _fid in (("Déferlants", DEFERLANTS), ("Exilés", EXILES), ("Derniers nés", DERNIERS_NES)):
+    for _age, _entries in AGE_REFERENCE.get(_fname, {}).items():
+        for _i, (_name, _text) in enumerate(_entries):
+            if _name not in _BASE_NAMES:
+                continue
+            _gold, _mana = HARVEST_BY_AGE[_fid][_age]
+            _text = _re.sub(r" · (collecte|récolte)[^·]*", "", _text)
+            _entries[_i] = (_name, f"{_text} · {_harvest_text(_gold, _mana)}")
+            break
+for _age, _entries in AGE_REFERENCE.get("Vagabonds", {}).items():
+    for _i, (_name, _text) in enumerate(_entries):
+        _harvest = HERO_HARVEST.get(_name, {}).get(_age)
+        if _harvest:
+            _text = _re.sub(r"(récolte )?\d+ or ou \d+ mana", _harvest_text(*_harvest), _text)
+            _entries[_i] = (_name, _text)
+
+
+# ============================================================
+# EXILÉS : CONSTRUIRE DE L'AUTRE CÔTÉ DE LA LIGNE NOIRE
+# Une construction (bâtiment ou base) du côté adverse de la ligne en
+# pointillés coûte 3 fois son prix en or et 3 mana. (Le recrutement
+# d'unités garde son surcoût de +50 %.)
+# ============================================================
+
+EXILE_FAR_BUILD_GOLD = 3
+EXILE_FAR_BUILD_MANA = 3
+
+_lw_exilefar_previous_placement_cost = placement_cost
+
+
+def placement_cost(view, owner, mode, name, positions, accelerated=False):
+    if (
+        mode == "build" and positions
+        and faction_id(view, owner) == EXILES
+        and enemy_side_of_line(owner, tuple(positions[0]))
+    ):
+        gold, mana = _lw_exilefar_previous_placement_cost(view, owner, mode, name, [], accelerated)
+        return gold * EXILE_FAR_BUILD_GOLD, mana + EXILE_FAR_BUILD_MANA
+    return _lw_exilefar_previous_placement_cost(view, owner, mode, name, positions, accelerated)
 
 
 # ============================================================
