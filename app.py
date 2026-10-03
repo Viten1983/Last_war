@@ -9876,12 +9876,33 @@ def victory_image_data():
         return None
 
 
+# Image de victoire propre à chaque faction (image générique sinon).
+FACTION_VICTORY_IMAGES = {
+    "Déferlants": "victoire_deferlants.jpg",
+    "Exilés": "victoire_exiles.jpg",
+    "Derniers nés": "victoire_derniers_nes.jpg",
+    "Vagabonds": "victoire_vagabonds.jpg",
+}
+
+
+@st.cache_data
+def faction_victory_image_data(faction_name):
+    import base64
+    filename = FACTION_VICTORY_IMAGES.get(faction_name)
+    if filename is None:
+        return None
+    try:
+        return base64.b64encode((VICTORY_IMAGE.parent / filename).read_bytes()).decode("ascii")
+    except OSError:
+        return None
+
+
 def render_victory_screen(g):
     faction = faction_of(g, g["winner"])["name"]
     title = f"Le joueur des {faction} a gagné la partie !"
-    image = victory_image_data()
+    image = faction_victory_image_data(faction) or victory_image_data()
     background = (
-        f"url('data:image/jpeg;base64,{image}') center 15% / cover no-repeat"
+        f"url('data:image/jpeg;base64,{image}') center 30% / cover no-repeat"
         if image
         else "linear-gradient(135deg, #1e3a8a, #111827)"
     )
