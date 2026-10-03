@@ -4868,7 +4868,7 @@ def render_build_controls(g, view, local=False, on_board=False):
                 for column, name in zip(columns, names):  
                     data = UNITS[name]  
                     built_count = view["players"][owner]["units_built"].get(name, 0)
-                    remaining_count = max(0, data["limit"] - built_count)
+                    remaining_count = max(0, unit_limit(view, owner, name) - built_count)
   
                     with column:  
                         st.write(f"**{name}**")  
@@ -17915,29 +17915,23 @@ def harvest_income(g, owner):
     return table[age]
 
 
-def dn_collect(g, base):
-    """Derniers nés : la base récolte l'or (ou le mana) d'une case voisine
-    où se tient au moins un de ses ouvriers."""
-    owner = base["owner"]
-    cells = {"gold": [], "mana": []}
-    for pos in neighbors(tuple(base["pos"])):
-        resource = g["resources"].get(key(pos))
-        if resource is None:
-            continue
-        if any(o["owner"] == owner and o["name"] == WORKER for o in pieces_at(g, pos)):
-            cells[resource[0]].append(resource[1])
-    gold_income, mana_income = harvest_income(g, owner)
-    for kind, income in (("gold", gold_income), ("mana", mana_income)):
-        if cells[kind]:
-            g["players"][owner][kind] += income * max(cells[kind])
+# Derniers nés : la récolte dépend du nombre d'ouvriers sur les cases de
+# ressource voisines de la base (plafonné par le niveau de la base : 1
+# ouvrier pour la Colonie, 2 pour la Ville, 3 pour la Forteresse).
+DN_GOLD_BY_WORKERS = {1: 125, 2: 200, 3: 250}
+DN_MANA_BY_WORKERS = {1: 1, 2: 1, 3: 2}
+HARVEST_BY_AGE[DERNIERS_NES] = {
+    n: (DN_GOLD_BY_WORKERS[n], DN_MANA_BY_WORKERS[n]) for n in (1, 2, 3)
+}
 
 
 # Héros Vagabonds : (or, mana) récoltés par tour sur la case du marqueur.
 HERO_HARVEST = {
-    "De Marbourg": {1: (200, 1), 2: (250, 1)},
-    "Sayn": {1: (125, 1), 2: (150, 1)},
-    "Wulfoad": {1: (125, 1), 2: (150, 1)},
-    "Campbell": {2: (250, 1)},
+    "De Marbourg": {1: (200, 1), 2: (250, 1), 3: (500, 2)},
+    "Sayn": {1: (125, 1), 2: (150, 1), 3: (175, 2)},
+    "Wulfoad": {1: (125, 1), 2: (150, 1), 3: (175, 2)},
+    "Campbell": {2: (250, 1), 3: (350, 2)},
+    "Aalongue": {3: (400, 2)},
 }
 for _hero, _ages in HERO_HARVEST.items():
     for _age, (_gold, _mana) in _ages.items():
@@ -17992,7 +17986,11 @@ for _fname, _fid in (("Déferlants", DEFERLANTS), ("Exilés", EXILES), ("Dernier
                 continue
             _gold, _mana = HARVEST_BY_AGE[_fid][_age]
             _text = _re.sub(r" · (collecte|récolte)[^·]*", "", _text)
-            _entries[_i] = (_name, f"{_text} · {_harvest_text(_gold, _mana)}")
+            _note = (
+                f" (avec {_age} ouvrier{'s' if _age > 1 else ''} sur la case)"
+                if _fid == DERNIERS_NES else ""
+            )
+            _entries[_i] = (_name, f"{_text} · {_harvest_text(_gold, _mana)}{_note}")
             break
 for _age, _entries in AGE_REFERENCE.get("Vagabonds", {}).items():
     for _i, (_name, _text) in enumerate(_entries):
@@ -18024,6 +18022,41 @@ def placement_cost(view, owner, mode, name, positions, accelerated=False):
         gold, mana = _lw_exilefar_previous_placement_cost(view, owner, mode, name, [], accelerated)
         return gold * EXILE_FAR_BUILD_GOLD, mana + EXILE_FAR_BUILD_MANA
     return _lw_exilefar_previous_placement_cost(view, owner, mode, name, positions, accelerated)
+
+
+# ============================================================
+# LIMITE PAR ÂGE (fiche des Déferlants : 26, « AGE II 16 », « AGE III 10 »)
+# La limite compte toutes les unités recrutées depuis le début de la partie
+# et devient celle de l'âge atteint : au-delà, plus de recrutement.
+# ============================================================
+
+UNIT_LIMITS_BY_AGE = {
+    "Déferlant": {1: raised_limit(20, 2), 2: raised_limit(12, 2), 3: raised_limit(8, 2)},
+}
+
+
+def unit_limit(g, owner, name):
+    """Limite de l'unité pour ce joueur, à son âge actuel."""
+    by_age = UNIT_LIMITS_BY_AGE.get(name)
+    if by_age:
+        return by_age[int(g["players"][owner].get("age", 1))]
+    return UNITS[name]["limit"]
+
+
+_lw_agelimit_previous_recruit = recruit
+
+
+def recruit(g, owner, producer_id, name, positions, *args, **kwargs):
+    if name in UNIT_LIMITS_BY_AGE:
+        built = g["players"][owner]["units_built"].get(name, 0)
+        batch = recruitment_batch(g, owner, name)
+        limit = unit_limit(g, owner, name)
+        if built + batch > limit:
+            raise ValueError(
+                f"Limite de {name}s atteinte pour l'âge {g['players'][owner]['age']} : "
+                f"{limit} au total ({built} déjà recrutés)."
+            )
+    return _lw_agelimit_previous_recruit(g, owner, producer_id, name, positions, *args, **kwargs)
 
 
 # ============================================================
