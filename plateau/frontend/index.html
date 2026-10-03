@@ -914,7 +914,8 @@
           const label = hitLabel(hit, ev);
           if (label) cell.labels.push(label);
         }
-        for (const pos of ev.spawns || []) {
+        // Ronds vert / orange : seulement pour ce que l'adversaire a produit.
+        for (const pos of ev.mine ? [] : ev.spawns || []) {
           const piece = (args.entities || []).find(p => p.pos[0] === pos[0] && p.pos[1] === pos[1]);
           const aiMarked = piece && args.ai_marks && (args.ai_marks.new || []).includes(piece.id);
           if (piece && !aiMarked) { const c = pt(pos); drawNewMark(lines, piece, c.x, c.y); }
