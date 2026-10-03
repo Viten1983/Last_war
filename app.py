@@ -586,7 +586,7 @@ AGE_REFERENCE = {
             ("Galerie d'enragés", "Bâtiment · 250 or · produit 2 unités"),
             ("Marais d'aspergeurs", "Bâtiment · 250 or · produit les Aspergeurs"),
             ("Aspergeur", "Unité · portée 3 · attaque à distance"),
-            ("Rampant", "Unité · déplacement souterrain"),
+            ("Rampant", "Unité · se plante dans le sol (fin d'activation), puis tire en ligne : 4 PF sur la cible et les 2 cases derrière elle"),
         ],
         3: [
             ("Incubateur", "Base · 500 or · 6 PF · collecte 300 or ou 3 mana"),
@@ -647,6 +647,7 @@ Prototype âge I : Déferlants contre Exilés.
 - Une activation permet un déplacement OU une attaque.
 - Les unités, bases et bâtiments alliés peuvent être traversés (chaque case traversée compte comme un déplacement), mais pas occupés à l'arrivée.
 - Un tir subit une riposte égale aux PF de la cible (au contact, c'est un corps à corps).
+- Une unité de corps à corps (sans tir) ne riposte jamais contre un tireur, même au contact.
 - Une unité invisible non détectée attaque sans subir de riposte.
 - Pile d'ouvriers (1 à 3 sur une case) : au corps à corps, ils se défendent ensemble avec leurs PF cumulés ; une attaque victorieuse les détruit tous d'un coup, l'attaquant perd ce total et prend la case.
 - La Catapulte et la Catapulte de l'enfer ne ripostent jamais (ni au corps à corps, ni aux tirs). Seul le Trébuchet tire automatiquement sur les unités qui traversent sa zone.
@@ -7734,14 +7735,18 @@ def plant_rampant(g, unit_id):
         raise ValueError("Ce Rampant ne peut plus agir ce tour.")
 
     unit["planted"] = True
-    # Il ne bouge plus, mais peut encore tirer pendant ce tour.
-    g["moving_unit_id"] = unit["id"]
+    # Se planter termine son activation : il ne pourra tirer qu'à une
+    # activation suivante, déjà planté.
+    unit["acted"] = True
+    if g.get("moving_unit_id") == unit["id"]:
+        g.pop("moving_unit_id")
 
     log(g, f"Rampant #{unit['id']} se plante dans le sol.")
     g["_ui_message"] = (
         "Rampant planté : invisible pour l'adversaire. "
-        "Tu peux tirer maintenant ou terminer son activation."
+        "Il pourra tirer à sa prochaine activation."
     )
+    next_activation(g)
 
 
 def unplant_rampant(g, unit_id):
@@ -12716,22 +12721,26 @@ def ranged_attack_values(g, attacker, target):
 
 # ============================================================
 # RAMPANT : TIR EN LIGNE
-# Planté, il frappe les 3 cases qui se suivent en ligne droite depuis lui
-# (1, 2 et 3 cases), dans la direction de la cible : 3 PF de dégâts sur
-# chaque case, ennemis seulement, jamais les unités volantes.
+# Planté, il vise une cible en ligne droite (à sa portée) et frappe 3 cases
+# qui se suivent à partir d'elle : la cible, puis les 2 cases derrière,
+# 4 PF de dégâts sur chacune, ennemis seulement, jamais les unités volantes.
 # ============================================================
 
-RAMPANT_LINE_DAMAGE = 3.0
+RAMPANT_LINE_DAMAGE = 4.0
 RAMPANT_LINE_LENGTH = 3
 
 
 def rampant_line_cells(rampant, target_pos):
-    direction = golem_direction(tuple(rampant["pos"]), tuple(target_pos))
+    """La cible et les 2 cases derrière elle ; None hors ligne droite."""
+    origin, target_pos = tuple(rampant["pos"]), tuple(target_pos)
+    direction = golem_direction(origin, target_pos)
     if direction is None:
         return None
-    q, r = rampant["pos"]
     dq, dr = direction
-    cells = [(q + k * dq, r + k * dr) for k in range(1, RAMPANT_LINE_LENGTH + 1)]
+    gap = distance(origin, target_pos)
+    if (origin[0] + gap * dq, origin[1] + gap * dr) != target_pos:
+        return None
+    cells = [(target_pos[0] + k * dq, target_pos[1] + k * dr) for k in range(RAMPANT_LINE_LENGTH)]
     return [c for c in cells if c in CELL_SET]
 
 
@@ -12743,7 +12752,7 @@ def ranged_attack_values(g, attacker, target):
     if attacker.get("name") == RAMPANT:
         cells = rampant_line_cells(attacker, target["pos"])
         if cells is None or tuple(target["pos"]) not in cells:
-            raise ValueError("Le Rampant tire en ligne droite, jusqu'à 3 cases.")
+            raise ValueError("Le Rampant tire en ligne droite sur sa cible (portée 3).")
         values = dict(
             values,
             damage=RAMPANT_LINE_DAMAGE,
@@ -17776,6 +17785,48 @@ def render_board(g, view, readonly=False):
         return None
     return _lw_banner_previous_render_board(g, view, readonly)
 
+
+# ============================================================
+# RAMPANT : JAMAIS DE CORPS À CORPS
+# Il n'attaque que par son tir en ligne, une fois planté.
+# ============================================================
+
+_lw_ramp_previous_prepare_attack = prepare_attack
+
+
+def prepare_attack(g, attacker_ids, target_id):
+    for eid in attacker_ids:
+        if entity(g, eid)["name"] == RAMPANT:
+            raise ValueError(
+                "Le Rampant n'attaque pas au corps à corps : planté, il tire en ligne."
+            )
+    return _lw_ramp_previous_prepare_attack(g, attacker_ids, target_id)
+
+
+# ============================================================
+# UNITÉS DE CORPS À CORPS : PAS DE RIPOSTE CONTRE UN TIREUR
+# Une unité sans tir (Ravageur, Silencieux, Déferlant…) ne riposte pas
+# quand un tireur l'attaque, même au contact : seules les attaques au
+# corps à corps d'unités de mêlée entraînent sa riposte.
+# ============================================================
+
+def melee_only(piece):
+    return piece.get("kind") == "unit" and UNITS.get(piece.get("name"), {}).get("range", 0) <= 0
+
+
+_lw_shooter_previous_combat_values = combat_values
+
+
+def combat_values(attackers, target):
+    values = _lw_shooter_previous_combat_values(attackers, target)
+    if not (attackers and melee_only(target) and all(is_shooter(a) for a in attackers)):
+        return values
+    # Même traitement que les catapultes : aucune perte pour les tireurs.
+    values = dict(values, hidden=True, no_riposte=target["name"], losses=0.0)
+    if not values["winnable"]:
+        values["defender_damage"] = values["power"]
+        values["defender_remaining"] = values["defense"] - values["power"]
+    return values
 
 # ============================================================
 # PSEUDO OBLIGATOIRE
