@@ -5964,9 +5964,9 @@ def main():
             "Cases rouges : cible ennemie accessible · "  
             "Pièce grise : action déjà effectuée · "
             "Attente N : pièce disponible dans N fins de tour · "
-            "Numéros sur le plateau : actions du journal de bord · "
+            "Numéros sur le plateau : combats du journal de bord · "
             "Case rouge et « −N PF » : dégâts subis · "
-            "Contour jaune pointillé : pièce apparue"
+            "Rond vert : unité recrutée · Rond orange : bâtiment ou base construit"
         )  
   
     with st.container(key="lw_page_board"):  
@@ -16494,10 +16494,10 @@ def render_board(g, view, readonly=False):
         # L'IA a pu changer de tour pendant qu'elle jouait : on recale.
         ai_update_turn_marks(bundle)
         marks = ai_turn_marks_view(bundle)
-        if marks:
+        if marks and marks.get("new"):
             st.caption(
-                "🤖 Ce tour : 🟠 dernier déplacement (flèche depuis la case de départ) · "
-                "🟢 unités recrutées par l'IA · 🟡 bâtiments, bases ou héros construits."
+                "🤖 Ce tour : 🟢 unités recrutées par l'IA · "
+                "🟠 bâtiments, bases ou héros construits."
             )
     st.session_state["_lw_ai_marks"] = marks
     return _lw_marks_previous_render_board(g, view, readonly)

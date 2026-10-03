@@ -755,19 +755,20 @@
     function drawAiMark(group, piece, x, y) {
       const marks = args.ai_marks;
       if (!marks) return;
-      const moved = Object.prototype.hasOwnProperty.call(marks.moved || {}, String(piece.id));
-      const isNew = (marks.new || []).includes(piece.id);
-      if (!moved && !isNew) return;
-      const color = isNew ? (piece.kind === "unit" ? "#22c55e" : "#f59e0b") : "#f97316";
+      if (!(marks.new || []).includes(piece.id)) return;
+      drawNewMark(group, piece, x, y);
+    }
+
+    // Pièce apparue en production : rond vert (unité) ou orange (bâtiment, base).
+    function drawNewMark(group, piece, x, y) {
+      const color = piece.kind === "unit" && !piece.hero ? "#22c55e" : "#f59e0b";
       group.appendChild(svgNode("circle", {
         class: "ai-mark", cx: x, cy: y, r: IMAGE_RADIUS + 5, fill: "none", stroke: color,
-        "stroke-width": 5, "stroke-dasharray": isNew ? "none" : "9 5", opacity: 0.95, "pointer-events": "none",
+        "stroke-width": 5, opacity: 0.95, "pointer-events": "none",
       }));
-      if (isNew) {
-        const by = y + IMAGE_RADIUS + 8;
-        group.appendChild(svgNode("rect", { class: "ai-mark", x: x - 27, y: by - 8, width: 54, height: 15, rx: 7.5, fill: color, stroke: "#1c1917", "stroke-width": 1.4, "pointer-events": "none" }));
-        addText(group, x, by, "NOUVEAU", 8.5, "#1c1917");
-      }
+      const by = y + IMAGE_RADIUS + 8;
+      group.appendChild(svgNode("rect", { class: "ai-mark", x: x - 27, y: by - 8, width: 54, height: 15, rx: 7.5, fill: color, stroke: "#1c1917", "stroke-width": 1.4, "pointer-events": "none" }));
+      addText(group, x, by, "NOUVEAU", 8.5, "#1c1917");
     }
 
     function drawAiArrows() {
@@ -909,13 +910,7 @@
       for (const ev of fx.events) {
         if (pendingSeqs.has(ev.seq)) continue;  // marques après l'animation
         const ink = OWNER_INK[ev.faction] || "#dc2626";
-        for (const shot of ev.shots || []) {
-          arrowLine(lines, pt(shot.from), pt(shot.to), FX_COLORS[shot.kind] || ink, shot.kind !== "melee");
-        }
-        for (const move of ev.moves || []) {
-          if (move.from[0] === move.to[0] && move.from[1] === move.to[1]) continue;
-          arrowLine(lines, pt(move.from), pt(move.to), ink, true, 2.5);
-        }
+        // Pas de traits ni de flèches : seulement les effets des combats.
         for (const hit of ev.hits || []) {
           const k = keyOf(hit.pos[0], hit.pos[1]);
           if (!cells.has(k)) cells.set(k, { pos: hit.pos, damage: 0, heal: 0, destroyed: false, status: null });
@@ -926,9 +921,12 @@
           if (hit.status) cell.status = hit.status;
         }
         for (const pos of ev.spawns || []) {
-          const c = pt(pos);
-          lines.appendChild(svgNode("polygon", { points: hexPoints(c.x, c.y, SIZE - 4), fill: "none", stroke: "#facc15", "stroke-width": 3, "stroke-dasharray": "5 4", opacity: 0.9 }));
+          const piece = (args.entities || []).find(p => p.pos[0] === pos[0] && p.pos[1] === pos[1]);
+          const aiMarked = piece && args.ai_marks && (args.ai_marks.new || []).includes(piece.id);
+          if (piece && !aiMarked) { const c = pt(pos); drawNewMark(lines, piece, c.x, c.y); }
         }
+        // Numéro seulement pour les combats (dégâts, sorts) : pas pour les déplacements.
+        if (!(ev.hits || []).length && !(ev.shots || []).length) continue;
         // Numéro de l'action : sur la cible, sinon sur l'arrivée ou la pièce.
         const anchor = (ev.shots && ev.shots[0] && ev.shots[0].to) || (ev.moves && ev.moves[0] && ev.moves[0].to)
           || (ev.hits && ev.hits[0] && ev.hits[0].pos) || (ev.spawns && ev.spawns[0]) || (ev.auras && ev.auras[0] && ev.auras[0].pos);
@@ -1570,7 +1568,6 @@ if (reachable || placed) {
         "stroke-linecap": "round",
         "pointer-events": "none",
       }));
-      drawAiArrows();
       drawFxMarks();
       // Calque des animations : conservé d'un rendu à l'autre (une animation
       // en cours continue même si Streamlit redessine le plateau).
