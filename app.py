@@ -5963,10 +5963,8 @@ def main():
             # Fiche ouverte : elle prend la place du plateau, la partie est intacte.
             render_faction_sheet()
         elif finished and g["winner"] != -1:
-            # Écran de victoire à la place du plateau.
+            # Plateau final avec la banderole et l'image de fin de partie.
             render_victory_screen(g)
-            with st.expander("Voir le plateau final"):
-                render_board(g, view, readonly=True)
         else:
             render_board(g, view, readonly=finished)
         if st.session_state.get("ui_faction_view") not in FACTION_SHEETS:
@@ -9859,12 +9857,26 @@ VICTORY_IMAGE = Path(__file__).parent / "assets" / "victoire.jpg"
 
 
 @st.cache_data
-def victory_image_data():
+def _file_base64(path_text, modified):
+    """Fichier en base64, en cache. La date de modification fait partie de
+    la clé : une image remplacée est relue sans redémarrer le serveur."""
     import base64
     try:
-        return base64.b64encode(VICTORY_IMAGE.read_bytes()).decode("ascii")
+        return base64.b64encode(Path(path_text).read_bytes()).decode("ascii")
     except OSError:
         return None
+
+
+def file_base64(path):
+    try:
+        modified = Path(path).stat().st_mtime
+    except OSError:
+        return None
+    return _file_base64(str(path), modified)
+
+
+def victory_image_data():
+    return file_base64(VICTORY_IMAGE)
 
 
 # Image de victoire propre à chaque faction (image générique sinon).
@@ -9876,16 +9888,9 @@ FACTION_VICTORY_IMAGES = {
 }
 
 
-@st.cache_data
 def faction_victory_image_data(faction_name):
-    import base64
     filename = FACTION_VICTORY_IMAGES.get(faction_name)
-    if filename is None:
-        return None
-    try:
-        return base64.b64encode((VICTORY_IMAGE.parent / filename).read_bytes()).decode("ascii")
-    except OSError:
-        return None
+    return file_base64(VICTORY_IMAGE.parent / filename) if filename else None
 
 
 def render_victory_screen(g):
@@ -10335,13 +10340,8 @@ LOGO_HOME = Path(__file__).resolve().parent / "assets" / "logo_sans_texte.jpg"
 LOGO_TITLE = Path(__file__).resolve().parent / "assets" / "logo_titre.jpg"
 
 
-@st.cache_data
 def image_base64(path_text):
-    import base64
-    try:
-        return base64.b64encode(Path(path_text).read_bytes()).decode("ascii")
-    except OSError:
-        return None
+    return file_base64(path_text)
 
 
 def render_logo_header(home):
@@ -14304,13 +14304,8 @@ def render_sidebar(bundle):
 ABANDON_IMAGE = Path(__file__).parent / "assets" / "abandon.jpg"
 
 
-@st.cache_data
 def abandon_image_data():
-    import base64
-    try:
-        return base64.b64encode(ABANDON_IMAGE.read_bytes()).decode("ascii")
-    except OSError:
-        return None
+    return file_base64(ABANDON_IMAGE)
 
 
 def game_forfeiter(g):
@@ -17753,13 +17748,11 @@ def attack(g, attacker_ids, target_id, occupier_id=None, losses=None, *args, **k
 
 
 # ============================================================
-# FIN DE PARTIE : BANDEROLE SUR LE PLATEAU, PUIS IMAGE DE VICTOIRE
-# Pendant 5 secondes, le plateau final reste affiché avec une banderole
-# qui dit pourquoi la partie est gagnée ; ensuite l'image de victoire.
+# FIN DE PARTIE : BANDEROLE ET IMAGE SUR LE PLATEAU
+# Le plateau final reste affiché, avec une banderole qui dit pourquoi la
+# partie est gagnée et, juste en dessous, UNE image : celle de la faction
+# gagnante, ou celle de l'abandon. Elle reste jusqu'au retour à l'accueil.
 # ============================================================
-
-VICTORY_BANNER_SECONDS = 5
-
 
 def victory_banner_text(g):
     winner = g["winner"]
@@ -17774,56 +17767,32 @@ def victory_banner_text(g):
     return f"Fin du temps : les {faction} remportent la victoire avec {float(points):g} PV !"
 
 
-@st.fragment(run_every=1.0)
-def victory_banner_timer(deadline):
-    # Toutes les secondes : à l'échéance, la page passe à l'image de victoire.
-    if time.time() >= deadline:
-        st.rerun(scope="app")
-
-
-_lw_banner_previous_render_victory_screen = render_victory_screen
+def victory_image_uri(g):
+    """L'image de fin : abandon, sinon celle de la faction gagnante."""
+    if game_forfeiter(g) is not None:
+        image = abandon_image_data()
+    else:
+        image = faction_victory_image_data(faction_of(g, g["winner"])["name"]) or victory_image_data()
+    return f"data:image/jpeg;base64,{image}" if image else None
 
 
 def render_victory_screen(g):
-    bundle = st.session_state.get("bundle") or {}
-    key = f"{bundle.get('game_id') or st.query_params.get('room') or ''}:{g['winner']}"
-    seen = st.session_state.setdefault("lw_victory_seen", {})
-    started = seen.setdefault(key, time.time())
-    deadline = started + VICTORY_BANNER_SECONDS
-    if time.time() >= deadline:
-        return _lw_banner_previous_render_victory_screen(g)
-
-    st.session_state["_lw_victory_banner"] = {"text": victory_banner_text(g), "faction": faction_id(g, g["winner"])}
+    st.session_state["_lw_victory_banner"] = {
+        "text": victory_banner_text(g),
+        "faction": faction_id(g, g["winner"]),
+        "image": victory_image_uri(g),
+    }
     try:
         render_board(g, g, readonly=True)
     finally:
         st.session_state.pop("_lw_victory_banner", None)
-    if game_forfeiter(g) is not None:
-        # Abandon : l'image d'abandon, bien cadrée, sous la banderole.
-        _lw_banner_previous_render_victory_screen(g)
-    victory_banner_timer(deadline)
-
-
-def victory_banner_active(g):
-    """Vrai pendant les secondes de banderole de cette partie."""
-    if g.get("winner") not in (0, 1):
-        return False
-    bundle = st.session_state.get("bundle") or {}
-    key = f"{bundle.get('game_id') or st.query_params.get('room') or ''}:{g['winner']}"
-    started = st.session_state.get("lw_victory_seen", {}).get(key)
-    return started is not None and time.time() < started + VICTORY_BANNER_SECONDS
-
-
-_lw_banner_previous_render_board = render_board
-
-
-def render_board(g, view, readonly=False):
-    # Pendant la banderole, seul le plateau qui la porte est affiché
-    # (pas de second plateau « final » avec la même clé).
-    if victory_banner_active(g) and not st.session_state.get("_lw_victory_banner"):
-        st.caption("Le plateau final est affiché ci-dessus.")
-        return None
-    return _lw_banner_previous_render_board(g, view, readonly)
+    # Résultat ajouté au profil du joueur (une seule fois par partie).
+    bundle = st.session_state.get("bundle")
+    if isinstance(bundle, dict) and isinstance(bundle.get("game"), dict) and bundle["game"].get("winner") is not None:
+        before = list(bundle.get("stats_recorded", []))
+        record_finished_game(bundle)
+        if bundle.get("stats_recorded", []) != before and current_player_name():
+            st.caption(f"📊 Résultat enregistré dans le profil de {current_player_name()}.")
 
 
 # ============================================================

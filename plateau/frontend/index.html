@@ -1505,10 +1505,10 @@
       if (!banner || !banner.text) return;
       const colors = FACTION_COLORS[banner.faction] || FACTION_COLORS[0];
       const layer = svgNode("g", { class: "victory-banner", "pointer-events": "none" });
-      const width = baseW * 0.84, height = Math.max(90, baseH * 0.13);
-      const x = (baseW - width) / 2, y = baseH * 0.42 - height / 2;
-      // Voile sombre sur le plateau, puis le ruban et ses deux queues.
-      layer.appendChild(svgNode("rect", { x: 0, y: 0, width: baseW, height: baseH, fill: "#000000", opacity: 0.35 }));
+      // Banderole en haut du plateau, l'image de fin de partie juste dessous.
+      const width = baseW * 0.84, height = Math.max(80, baseH * 0.11);
+      const x = (baseW - width) / 2, y = baseH * 0.05;
+      layer.appendChild(svgNode("rect", { x: 0, y: 0, width: baseW, height: baseH, fill: "#000000", opacity: 0.45 }));
       const tail = height * 0.55;
       layer.appendChild(svgNode("polygon", { points: `${x - tail},${y + height * 0.25} ${x + 10},${y + height * 0.25} ${x + 10},${y + height * 1.1} ${x - tail},${y + height * 1.1} ${x - tail * 0.6},${y + height * 0.68}`, fill: colors.stroke, stroke: "#facc15", "stroke-width": 3 }));
       layer.appendChild(svgNode("polygon", { points: `${x + width + tail},${y + height * 0.25} ${x + width - 10},${y + height * 0.25} ${x + width - 10},${y + height * 1.1} ${x + width + tail},${y + height * 1.1} ${x + width + tail * 0.6},${y + height * 0.68}`, fill: colors.stroke, stroke: "#facc15", "stroke-width": 3 }));
@@ -1520,13 +1520,21 @@
         x: baseW / 2, y: y + height / 2 + 2, "text-anchor": "middle", "dominant-baseline": "middle",
         "font-size": size, "font-weight": 900, fill: "#ffffff", stroke: "rgba(0,0,0,0.75)", "stroke-width": 5, "paint-order": "stroke",
       }, label));
+      if (banner.image) {
+        // Image carrée, entière, bordée d'or, centrée sous la banderole.
+        const top = y + height + baseH * 0.04;
+        const side = Math.min(baseH - top - baseH * 0.04, baseW * 0.6);
+        const ix = (baseW - side) / 2;
+        const clipId = "victory-image-clip";
+        const defs = svgNode("defs", {});
+        const clip = svgNode("clipPath", { id: clipId });
+        clip.appendChild(svgNode("rect", { x: ix, y: top, width: side, height: side, rx: 16 }));
+        defs.appendChild(clip);
+        layer.appendChild(defs);
+        layer.appendChild(svgNode("rect", { x: ix - 8, y: top - 8, width: side + 16, height: side + 16, rx: 20, fill: "#16110d", stroke: "#b8913f", "stroke-width": 4 }));
+        layer.appendChild(svgNode("image", { href: banner.image, x: ix, y: top, width: side, height: side, preserveAspectRatio: "xMidYMid slice", "clip-path": `url(#${clipId})` }));
+      }
       board.appendChild(layer);
-      // Apparition : le ruban se déploie depuis le centre.
-      tween(700, t => {
-        const s = 0.6 + 0.4 * easeOut(t);
-        layer.setAttribute("transform", `translate(${baseW / 2},${baseH * 0.42}) scale(${s}) translate(${-baseW / 2},${-baseH * 0.42})`);
-        layer.setAttribute("opacity", String(Math.min(1, t * 1.6)));
-      });
     }
 
     function render(newArgs) {
@@ -1732,9 +1740,13 @@ if (reachable || placed) {
       drawHarvest();
       drawCellCosts();
       board.appendChild(fxLayer);
-      drawVictoryBanner();
-      animateLastMove();
-      queueFx();
+      if (args.banner) {
+        // Fin de partie : rien ne passe par-dessus la banderole et l'image.
+        drawVictoryBanner();
+      } else {
+        animateLastMove();
+        queueFx();
+      }
       wrapper.scrollLeft = previousScrollLeft;
       wrapper.scrollTop = previousScrollTop;
       requestAnimationFrame(resizeFrame);
