@@ -14336,10 +14336,10 @@ def render_victory_screen(g):
     )
     st.markdown(
         f"""
-        <div style="position: relative; width: min(100%, 760px); margin: 0 auto;
-                    aspect-ratio: 4 / 3;
-                    border-radius: 14px; overflow: hidden;
-                    background: url('data:image/jpeg;base64,{image}') center 45% / cover no-repeat;
+        <div style="position: relative; width: min(100%, 620px); margin: 0 auto;
+                    aspect-ratio: 1 / 1;
+                    border-radius: 14px; overflow: hidden; border: 2px solid #b8913f;
+                    background: url('data:image/jpeg;base64,{image}') center / cover no-repeat;
                     box-shadow: 0 8px 28px #00000066;">
           <div style="position: absolute; inset: 0;
                       background: linear-gradient(180deg, #00000099 0%, #00000022 45%, #00000000 70%);"></div>
@@ -17754,11 +17754,11 @@ def attack(g, attacker_ids, target_id, occupier_id=None, losses=None, *args, **k
 
 # ============================================================
 # FIN DE PARTIE : BANDEROLE SUR LE PLATEAU, PUIS IMAGE DE VICTOIRE
-# Pendant 10 secondes, le plateau final reste affiché avec une banderole
+# Pendant 5 secondes, le plateau final reste affiché avec une banderole
 # qui dit pourquoi la partie est gagnée ; ensuite l'image de victoire.
 # ============================================================
 
-VICTORY_BANNER_SECONDS = 10
+VICTORY_BANNER_SECONDS = 5
 
 
 def victory_banner_text(g):
@@ -17798,11 +17798,14 @@ def render_victory_screen(g):
         render_board(g, g, readonly=True)
     finally:
         st.session_state.pop("_lw_victory_banner", None)
+    if game_forfeiter(g) is not None:
+        # Abandon : l'image d'abandon, bien cadrée, sous la banderole.
+        _lw_banner_previous_render_victory_screen(g)
     victory_banner_timer(deadline)
 
 
 def victory_banner_active(g):
-    """Vrai pendant les 10 secondes de banderole de cette partie."""
+    """Vrai pendant les secondes de banderole de cette partie."""
     if g.get("winner") not in (0, 1):
         return False
     bundle = st.session_state.get("bundle") or {}
