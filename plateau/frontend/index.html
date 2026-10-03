@@ -895,9 +895,29 @@
       layer.appendChild(svgNode("polygon", { points: head, fill: color, opacity: 0.95 }));
     }
 
+    // Morts du dernier tour : case rouge et croix, effacées au tour suivant.
+    function drawDeaths(layer) {
+      const seen = new Set();
+      for (const death of (args.fx && args.fx.deaths) || []) {
+        if (pendingSeqs.has(death.seq)) continue;  // après l'animation
+        const k = keyOf(death.pos[0], death.pos[1]);
+        if (seen.has(k)) continue;
+        seen.add(k);
+        const c = pt(death.pos);
+        layer.appendChild(svgNode("polygon", { points: hexPoints(c.x, c.y, SIZE - 2), fill: "#ef4444", "fill-opacity": 0.22, stroke: "#dc2626", "stroke-width": 4 }));
+        const r = 15;
+        layer.appendChild(svgNode("path", { d: `M${c.x - r} ${c.y - r} L${c.x + r} ${c.y + r} M${c.x + r} ${c.y - r} L${c.x - r} ${c.y + r}`, stroke: "#dc2626", "stroke-width": 6, "stroke-linecap": "round", opacity: 0.75 }));
+      }
+      return seen;
+    }
+
     function drawFxMarks() {
       const fx = args.fx;
-      if (!fx || !fx.events || !fx.events.length) return;
+      if (!fx) return;
+      const deathLayer = svgNode("g", { class: "fx-marks", "pointer-events": "none" });
+      const deathCells = drawDeaths(deathLayer);
+      board.appendChild(deathLayer);
+      if (!fx.events || !fx.events.length) return;
       const lines = svgNode("g", { class: "fx-marks", "pointer-events": "none" });
       const cells = new Map();
       const numbers = new Map();
@@ -934,14 +954,10 @@
       const badges = svgNode("g", { class: "fx-badges", "pointer-events": "none" });
       cells.forEach(cell => {
         const c = pt(cell.pos);
-        if (cell.damage > 0) {
+        // Case rouge pour une pièce touchée ; une pièce morte a déjà sa
+        // case rouge et sa croix (drawDeaths), qui restent un tour.
+        if (cell.damage > 0 && !deathCells.has(keyOf(cell.pos[0], cell.pos[1]))) {
           badges.appendChild(svgNode("polygon", { points: hexPoints(c.x, c.y, SIZE - 2), fill: "#ef4444", "fill-opacity": 0.22, stroke: "#dc2626", "stroke-width": 4 }));
-
-          if (cell.destroyed) {
-            // Pièce détruite : grande croix rouge sur la case.
-            const r = 15;
-            badges.appendChild(svgNode("path", { d: `M${c.x - r} ${c.y - r} L${c.x + r} ${c.y + r} M${c.x + r} ${c.y - r} L${c.x - r} ${c.y + r}`, stroke: "#dc2626", "stroke-width": 6, "stroke-linecap": "round", opacity: 0.75 }));
-          }
         }
         // PF sur une seule ligne, à gauche de la pièce : rouge = infligés
         // par l'attaquant, orange = infligés par le défenseur (riposte).

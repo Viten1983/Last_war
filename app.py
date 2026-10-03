@@ -17410,7 +17410,29 @@ def fx_board_payload(bundle, g, viewer, recent):
             "auras": e.get("auras", []), "text": e.get("text", ""),
         })
     game_id = (bundle or {}).get("game_id") or (bundle or {}).get("code") or ""
-    return {"events": events, "viewer": viewer, "game": str(game_id)}
+    return {
+        "events": events, "viewer": viewer, "game": str(game_id),
+        "deaths": fx_deaths(g),
+    }
+
+
+def fx_phase_index(round_number, phase):
+    return 2 * int(round_number) + (1 if phase == "move" else 0)
+
+
+def fx_deaths(g):
+    """Cases où une pièce est morte, montrées pendant un tour complet :
+    une mort en manœuvres du tour N reste jusqu'à la fin des manœuvres
+    du tour N+1, puis s'efface."""
+    now = fx_phase_index(g["turn"], g["phase"])
+    deaths = []
+    for e in g.get("journal") or []:
+        if now - fx_phase_index(e.get("round", 0), e.get("phase")) > 2:
+            continue
+        for hit in e.get("hits") or []:
+            if hit.get("destroyed"):
+                deaths.append({"pos": hit["pos"], "seq": e["seq"]})
+    return deaths
 
 
 def fx_color_pf(text, css):
@@ -17520,7 +17542,8 @@ def render_board(g, view, readonly=False):
     viewer = fx_viewer(bundle, g)
     recent = fx_recent(g, viewer)
     render_journal(bundle, g, viewer, recent)
-    st.session_state["_lw_fx"] = fx_board_payload(bundle, g, viewer, recent) if recent else None
+    payload = fx_board_payload(bundle, g, viewer, recent)
+    st.session_state["_lw_fx"] = payload if recent or payload["deaths"] else None
     return _lw_fx_previous_render_board(g, view, readonly)
 
 
