@@ -17420,7 +17420,9 @@ def fx_color_pf(text, css):
         if t.startswith("−") or (t.startswith("+") and t[1:2].isdigit())
     }
     for token in sorted(tokens, key=len, reverse=True):
-        text = text.replace(token, f'<b class="{css}">{token}</b>')
+        # PF regagnés (sorts de soutien) : toujours en vert.
+        token_css = "lw-j-gain" if token.startswith("+") else css
+        text = text.replace(token, f'<b class="{token_css}">{token}</b>')
     return text.replace("détruit", f'<b class="{css}">détruit</b>')
 
 
@@ -17438,12 +17440,12 @@ def render_journal(bundle, g, viewer, recent):
             f'<span class="lw-j-num" style="background:{color}">{number}</span>'
             if number is not None else '<span class="lw-j-num lw-j-old"></span>'
         )
-        # En vert : ce que l'attaquant inflige ; en rouge : ce que le défenseur
-        # lui inflige en retour (après « pertes : »).
+        # En rouge : ce que l'attaquant inflige ; en orange : ce que le défenseur
+        # lui inflige en riposte (après « pertes : »).
         dealt, _, taken = e.get("text", "").partition(" · pertes : ")
-        text = fx_color_pf(escape(dealt), "lw-j-gain")
+        text = fx_color_pf(escape(dealt), "lw-j-loss")
         if taken:
-            text += " · pertes : " + fx_color_pf(escape(taken), "lw-j-loss")
+            text += " · pertes : " + fx_color_pf(escape(taken), "lw-j-riposte")
         return (
             f'<div class="lw-j-line{" lw-j-fresh" if fresh else ""}" style="border-left-color:{color}">'
             f'{badge}<span class="lw-j-turn">T{escape(str(e.get("turn", "")))}</span>'
@@ -17472,6 +17474,7 @@ def render_journal(bundle, g, viewer, recent):
     .lw-j-text { flex: 1 1 auto; }
     .lw-j-loss { color: #dc2626; }
     .lw-j-gain { color: #15803d; }
+    .lw-j-riposte { color: #ea580c; }
     .lw-j-new { flex: 0 0 auto; background: #ea580c; color: #fff; font-size: 10px; font-weight: 800;
                 padding: 1px 6px; border-radius: 8px; align-self: center; }
     .lw-j-empty { color: #78716c; font-size: 13px; }
@@ -17482,6 +17485,7 @@ def render_journal(bundle, g, viewer, recent):
       .lw-j-fresh { background: #431407; box-shadow: inset 0 0 0 1px #9a3412; }
       .lw-j-loss { color: #f87171; }
       .lw-j-gain { color: #4ade80; }
+      .lw-j-riposte { color: #fb923c; }
     }
     </style>
     """

@@ -943,17 +943,15 @@
             badges.appendChild(svgNode("path", { d: `M${c.x - r} ${c.y - r} L${c.x + r} ${c.y + r} M${c.x + r} ${c.y - r} L${c.x - r} ${c.y + r}`, stroke: "#dc2626", "stroke-width": 6, "stroke-linecap": "round", opacity: 0.75 }));
           }
         }
-        // PF au-dessus de la pièce : vert = infligés par l'attaquant,
-        // rouge = infligés par le défenseur (riposte).
-        cell.labels.forEach((label, i) => {
-          pfText(badges, c.x, c.y - SIZE * 0.9 - i * 17, label.text, label.color);
-        });
+        // PF sur une seule ligne, à gauche de la pièce : rouge = infligés
+        // par l'attaquant, orange = infligés par le défenseur (riposte).
+        if (cell.labels.length) pfLine(badges, c.x - IMAGE_RADIUS - 5, c.y, cell.labels);
       });
       numbers.forEach((list, k) => {
         const [q, r] = k.split(",").map(Number);
         const c = center(q, r);
-        // À gauche de la pièce, empilés vers le bas si plusieurs actions.
-        list.forEach((item, i) => numberBadge(badges, c.x - SIZE * 0.92, c.y - 12 + i * 23, item.n, item.ink));
+        // Coin haut gauche de la case (la gauche de la pièce porte les PF).
+        list.forEach((item, i) => numberBadge(badges, c.x - SIZE * 0.62 + i * 23, c.y - SIZE * 0.78, item.n, item.ink));
       });
       board.appendChild(lines);
       board.appendChild(badges);
@@ -1144,17 +1142,23 @@
       else { dust(c, 0.8); }
     }
 
-    const PF_DEALT = "#16a34a";     // PF infligés par l'attaquant
-    const PF_TAKEN = "#dc2626";     // PF infligés par le défenseur
+    const PF_DEALT = "#dc2626";     // PF infligés par l'attaquant : rouge
+    const PF_TAKEN = "#ea580c";     // PF infligés en riposte par le défenseur : orange
+    const PF_HEAL = "#16a34a";      // PF regagnés (sorts de soutien)
     function pfNumber(value) { return String(Math.round(value * 10) / 10).replace(".", ","); }
     function hitLabel(hit, ev) {
       if (hit.damage) return { text: `−${pfNumber(hit.damage)} PF`, color: hit.owner === ev.owner ? PF_TAKEN : PF_DEALT };
-      if (hit.heal) return { text: `+${pfNumber(hit.heal)} PF`, color: PF_DEALT };
+      if (hit.heal) return { text: `+${pfNumber(hit.heal)} PF`, color: PF_HEAL };
       if (hit.status) return { text: hit.status, color: "#0369a1" };
       return null;
     }
-    function pfText(layer, x, y, text, color) {
-      layer.appendChild(svgNode("text", { x, y, "text-anchor": "middle", "dominant-baseline": "middle", "font-size": 15, "font-weight": 900, fill: color, stroke: "#ffffff", "stroke-width": 4, "paint-order": "stroke" }, text));
+    // Une ligne de PF alignée à droite sur xEnd (chaque valeur dans sa couleur).
+    function pfLine(layer, xEnd, y, labels) {
+      const text = svgNode("text", { x: xEnd, y, "text-anchor": "end", "dominant-baseline": "middle", "font-size": 14, "font-weight": 900, stroke: "#ffffff", "stroke-width": 4, "paint-order": "stroke" });
+      labels.forEach((label, i) => {
+        text.appendChild(svgNode("tspan", { fill: label.color }, (i ? " " : "") + label.text));
+      });
+      layer.appendChild(text);
     }
 
     function hitTexts(ev) {
