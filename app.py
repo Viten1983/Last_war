@@ -648,6 +648,7 @@ Prototype âge I : Déferlants contre Exilés.
 - Les unités, bases et bâtiments alliés peuvent être traversés (chaque case traversée compte comme un déplacement), mais pas occupés à l'arrivée.
 - Un tir subit une riposte égale aux PF de la cible (au contact, c'est un corps à corps).
 - Une unité invisible non détectée attaque sans subir de riposte.
+- Pile d'ouvriers (1 à 3 sur une case) : au corps à corps, ils se défendent ensemble avec leurs PF cumulés ; une attaque victorieuse les détruit tous d'un coup, l'attaquant perd ce total et prend la case.
 - La Catapulte et la Catapulte de l'enfer ne ripostent jamais (ni au corps à corps, ni aux tirs). Seul le Trébuchet tire automatiquement sur les unités qui traversent sa zone.
 - Bâtiment technique (Bassin de mutation, Marché, Forge) : seulement en J5 pour le joueur du haut, P12 pour celui du bas.
 - Vagabonds : 3 héros mobiles servent de bases ; ils bougent, produisent et attaquent pendant la production (attaque immédiate, sans riposte ; l'adversaire la voit au dévoilement). Détruire 3 héros fait gagner.
@@ -17490,6 +17491,82 @@ def ai_autoplay():
             f"🤖 {faction_of(g, config['seat'])['name']} (IA) a joué {len(done)} action(s) : "
             "détail ligne par ligne dans le journal de bord, au-dessus du plateau."
         )
+
+
+# ============================================================
+# PILE D'OUVRIERS : UN SEUL DÉFENSEUR
+# Au corps à corps, les 1 à 3 ouvriers d'une case se défendent ensemble :
+# défense = somme de leurs PF. Si l'attaque l'emporte, tous les ouvriers
+# meurent d'un coup, l'attaquant perd cette somme et prend la case.
+# Sinon, les dégâts tuent les ouvriers un par un (la cible d'abord).
+# (Les tirs, eux, visent toujours un seul ouvrier.)
+# ============================================================
+
+def worker_stack_mates(g, target):
+    """Les autres ouvriers de la pile de la cible (liste vide si seul)."""
+    if g is None or target.get("name") != WORKER or not any(e is target for e in g["entities"]):
+        return []
+    pieces = pieces_at(g, tuple(target["pos"]))
+    if len(pieces) < 2 or not is_worker_stack(g, pieces):
+        return []
+    return [p for p in pieces if p is not target]
+
+
+_lw_stack_previous_combat_values = combat_values
+
+
+def combat_values(attackers, target):
+    mates = worker_stack_mates(_LW_COMBAT_GAME, target)
+    if mates:
+        total = float(target["pf"]) + sum(float(m["pf"]) for m in mates)
+        target = dict(target, pf=total)
+    return _lw_stack_previous_combat_values(attackers, target)
+
+
+_lw_stack_previous_attack = attack
+
+
+def attack(g, attacker_ids, target_id, occupier_id=None, losses=None, *args, **kwargs):
+    target = entity(g, target_id)
+    mates = worker_stack_mates(g, target)
+    if not mates:
+        return _lw_stack_previous_attack(g, attacker_ids, target_id, occupier_id, losses, *args, **kwargs)
+
+    owner = g["active"]
+    workers = [target] + mates
+    original = {w["id"]: float(w["pf"]) for w in workers}
+    total = sum(original.values())
+    # Le combat se joue contre un seul défenseur qui porte toute la pile.
+    g["entities"] = [e for e in g["entities"] if all(e is not m for m in mates)]
+    target["pf"] = total
+    try:
+        _lw_stack_previous_attack(g, attacker_ids, target_id, occupier_id, losses, *args, **kwargs)
+    except Exception:
+        target["pf"] = original[target["id"]]
+        g["entities"].extend(mates)
+        raise
+
+    survived = any(e is target for e in g["entities"])
+    damage = total - (float(target["pf"]) if survived else 0.0)
+    if not survived:
+        # Victoire : toute la pile tombe d'un coup.
+        for mate in mates:
+            g["entities"].append(mate)
+            destroy(g, mate, owner)
+        log(g, f"Les {len(workers)} ouvriers de la case sont détruits d'un coup.")
+        return
+
+    # Défaite ou attaque invisible : dégâts répartis ouvrier par ouvrier.
+    remaining = damage
+    target["pf"] = original[target["id"]]
+    g["entities"].extend(mates)
+    for worker in workers:
+        hit = min(float(worker["pf"]), remaining)
+        worker["pf"] = float(worker["pf"]) - hit
+        remaining -= hit
+    for worker in workers:
+        if worker["pf"] <= 0 and any(e is worker for e in g["entities"]):
+            destroy(g, worker, owner)
 
 
 # ============================================================
