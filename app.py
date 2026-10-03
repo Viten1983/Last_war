@@ -14367,12 +14367,15 @@ AI_LEVELS = {
     "debutant": "🟢 Débutant",
     "intermediaire": "🟠 Intermédiaire",
     "expert": "🔴 Expert",
+    "sanguinaire": "💀 Destructeur sanguinaire",
 }
 
 AI_LEVEL_TEXT = {
     "debutant": "Débutant : joue simplement mais jamais au hasard, dépense au moins 75 % de ses ressources.",
     "intermediaire": "Intermédiaire : dépense au moins 90 %, voit venir tes attaques, se défend et attaque bien.",
     "expert": "Expert : dépense tout (sauf pour changer d'âge), anticipe sur 2 tours et attaque sans relâche.",
+    "sanguinaire": "Destructeur sanguinaire : joue comme l'Expert mais ne pense qu'à détruire. "
+                   "Il fonce sur tes bases, accepte de sacrifier ses unités et frappe à chaque occasion.",
 }
 
 AI_PARAMS = {
@@ -14402,6 +14405,21 @@ AI_PARAMS = {
         "advance": 26.0, "danger": 0.15, "threat_turns": 2, "defend": 0.6,
         "groups": True, "replies": 3, "top": 4, "base_bonus": 3500.0,
         "front": True,
+    },
+    # Comme l'Expert (anticipation sur 2 tours, économie complète), mais très
+    # très agressif : il vise les bases ennemies, craint peu les menaces et
+    # accepte les échanges, même défavorables : il attaque sans cesse.
+    "sanguinaire": {
+        "spend": 1.0, "save_for_age": True, "age_from": {2: 3, 3: 6},
+        "building_goal": "limit", "fast_build_at": 800, "eco_colonies": True,
+        "upgrade_min": 150, "decisive_upgrades": True, "unit_rule": "tier",
+        "advance": 33.0, "danger": 0.1, "threat_turns": 2, "defend": 0.5,
+        "groups": True, "replies": 3, "top": 4, "base_bonus": 8000.0,
+        "front": True,
+        # Agressivité (réglée sur des parties contre l'Expert : près de deux
+        # fois plus d'attaques) : ses pertes comptent pour 60 %, il craint
+        # moins les ripostes à venir et chaque attaque reçoit une prime.
+        "own_value": 0.6, "anticipate_weight": 0.35, "attack_drive": 300.0,
     },
 }
 
@@ -14516,9 +14534,10 @@ def ai_material(g, me, P):
             return 1e7
         return 0.0 if g["winner"] == -1 else -1e7
     score = 0.0
+    own_value = P.get("own_value", 1.0)
     for e in g["entities"]:
         if e["owner"] == me:
-            score += ai_piece_value(g, e)
+            score += ai_piece_value(g, e) * own_value
         elif visible_to_player(g, e, me):
             score -= ai_piece_value(g, e)
     for owner in (0, 1):
@@ -14873,7 +14892,8 @@ def ai_anticipate(g, me, options, P):
             continue
         baseline = ai_exchange(now, me, P, plies, near)
         future = ai_exchange(after, me, P, plies, near)
-        checked.append((gain + AI_ANTICIPATE_WEIGHT * (future - baseline), after, move))
+        weight = P.get("anticipate_weight", AI_ANTICIPATE_WEIGHT)
+        checked.append((gain + weight * (future - baseline), after, move))
     checked.sort(key=lambda item: -item[0])
     return checked + options[top:]
 
@@ -14923,7 +14943,8 @@ def ai_move_step(bundle, me, level):
         after = ai_simulate(g, fn, *args)
         if after is None:
             continue
-        gain = gain_of(after)
+        # Prime à l'attaque (niveau agressif) : frapper plutôt que se replacer.
+        gain = gain_of(after) + P.get("attack_drive", 0.0)
         if P.get("first_attack") and gain > 0:
             # Débutant : il prend la première attaque gagnante, sans comparer.
             bundle["game"] = ai_restore_log(g, after)
@@ -15821,7 +15842,7 @@ def ai_next_age_cost(g, me):
     return gold, mana
 
 
-AI_VAGABOND_AGE_II = {"debutant": 3, "intermediaire": 2, "expert": 2}
+AI_VAGABOND_AGE_II = {"debutant": 3, "intermediaire": 2, "expert": 2, "sanguinaire": 2}
 
 
 def ai_level_name(P):
