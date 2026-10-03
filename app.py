@@ -649,6 +649,7 @@ Prototype âge I : Déferlants contre Exilés.
 - Un tir subit une riposte égale aux PF de la cible (au contact, c'est un corps à corps).
 - Une unité de corps à corps (sans tir) ne riposte jamais contre un tireur, même au contact.
 - Armes de siège (Catapulte, Trébuchet, Catapulte de l'enfer, Golem de pierre) : jamais de riposte contre elles.
+- Vagabonds : une unité ennemie qui passe sur la case du marqueur d'un héros le détruit ; le héros ne récolte plus jusqu'à ce qu'il traverse une autre case d'or ou de mana.
 - Catapulte, Trébuchet, Catapulte de l'enfer, Golem de pierre et Rampant ne peuvent pas viser les unités volantes, et leurs dégâts de zone ne les touchent pas.
 - Une unité invisible non détectée attaque sans subir de riposte.
 - Pile d'ouvriers (1 à 3 sur une case) : au corps à corps, ils se défendent ensemble avec leurs PF cumulés ; une attaque victorieuse les détruit tous d'un coup, l'attaquant perd ce total et prend la case.
@@ -4462,6 +4463,7 @@ def render_board(g, view, readonly=False):
         fx=st.session_state.get("_lw_fx"),
         banner=st.session_state.get("_lw_victory_banner"),
         cell_costs=st.session_state.get("_lw_cell_costs"),
+        phase_banner=st.session_state.get("_lw_phase_banner"),
         key=f"board_component_{st.session_state.ui_board_key}",
         default=None,
     )
@@ -5495,9 +5497,8 @@ def render_scores(g, view):
                 and not finished  
             )  
   
-            hidden = private_phase and (  
-                g["curtain"] or owner != g["active"]  
-            )  
+            # Chaque joueur ne voit que sa propre trésorerie, jamais l'adverse.
+            hidden = g["curtain"] or owner != treasury_viewer(g)
   
             if hidden:  
                 st.caption("Trésorerie masquée.")  
@@ -8222,7 +8223,7 @@ UPGRADES.update({
     "Marteau foudroyant": {
         "owner": DERNIERS_NES, "cost": 150, "mana": 0,
         "building": "Forge", "age": 1,
-        "effect": "+0,5 PF pour les attaques des Guerriers.",
+        "effect": "+0,5 PF pour les Guerriers (2 → 2,5 PF), y compris ceux déjà en jeu.",
     },
     "Esquive": {
         "owner": DERNIERS_NES, "cost": 150, "mana": 0,
@@ -8281,7 +8282,7 @@ AGE_REFERENCE["Derniers nés"] = {
         ("Guerrier", "200 or · 2 PF · 3 cases · touche 2 cases (ennemis)"),
         ("Éclaireur", "250 or · 1,5 PF · 7 cases · ×4 · sabote une base ennemie"),
         ("Forge", "Bâtiment technique · 200 or · améliorations"),
-        ("Marteau foudroyant", "150 or · +0,5 PF aux attaques des Guerriers"),
+        ("Marteau foudroyant", "150 or · Guerriers : 2 → 2,5 PF"),
         ("Esquive", "150 or · l'Éclaireur traverse les ennemis"),
     ],
     2: [
@@ -13202,6 +13203,7 @@ def new_online_room():
         "factions": {0: DEFERLANTS, 1: EXILES},
         "victory_mode": "time",
         "minutes": 60,
+        "turn_seconds": ONLINE_TURN_SECONDS,
         "ready": {0: False, 1: False},
         "status": "lobby",
         "bundle": None,
@@ -13337,12 +13339,12 @@ def online_sync(room, seat, publish=True):
                 room["prod_turn"] = g["turn"]
                 room["prod_started"] = now
                 room["prod_ready"] = {0: False, 1: False}
-            late = now - room["prod_started"] > ONLINE_TURN_SECONDS
+            late = now - room["prod_started"] > online_turn_seconds(room)
             if all(room["prod_ready"].values()) or late:
                 online_merge_productions(room)
             return
 
-        # Manœuvres : 3 min cumulées par joueur.
+        # Manœuvres : temps cumulé par joueur (réglé par l'hôte).
         clock = room["move_clock"]
         if clock is None or clock["turn"] != g["turn"]:
             room["move_used"] = {0: 0.0, 1: 0.0}
@@ -13352,7 +13354,7 @@ def online_sync(room, seat, publish=True):
             clock["active"], clock["since"] = g["active"], now
         active = g["active"]
         spent = room["move_used"][active] + now - clock["since"]
-        if spent > ONLINE_TURN_SECONDS and active not in g["passed"]:
+        if spent > online_turn_seconds(room) and active not in g["passed"]:
             bundle = copy.deepcopy(room["bundle"])
             try:
                 pass_turn(bundle["game"])
@@ -13367,10 +13369,10 @@ def online_time_left(room, seat):
     g = room["bundle"]["game"]
     now = time.time()
     if g["phase"] == "build":
-        return max(0, ONLINE_TURN_SECONDS - (now - (room["prod_started"] or now)))
+        return max(0, online_turn_seconds(room) - (now - (room["prod_started"] or now)))
     clock = room["move_clock"] or {"active": g["active"], "since": now}
     spent = room["move_used"][seat] + (now - clock["since"] if clock["active"] == seat else 0)
-    return max(0, ONLINE_TURN_SECONDS - spent)
+    return max(0, online_turn_seconds(room) - spent)
 
 
 @st.fragment(run_every=2)
@@ -13393,7 +13395,7 @@ def online_poll():
             who = "À toi de manœuvrer"
         else:
             who = "Manœuvres de l'adversaire"
-        st.caption(f"🌐 {who} · ⏱️ {left // 60}:{left % 60:02d} restantes (3 min par joueur et par phase)")
+        st.caption(f"🌐 {who} · ⏱️ {left // 60}:{left % 60:02d} restantes ({online_turn_label(room)} par joueur et par phase)")
 
 
 # ------------------------------------------------------------
@@ -13514,10 +13516,20 @@ def render_online_lobby(room, seat):
             with online_lock():
                 room["victory_mode"], room["minutes"] = mode, minutes
                 room["version"] += 1
+        think = st.number_input(
+            "⏱️ Temps de réflexion (minutes par joueur et par phase)",
+            min_value=1, max_value=30, value=int(online_turn_seconds(room) // 60), step=1,
+            disabled=locked, key="lobby_turn_minutes",
+        )
+        if int(think) * 60 != online_turn_seconds(room) and not locked:
+            with online_lock():
+                room["turn_seconds"] = int(think) * 60
+                room["version"] += 1
     else:
         st.caption(
             f"Réglages de l'hôte : {VICTORY_MODES[room['victory_mode']]}"
             + (f" · {room['minutes']} min" if room["victory_mode"] == "time" else "")
+            + f" · réflexion : {online_turn_label(room)} par joueur et par phase"
         )
 
     st.divider()
@@ -13572,7 +13584,7 @@ def render_online_waiting(room, seat):
     render_logo_header(home=False)
     g = room["bundle"]["game"]
     st.subheader(f"Tour {turn_label(g)} — Production validée")
-    st.info("⏳ Ta production est validée. En attente de l'adversaire (3 min maximum)…")
+    st.info(f"⏳ Ta production est validée. En attente de l'adversaire ({online_turn_label(room)} maximum)…")
     draft = room["drafts"][seat] or g
     render_board(g, draft, readonly=True)
 
@@ -17549,17 +17561,21 @@ def fx_board_payload(bundle, g, viewer, recent):
     return {
         "events": events, "viewer": viewer, "game": str(game_id),
         "deaths": fx_deaths(g),
-        "harvest": fx_harvest(g),
+        "harvest": fx_harvest(g, viewer),
     }
 
 
-def fx_harvest(g):
-    """Récolte de chaque base (ou héros), montrée pendant la production qui
-    la suit : or en jaune, mana en orange au-dessus de la base."""
+def fx_harvest(g, viewer=None):
+    """Récolte de chaque base (ou héros) du joueur de cet écran, montrée
+    pendant la production qui la suit : or en jaune, mana en orange.
+    Jamais celle de l'adversaire (ses ressources restent secrètes)."""
     h = g.get("last_harvest")
     if not h or h.get("turn") != g["turn"] or g["phase"] != "build" or not h.get("items"):
         return None
-    return {"id": f"{h['turn']}:{h.get('seq', 0)}", "items": h["items"]}
+    items = [i for i in h["items"] if viewer is None or i.get("owner") == viewer]
+    if not items:
+        return None
+    return {"id": f"{h['turn']}:{h.get('seq', 0)}", "items": items}
 
 
 def fx_phase_index(round_number, phase):
@@ -17693,7 +17709,13 @@ def render_board(g, view, readonly=False):
         for line in reversed(g.get("log", [])):
             st.text(line)
     render_journal(bundle, g, viewer, recent)
-    render_phase_badge(g)
+    render_phase_badge(g, view)
+    # Grande annonce de la phase sur le plateau (2 secondes, une fois par phase).
+    st.session_state["_lw_phase_banner"] = None if g.get("winner") is not None else {
+        "key": f"{(bundle or {}).get('game_id') or ''}:{g['turn']}:{g['phase']}",
+        "text": ("🛠️ Phase de production" if g["phase"] == "build" else "⚔️ Phase de manœuvres"),
+        "turn": g["turn"],
+    }
     payload = fx_board_payload(bundle, g, viewer, recent)
     st.session_state["_lw_fx"] = payload if recent or payload["deaths"] or payload["harvest"] else None
     return _lw_fx_previous_render_board(g, view, readonly)
@@ -17872,11 +17894,15 @@ def victory_banner_text(g):
     loser = game_forfeiter(g)
     if loser is not None:
         return f"Les {faction_of(g, loser)['name']} abandonnent : les {faction} remportent la victoire !"
-    if g.get("victory_mode") == "bases":
-        count = int(g["players"][winner].get("bases", 0))
+    count = int(g["players"][winner].get("bases", 0))
+    if count >= 3:
         return f"Les {faction} ont détruit {count} bases ennemies : ils remportent la victoire !"
-    points = g["players"][winner].get("pv", 0)
-    return f"Fin du temps : les {faction} remportent la victoire avec {float(points):g} PV !"
+    points = float(g["players"][winner].get("pv", 0))
+    other = float(g["players"][1 - winner].get("pv", 0))
+    return (
+        f"Temps écoulé : les {faction} ont infligé le plus de dégâts "
+        f"({fx_num(points)} PV contre {fx_num(other)}) et remportent la victoire !"
+    )
 
 
 def victory_image_uri(g):
@@ -18333,7 +18359,7 @@ UNIT_BONUS = {
     # Derniers nés
     "Ouvrier": ["Se déplace pendant la production ; construit bâtiments et bases.",
                 "Récolte : 1 à 3 ouvriers par case, selon le niveau de la base (Colonie 1, Ville 2, Forteresse 3)."],
-    "Guerrier": ["Frappe 2 cases ennemies.", "Marteau foudroyant : +0,5 PF en attaque."],
+    "Guerrier": ["Frappe 2 cases ennemies.", "Marteau foudroyant (Forge) : 2 → 2,5 PF."],
     "Éclaireur": ["Très rapide.", "Sabote une base ennemie : elle ne récolte pas.",
                   "N'attaque pas les bases.", "Esquive : traverse les unités ennemies sans dégâts."],
     "Chevalier": ["Piétinement contre les unités d'âge I."],
@@ -18410,6 +18436,7 @@ def render_selected_card(g, view):
         lines.append(f"💰 **Récolte** : {gold} or ou {mana} mana par tour (case du marqueur)")
         bonus = ["Héros : compte comme une base ; produit des unités.",
                  "Récolte la dernière case d'or ou de mana traversée (son marqueur).",
+                 "Une unité ennemie qui passe sur son marqueur le détruit : plus de récolte.",
                  "Attaque pendant la production, sans riposte."] + HERO_BONUS.get(piece["name"], [])
     elif piece["kind"] == "unit":
         data = UNITS.get(piece["name"], {})
@@ -18565,8 +18592,7 @@ def render_sidebar(bundle):
                 st.caption("La sauvegarde contient aussi les planifications privées.")
                 confirm = st.checkbox("Confirmer le retour à l'accueil", key="confirm_home")
                 if st.button("Retour à l'accueil", disabled=not confirm, key="go_home"):
-                    reset_session()
-                    st.rerun()
+                    go_home_now()
             render_forfeit(bundle)
 
         # 2. Actions du joueur
@@ -18583,9 +18609,15 @@ def render_sidebar(bundle):
                 ):
                     ai_undo_last_move()
                     st.rerun()
+            if g["winner"] is not None:
+                # Partie terminée : retour direct à l'accueil.
+                if st.button("🏠 Retour à l'accueil", type="primary", width="stretch", key="end_go_home"):
+                    go_home_now()
             # Terminer la phase : même place, en rouge, en production comme en manœuvres.
             with st.container(key="lw_end_phase"):
-                if g["phase"] == "build":
+                if g["winner"] is not None:
+                    pass
+                elif g["phase"] == "build":
                     if st.button(
                         "✅ Terminer ma phase de production",
                         disabled=g["winner"] is not None,
@@ -18661,15 +18693,114 @@ div:has(> .st-key-lw_phase_badge) {
 """
 
 
-def render_phase_badge(g):
+def render_phase_badge(g, view=None):
     if g.get("winner") is not None:
         return
+    # Trésorerie du joueur de cet écran, en temps réel (en production :
+    # après les achats déjà planifiés).
+    viewer = treasury_viewer(g)
+    player = ((view or g).get("players") or g["players"])[viewer]
+    money = f" · 💰 {player['gold']} or · 🔮 {player['mana']} mana"
     label = "🛠️ Phase de production" if g["phase"] == "build" else "⚔️ Phase de manœuvres"
     with st.container(key="lw_phase_badge"):
         st.markdown(
-            PHASE_BADGE_CSS + f'<div class="lw-phase-badge">Tour {g["turn"]} · {label}</div>',
+            PHASE_BADGE_CSS + f'<div class="lw-phase-badge">Tour {g["turn"]} · {label}{money}</div>',
             unsafe_allow_html=True,
         )
+
+
+# ============================================================
+# TRÉSORERIE PRIVÉE, TEMPS DE RÉFLEXION EN LIGNE, MARTEAU FOUDROYANT
+# ============================================================
+
+def treasury_viewer(g):
+    """Siège du joueur de cet écran : seule sa trésorerie est affichée."""
+    bundle = st.session_state.get("bundle")
+    if st.query_params.get("room"):
+        room = online_active_room()
+        if room is not None and room.get("bundle"):
+            bundle = room["bundle"]
+    return fx_viewer(bundle if isinstance(bundle, dict) else {}, g)
+
+
+def online_turn_seconds(room):
+    """Temps de réflexion par joueur et par phase, réglé par l'hôte."""
+    return int((room or {}).get("turn_seconds") or ONLINE_TURN_SECONDS)
+
+
+def online_turn_label(room):
+    return f"{online_turn_seconds(room) / 60:g} min"
+
+
+# Marteau foudroyant : de vrais PF (Guerrier 2 → 2,5), comme les Dents acérées.
+ATTACK_UPGRADES.pop("Marteau foudroyant", None)
+PF_UPGRADES["Marteau foudroyant"] = (WARRIOR, 0.5)
+
+
+def go_home_now():
+    """Retour à l'accueil, y compris depuis une partie en ligne terminée."""
+    st.query_params.clear()
+    reset_session()
+    st.rerun()
+
+
+# ============================================================
+# VAGABONDS : MARQUEUR DE RÉCOLTE DÉTRUIT PAR L'ENNEMI
+# Une unité ennemie qui passe (ou s'arrête) sur la case du marqueur d'un
+# héros le détruit : le héros ne récolte plus, jusqu'à ce qu'il traverse
+# une autre case d'or ou de mana.
+# ============================================================
+
+def break_hero_markers(g, owner, cells, cause):
+    """Détruit les marqueurs des héros adverses posés sur ces cases."""
+    cells = {tuple(int(v) for v in c) for c in cells}
+    broken = []
+    for hero in g["entities"]:
+        marker = hero.get("marker")
+        if hero.get("owner") == owner or not is_hero(hero) or not marker:
+            continue
+        if tuple(int(v) for v in marker) in cells:
+            hero["marker"] = None
+            broken.append(hero)
+            log(g, f"{cause} détruit le marqueur de {hero['name']} en {coord(marker)} : plus de récolte.")
+    return broken
+
+
+_lw_marker_break_previous_game_action = game_action
+
+
+def game_action(bundle, fn, *args):
+    g = bundle["game"]
+    owner = g["active"]
+    before_move = (g.get("last_move") or {}).get("seq")
+    positions = {e["id"]: tuple(e["pos"]) for e in g["entities"] if e["owner"] == owner and e["kind"] == "unit"}
+    result = _lw_marker_break_previous_game_action(bundle, fn, *args)
+    g = bundle["game"]
+    if not any(h.get("marker") and h["owner"] != owner and is_hero(h) for h in g["entities"]):
+        return result
+    cells, movers = set(), []
+    last = g.get("last_move") or {}
+    if last.get("seq") and last.get("seq") != before_move:
+        mover = next((e for e in g["entities"] if e["id"] == last.get("unit_id")), None)
+        if mover is not None and mover["owner"] == owner:
+            # Toutes les cases du trajet, départ exclu.
+            cells.update(tuple(p) for p in (last.get("route") or [])[1:])
+            movers.append(mover)
+    for e in g["entities"]:
+        # Unité qui a changé de case (case conquise, piétinement…).
+        if e["id"] in positions and tuple(e["pos"]) != positions[e["id"]]:
+            cells.add(tuple(e["pos"]))
+            movers.append(e)
+    if cells:
+        cause = movers[0]["name"] if movers else "Une unité ennemie"
+        for hero in break_hero_markers(g, owner, cells, cause):
+            fx_push(g, {
+                "turn": turn_label(g), "round": g["turn"], "owner": owner, "phase": "move",
+                "kind": "impact", "icon": "💥",
+                "text": f"{cause} détruit le marqueur de récolte de {hero['name']} : il ne récolte plus",
+                "shots": [], "moves": [], "hits": [], "spawns": [], "auras": [],
+            })
+    return result
 
 
 # ============================================================

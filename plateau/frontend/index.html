@@ -1528,6 +1528,28 @@
       board.appendChild(layer);
     }
 
+    // Changement de phase : grande annonce au centre du plateau, qui
+    // s'efface au bout de 2 secondes (une seule fois par phase).
+    function drawPhaseAnnounce() {
+      const info = args.phase_banner;
+      if (!info || !info.key) return;
+      const id = `phase:${info.key}`;
+      if (playedFx.has(id)) return;
+      rememberFx(id);
+      const layer = svgNode("g", { "pointer-events": "none" });
+      const w = baseW * 0.62, h = Math.max(110, baseH * 0.14);
+      // En haut du plateau : visible dès que le plateau apparaît à l'écran.
+      const x = (baseW - w) / 2, y = baseH * 0.07;
+      const build = String(info.text).includes("production");
+      layer.appendChild(svgNode("rect", { x, y, width: w, height: h, rx: 22, fill: build ? "rgba(21,128,61,0.88)" : "rgba(185,28,28,0.88)", stroke: "#facc15", "stroke-width": 6 }));
+      layer.appendChild(svgNode("text", { x: baseW / 2, y: y + h * 0.42, "text-anchor": "middle", "dominant-baseline": "middle", "font-size": h * 0.38, "font-weight": 900, fill: "#ffffff", stroke: "rgba(0,0,0,0.55)", "stroke-width": 5, "paint-order": "stroke" }, info.text));
+      layer.appendChild(svgNode("text", { x: baseW / 2, y: y + h * 0.78, "text-anchor": "middle", "dominant-baseline": "middle", "font-size": h * 0.2, "font-weight": 800, fill: "#fde68a" }, `Tour ${info.turn}`));
+      fxLayer.appendChild(layer);
+      tween(250, t => layer.setAttribute("opacity", String(t)), () => {
+        setTimeout(() => tween(450, t => layer.setAttribute("opacity", String(1 - t)), () => layer.remove()), 1550);
+      });
+    }
+
     // Fin de partie : grande banderole aux couleurs du vainqueur, en travers
     // du plateau, avant l'image de victoire.
     function drawVictoryBanner() {
@@ -1776,6 +1798,7 @@ if (reachable || placed) {
       } else {
         animateLastMove();
         queueFx();
+        drawPhaseAnnounce();
       }
       wrapper.scrollLeft = previousScrollLeft;
       wrapper.scrollTop = previousScrollTop;
