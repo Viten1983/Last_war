@@ -1530,6 +1530,28 @@
 
     // Changement de phase : grande annonce au centre du plateau, qui
     // s'efface au bout de 2 secondes (une seule fois par phase).
+    // Centre (coordonnées du plateau) de la zone du plateau visible à l'écran,
+    // compte tenu du défilement de la page et du zoom.
+    function visibleBoardCenter() {
+      const svgRect = board.getBoundingClientRect();
+      let top = svgRect.top, bottom = svgRect.bottom;
+      try {
+        const frame = window.frameElement;
+        if (frame && window.parent) {
+          const r = frame.getBoundingClientRect();
+          top = Math.max(top, -r.top);
+          bottom = Math.min(bottom, window.parent.innerHeight - r.top);
+        }
+      } catch (error) { /* page parente inaccessible : tout le plateau */ }
+      if (bottom - top < 80) { top = svgRect.top; bottom = svgRect.bottom; }
+      const matrix = board.getScreenCTM();
+      if (!matrix) return { x: baseW / 2, y: baseH / 2 };
+      const p = board.createSVGPoint();
+      p.x = svgRect.left + svgRect.width / 2;
+      p.y = (top + bottom) / 2;
+      return p.matrixTransform(matrix.inverse());
+    }
+
     function drawPhaseAnnounce() {
       const info = args.phase_banner;
       if (!info || !info.key) return;
@@ -1538,8 +1560,9 @@
       rememberFx(id);
       const layer = svgNode("g", { "pointer-events": "none" });
       const w = baseW * 0.62, h = Math.max(110, baseH * 0.14);
-      // En haut du plateau : visible dès que le plateau apparaît à l'écran.
-      const x = (baseW - w) / 2, y = baseH * 0.07;
+      // Au centre de la partie du plateau visible à l'écran.
+      const mid = visibleBoardCenter();
+      const x = mid.x - w / 2, y = mid.y - h / 2;
       const build = String(info.text).includes("production");
       layer.appendChild(svgNode("rect", { x, y, width: w, height: h, rx: 22, fill: build ? "rgba(21,128,61,0.88)" : "rgba(185,28,28,0.88)", stroke: "#facc15", "stroke-width": 6 }));
       layer.appendChild(svgNode("text", { x: baseW / 2, y: y + h * 0.42, "text-anchor": "middle", "dominant-baseline": "middle", "font-size": h * 0.38, "font-weight": 900, fill: "#ffffff", stroke: "rgba(0,0,0,0.55)", "stroke-width": 5, "paint-order": "stroke" }, info.text));
