@@ -15617,20 +15617,29 @@ def ai_marker_value(g, me, hero, cell, need_mana):
     return float(mana * mult * (300 if need_mana else 130))
 
 
-def ai_hero_safe(g, me, hero, pos):
-    """Un héros détruit compte comme une base perdue : éviter les cases menacées."""
-    danger = sum(
+def ai_hero_danger(g, me, pos):
+    """PF ennemis capables d'atteindre cette case à la prochaine manœuvre."""
+    return sum(
         float(e["pf"]) for e in ai_enemy_pieces(g, me)
         if e["kind"] == "unit" and e["name"] not in NO_ATTACK_UNITS
         and distance(pos, tuple(e["pos"])) <= UNITS.get(e["name"], {}).get("move", 0)
         + max(1, UNITS.get(e["name"], {}).get("range", 0))
     )
-    return danger < float(hero["pf"])
 
 
-def ai_move_heroes(g, me):
+def ai_hero_safe(g, me, hero, pos):
+    """Un héros détruit compte comme une base perdue : éviter les cases menacées."""
+    return ai_hero_danger(g, me, pos) < float(hero["pf"])
+
+
+def ai_move_heroes(g, me, careful=False):
     """Vagabonds : chaque héros vise la case d'or ou de mana la plus rentable
-    (×2, ×3 en priorité) ; trop loin, il s'en approche tour après tour."""
+    (×2, ×3 en priorité) ; trop loin, il s'en approche tour après tour.
+
+    careful (Intermédiaire, Expert) : le marqueur garde la DERNIÈRE case de
+    ressource traversée, et c'est elle qui est récoltée. Le héros n'a donc pas
+    besoin de rester dessus : menacé, il traverse la ressource (ou la garde
+    comme marqueur) et s'arrête à l'abri, sans rien perdre de sa récolte."""
     if not is_vagabond(g, me):
         return g
     # Mana rare (âges, unités fortes) ou or qui s'entasse : le mana vaut plus.
@@ -15672,13 +15681,28 @@ def ai_move_heroes(g, me):
             return crossed[-1] if crossed else current.get("marker")
 
         safe = [p for p in sorted(options) if ai_hero_safe(g, me, current, p)]
-        best = max(
-            safe,
-            key=lambda p: (value_of(after_move(p)), -distance(p, tuple(current["pos"]))),
-            default=None,
-        )
+        here = tuple(current["pos"])
+        if careful:
+            danger = {p: ai_hero_danger(g, me, p) for p in list(options) + [here]}
+
+            def exposed(p):
+                # Case de ressource menacée : à éviter même si le héros y survit.
+                return danger[p] > 0 and key(p) in g["resources"]
+
+            rank = lambda p: (value_of(after_move(p)), not exposed(p), -danger[p], -distance(p, here))
+        else:
+            rank = lambda p: (value_of(after_move(p)), -distance(p, here))
+        best = max(safe, key=rank, default=None)
         target = None
-        if best is not None and value_of(after_move(best)) > 1.15 * here_value:
+        if careful and best is not None and (
+            not ai_hero_safe(g, me, current, here)
+            or (exposed(here) and value_of(after_move(best)) >= here_value)
+        ):
+            # En danger de mort : il fuit (un héros perdu vaut une base).
+            # Seulement exposé sur sa ressource : il se met à l'abri en gardant
+            # au moins la même récolte.
+            target = best
+        elif best is not None and value_of(after_move(best)) > 1.15 * here_value:
             target = best
         else:
             # Une case bien plus riche, à 2 tours de marche au plus, loin des
@@ -15923,7 +15947,7 @@ def ai_production(draft, me, level):
     start_gold, start_mana = ai_gold(g, me), ai_mana(g, me)
 
     g = ai_move_workers(g, me)
-    g = ai_move_heroes(g, me)
+    g = ai_move_heroes(g, me, careful=ai_level_name(P) != "debutant")
     urgent = False
     if P["decisive_upgrades"] or is_vagabond(g, me):
         # Améliorations décisives : contre-mesures (ex. Meute de tigres face à
