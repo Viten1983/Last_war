@@ -4628,8 +4628,8 @@ def render_build_controls(g, view, local=False, on_board=False):
         # Aucune action automatique :  
         # la tentative de passage d’âge nécessite un clic.  
         if st.button(  
-            f"Passer à l’âge {next_age}",  
-            key=f"{prefix}_advance_age_{next_age}",  
+            f"Passer à l’âge {next_age}",
+            key=f"{prefix}_advance_age_{'ok' if age_advance_possible(view, owner, next_age) else 'ko'}_{next_age}",
         ):  
             reasons = []  
   
@@ -4772,12 +4772,13 @@ def render_build_controls(g, view, local=False, on_board=False):
   
                         # Deux façons de construire : normale, ou accélérée (+50 %).
                         limit_hit = building_limit_reached(view, owner, name)
-                        normal_col, fast_col = st.columns(2)
+                        # L'un sous l'autre, en pleine largeur : libellés lisibles dans le menu.
+                        normal_col = fast_col = st.container()
                         with normal_col:
                             if st.button(
                                 "🔨 Construire",
                                 key=f"{prefix}_choose_build_{source['id']}_{name}",
-                                disabled=limit_hit,
+                                disabled=limit_hit or not can_pay(view, owner, data["cost"], data.get("mana", 0)),
                                 use_container_width=True,
                                 type=build_button_type(name, False),
                             ):
@@ -4787,7 +4788,7 @@ def render_build_controls(g, view, local=False, on_board=False):
                                 if st.button(
                                     "⚡ Immédiat",
                                     key=f"{prefix}_choose_fast_{source['id']}_{name}",
-                                    disabled=limit_hit,
+                                    disabled=limit_hit or not can_pay(view, owner, int(data["cost"] * 1.5), data.get("mana", 0)),
                                     use_container_width=True,
                                     help="Disponible immédiatement, pour +50 % du prix.",
                                     type=build_button_type(name, True),
@@ -4897,7 +4898,10 @@ def render_build_controls(g, view, local=False, on_board=False):
                         if st.button(  
                             f"Recruter : {name}",  
                             key=f"{prefix}_choose_recruit_{source['id']}_{name}",  
-                            disabled=remaining_count < recruitment_batch(view, owner, name),  
+                            disabled=(
+                                remaining_count < recruitment_batch(view, owner, name)
+                                or not can_pay(view, owner, recruit_cost, data["mana"])
+                            ),
                             type=(  
                                 "primary"  
                                 if (  
@@ -5429,18 +5433,7 @@ def render_move_controls(g):
                     losses,  
                 )  
   
-    st.divider()  
-  
-    st.caption(  
-        "Passer abandonne toutes tes activations restantes "  
-        "pour ce tour."  
-    )  
-  
-    if st.button(  
-        "Passer pour le reste du tour",  
-        key=f"{prefix}_pass",  
-    ):  
-        perform(game_action, pass_turn)  
+    # Fin des manœuvres : bouton rouge « Terminer mes manœuvres » du menu.
 # ============================================================
 # SCORES ET APPLICATION
 # ============================================================
@@ -17581,7 +17574,11 @@ def render_board(g, view, readonly=False):
         bundle = room.get("bundle") or bundle
     viewer = fx_viewer(bundle, g)
     recent = fx_recent(g, viewer)
+    with st.expander("📜 Journal de la partie (détaillé)"):
+        for line in reversed(g.get("log", [])):
+            st.text(line)
     render_journal(bundle, g, viewer, recent)
+    render_phase_badge(g)
     payload = fx_board_payload(bundle, g, viewer, recent)
     st.session_state["_lw_fx"] = payload if recent or payload["deaths"] or payload["harvest"] else None
     return _lw_fx_previous_render_board(g, view, readonly)
@@ -18152,6 +18149,399 @@ def trebuchet_auto_fire(g, mover, route):
         return _lw_ground_previous_trebuchet_auto_fire(g, mover, route)
     finally:
         g["entities"].extend(flyers)
+
+
+# ============================================================
+# MENU DE GAUCHE RÉORGANISÉ
+# 1. Informations générales (partie, objectif, fiches, sauvegarde)
+# 2. Actions du joueur (annuler, terminer la phase, commandes)
+# 3. Pièce sélectionnée : PF, déplacement, portée, capacités
+# ============================================================
+
+# Capacités particulières de chaque unité (affichées dans la fiche).
+UNIT_BONUS = {
+    # Déferlants
+    "Déferlant": ["Unité de base des Déferlants, recrutée par 2 à la Mare.",
+                  "Peut muter en Kamikaze (amélioration Mutation kamikaze)."],
+    "Kamikaze": ["💥 Explose sur sa cible : 2 PF sur la cible, 1 PF à gauche et à droite.",
+                 "Il disparaît en explosant."],
+    "Aspergeur": ["Tir à distance.", "Peut muter en Rampant (amélioration Rampants)."],
+    "Rampant": ["Se plante dans le sol (fin d'activation) : invisible, sauf détecteur à portée.",
+                "Planté, il tire en ligne : 4 PF sur la cible et les 2 cases derrière elle.",
+                "N'attaque jamais au corps à corps ; ne vise pas les unités volantes."],
+    "Enragé": ["Frappe la cible et ses 2 voisines (3 PF chacune), alliés compris !"],
+    "Costaud": ["N'attaque que les bâtiments et les bases."],
+    "Molosse": ["Frappe aussi une 2e case au contact de la cible.",
+                "Les unités d'âge I ne lui infligent que la moitié des dégâts."],
+    "Volant": ["Unité volante : hors d'atteinte du corps à corps.",
+               "Piétinement contre les unités d'âge I."],
+    "Décimant": ["N'attaque pas : il lance des sorts.",
+                 *[f"{v}" for v in DECIMANT_SPELLS.values()]],
+    # Exilés
+    "Tigre des forêts": ["Rapide au corps à corps.",
+                         "Meute de tigres : recrutés par 2, ils piétinent l'âge I."],
+    "Elfe": ["Tir à distance.",
+             "Instinct elfique : touche aussi la case derrière la cible."],
+    "Réveil des morts": ["Recrutés par 4."],
+    "Gobelin": ["Vole la récolte d'une case ennemie, puis la dépose près d'une de tes bases."],
+    "Mage des montagnes": ["2 sorts, un tous les 2 tours :",
+                           "🐌 Ralentissement : −50 % de déplacement à 3 unités ennemies.",
+                           "💥 Sort de dégâts : −2 PF à 2 unités ennemies."],
+    "Aramil": ["Garde les 2 sorts du Mage.",
+               "🔥 Incendie 2 bâtiments ennemis à portée.",
+               "🌀 Appelle le Titan Aragnak pour 1 tour."],
+    "Dragon": ["Unité volante, tir à distance (souffle de feu)."],
+    "Titan Aragnak": ["Appelé par Aramil pour 1 tour.", "Traverse les montagnes (1 MVT)."],
+    "Mammouth dompté": ["Frappe 3 cases : 10 PF sur la cible, 5 PF sur 2 voisines.",
+                        "Développement musculaire : +3 PF."],
+    "Nain des montagnes": ["Leader : quand il attaque, les 2 alliés à ses côtés attaquent avec lui."],
+    "Golem de pierre": ["Arme de siège : tir en ligne à 3 ou 4 cases, touche 3 cases l'une derrière l'autre.",
+                        "Vise uniquement des unités, jamais les unités volantes.",
+                        "Ne subit jamais de riposte."],
+    "Daeron et Finwe": ["Unité volante et invisible, sauf détecteur à portée.",
+                        "Rend invisibles les unités alliées à 1 case."],
+    "Daeron": ["Unité volante et invisible, sauf détecteur à portée."],
+    "Finwe": ["Unité volante et invisible, sauf détecteur à portée."],
+    # Derniers nés
+    "Ouvrier": ["Se déplace pendant la production ; construit bâtiments et bases.",
+                "Récolte : 1 à 3 ouvriers par case, selon le niveau de la base (Colonie 1, Ville 2, Forteresse 3)."],
+    "Guerrier": ["Frappe 2 cases ennemies.", "Marteau foudroyant : +0,5 PF en attaque."],
+    "Éclaireur": ["Très rapide.", "Sabote une base ennemie : elle ne récolte pas.",
+                  "N'attaque pas les bases.", "Esquive : traverse les unités ennemies sans dégâts."],
+    "Chevalier": ["Piétinement contre les unités d'âge I."],
+    "Archer": ["Tir à 1 à 3 cases.", "Flèches enflammées : touche 2 cases voisines."],
+    "Catapulte": ["Arme de siège : tir à 3-4 cases, 4 PF sur la cible et 2 PF à gauche et à droite.",
+                  "1 tir tous les 2 tours ; ne vise pas les unités volantes.",
+                  "Ne riposte jamais et ne subit jamais de riposte.",
+                  "Peut devenir Trébuchet (amélioration Trébuchet)."],
+    "Trébuchet": ["Immobile ; tir à 4-5 cases.",
+                  "Tir automatique sur toute unité ennemie (non volante) qui passe à 4-5 cases : 4 PF, 2 PF sur les côtés.",
+                  "Redevient Catapulte en 1 tour pour se déplacer.",
+                  "Ne subit jamais de riposte."],
+    "Catapulte de l'enfer": ["Arme de siège : tir à 3-5 cases, 6 PF sur la cible et la case de derrière.",
+                             "Ne vise pas les unités volantes.",
+                             "Ne riposte jamais et ne subit jamais de riposte."],
+    "Dirigeable": ["Volant ; transporte jusqu'à 3 unités.", "N'attaque pas ; détecte les unités invisibles.",
+                   *[f"{v}" for v in AIRSHIP_SPELLS.values()]],
+    "Griffon": ["Volant ; tir à 3 cases, touche 2 cases.",
+                "Invisibilité griffons : invisible, sauf détecteur à portée."],
+    "Roi Théobald": ["Invisible, sauf détecteur à portée.", "Piétinement contre les âges I et II."],
+    # Vagabonds
+    "Errant": ["Esprit ; 5 Errants fusionnent en Super Errant (7 PF)."],
+    "Ravageur": ["Esprit ; 4 Ravageurs fusionnent en Super Ravageur (10 PF)."],
+    "Super Errant": ["Fusion de 5 Errants ; une seule par partie."],
+    "Super Ravageur": ["Fusion de 4 Ravageurs ; une seule par partie."],
+    "Sorcier": ["N'attaque pas : il lance des sorts.", *[f"{v}" for v in SORCERER_SPELLS.values()]],
+    "Agile": ["Mutation imminente : les Agiles volent."],
+    "Barbare": ["Piétinement contre l'âge I.", "Endurance : +1 PF et +1 déplacement."],
+    "Voyant": ["Détecteur : révèle les unités invisibles à portée."],
+    "Silencieux": ["Invisible, sauf détecteur à portée."],
+    "Destruction": ["Fusion de 2 Barbares."],
+    "Parfait": ["Unité volante ; la plus puissante des Vagabonds."],
+}
+HERO_BONUS = {
+    "De Marbourg": ["N'attaque pas : 2 PF de défense seulement."],
+    "Aalongue": ["Détecteur ; ne combat pas.",
+                 "Téléporte 4 unités sur les cases voisines.",
+                 "Motivation : +1 déplacement à toutes les unités pendant 1 tour."],
+}
+
+
+def piece_range_text(name):
+    if name in SIEGE_RANGES:
+        low, high = SIEGE_RANGES[name]
+        return f"Tir à distance : {low} à {high} cases"
+    if name == STONE_GOLEM:
+        return "Tir à distance : 3 à 4 cases (en ligne)"
+    reach = UNITS.get(name, {}).get("range", 0)
+    if name in MAGES or name == DECIMANT:
+        return f"Sorts à {reach} cases (pas de tir normal)"
+    if name in NO_ATTACK_UNITS:
+        return "N'attaque pas" + (f" (sorts à {reach} cases)" if reach else "")
+    return f"Tir à distance : {reach} case{'s' if reach > 1 else ''}" if reach > 0 else "Corps à corps"
+
+
+def render_selected_card(g, view):
+    st.markdown("### 📋 Pièce sélectionnée")
+    piece = selected_entity(view)
+    if piece is None:
+        st.caption("Clique sur une unité ou un bâtiment du plateau pour voir ses caractéristiques.")
+        return
+    owner_name = faction_of(view, piece["owner"])["name"]
+    st.markdown(f"**{piece['name']}** — {owner_name} · {coord(piece['pos'])}")
+    lines = []
+    max_pf = piece.get("max_pf")
+    pf_text = f"{float(piece['pf']):g}" + (f" / {float(max_pf):g}" if max_pf and float(max_pf) != float(piece["pf"]) else "")
+    if piece.get("attack_bonus"):
+        pf_text += f" (+{float(piece['attack_bonus']):g} en attaque)"
+    lines.append(f"❤️ **PF** : {pf_text}")
+    if is_hero(piece):
+        pf, move, reach, gold, mana = hero_stats(view, piece)
+        lines.append(f"🦶 **Déplacement** : {move} cases")
+        lines.append("🎯 **Portée** : " + (f"tir à {reach} cases" if reach else "corps à corps"))
+        lines.append(f"💰 **Récolte** : {gold} or ou {mana} mana par tour (case du marqueur)")
+        bonus = ["Héros : compte comme une base ; produit des unités.",
+                 "Récolte la dernière case d'or ou de mana traversée (son marqueur).",
+                 "Attaque pendant la production, sans riposte."] + HERO_BONUS.get(piece["name"], [])
+    elif piece["kind"] == "unit":
+        data = UNITS.get(piece["name"], {})
+        move_text = f"{data.get('move', 0)} cases"
+        if g["phase"] == "move" and piece["owner"] == g["active"]:
+            try:
+                move_text += f" (reste {remaining_actions(g, piece)} ce tour)"
+            except Exception:
+                pass
+        lines.append(f"🦶 **Déplacement** : {move_text}")
+        lines.append(f"🎯 **Portée** : {piece_range_text(piece['name'])}")
+        traits = []
+        if is_flying(piece):
+            traits.append("volant")
+        if piece["name"] in INVISIBLE_UNITS or (piece["name"] == RAMPANT and piece.get("planted")):
+            traits.append("invisible")
+        if traits:
+            lines.append("✨ **Type** : " + ", ".join(traits))
+        bonus = UNIT_BONUS.get(piece["name"], [])
+    else:
+        kind = "Base" if piece["kind"] == "base" else "Bâtiment"
+        lines.append(f"🏠 **Type** : {kind}")
+        units = faction_of(view, piece["owner"])["buildings"].get(piece["name"], {}).get("units", [])
+        if units:
+            lines.append("🪖 **Produit** : " + ", ".join(units))
+        if piece.get("wait"):
+            lines.append(f"⏳ **Disponible dans** : {piece['wait']} fin(s) de tour")
+        bonus = []
+    st.markdown("  \n".join(lines))
+    if bonus:
+        st.markdown("**Capacités**")
+        st.markdown("\n".join(f"- {line}" for line in bonus))
+
+
+def age_advance_possible(view, owner, target_age):
+    """Le passage d'âge réussirait-il ? (essai sur une copie)"""
+    try:
+        advance_age(copy.deepcopy(view), owner, target_age)
+        return True
+    except Exception:
+        return False
+
+
+def can_pay(view, owner, gold, mana=0):
+    player = view["players"][owner]
+    return player["gold"] >= gold and player["mana"] >= mana
+
+
+SIDEBAR_CSS = """
+<style>
+/* Rubriques du menu de gauche */
+section[data-testid="stSidebar"] .st-key-lw_side_info,
+section[data-testid="stSidebar"] .st-key-lw_side_actions,
+section[data-testid="stSidebar"] .st-key-lw_side_unit {
+    background: #fffdf7;
+}
+section[data-testid="stSidebar"] h3 { margin-top: 0 !important; }
+
+/* Actions possibles en vert, impossibles en rouge (toutes les factions). */
+section[data-testid="stSidebar"] [class*="_choose_recruit_"] button,
+section[data-testid="stSidebar"] [class*="_choose_build_"] button,
+section[data-testid="stSidebar"] [class*="_choose_fast_"] button,
+section[data-testid="stSidebar"] [class*="_workers_"] button,
+section[data-testid="stSidebar"] [class*="_worker_build_"] button,
+section[data-testid="stSidebar"] [class*="_worker_fast_"] button,
+section[data-testid="stSidebar"] [class*="_upgrade_"] button,
+section[data-testid="stSidebar"] [class*="_mutate_"] button,
+section[data-testid="stSidebar"] [class*="_kamikaze_"] button,
+section[data-testid="stSidebar"] [class*="_fusion_go_"] button,
+section[data-testid="stSidebar"] [class*="_advance_age_ok_"] button {
+    background: #15803d !important;
+    border-color: #166534 !important;
+    color: #ffffff !important;
+}
+section[data-testid="stSidebar"] [class*="_choose_"] button:hover,
+section[data-testid="stSidebar"] [class*="_upgrade_"] button:hover,
+section[data-testid="stSidebar"] [class*="_advance_age_ok_"] button:hover {
+    filter: brightness(1.12);
+}
+section[data-testid="stSidebar"] [class*="_choose_recruit_"] button:disabled,
+section[data-testid="stSidebar"] [class*="_choose_build_"] button:disabled,
+section[data-testid="stSidebar"] [class*="_choose_fast_"] button:disabled,
+section[data-testid="stSidebar"] [class*="_workers_"] button:disabled,
+section[data-testid="stSidebar"] [class*="_worker_build_"] button:disabled,
+section[data-testid="stSidebar"] [class*="_worker_fast_"] button:disabled,
+section[data-testid="stSidebar"] [class*="_upgrade_"] button:disabled,
+section[data-testid="stSidebar"] [class*="_mutate_"] button:disabled,
+section[data-testid="stSidebar"] [class*="_kamikaze_"] button:disabled,
+section[data-testid="stSidebar"] [class*="_fusion_go_"] button:disabled,
+section[data-testid="stSidebar"] [class*="_advance_age_ko_"] button {
+    background: #b91c1c !important;
+    border-color: #7f1d1d !important;
+    color: #ffffff !important;
+    opacity: 0.9 !important;
+}
+/* Choix en cours : liseré jaune. */
+section[data-testid="stSidebar"] [class*="_choose_"] button[data-testid="stBaseButton-primary"] {
+    box-shadow: 0 0 0 3px #facc15 !important;
+}
+section[data-testid="stSidebar"] [class*="_choose_"] button p,
+section[data-testid="stSidebar"] [class*="_upgrade_"] button p,
+section[data-testid="stSidebar"] [class*="_advance_age_"] button p { color: inherit !important; }
+
+/* Terminer la phase : toujours rouge, toujours au même endroit. */
+.st-key-lw_end_phase button {
+    background: #dc2626 !important;
+    border-color: #991b1b !important;
+    color: #ffffff !important;
+    font-weight: 800 !important;
+}
+.st-key-lw_end_phase button:disabled { background: #fca5a5 !important; border-color: #f87171 !important; }
+.st-key-lw_end_phase button p { color: inherit !important; }
+</style>
+"""
+
+
+def render_sidebar(bundle):
+    g = bundle["game"]
+    view = bundle["draft"] if g["phase"] == "build" and bundle.get("draft") is not None else g
+    online = bool(st.query_params.get("room"))
+    with st.sidebar:
+        st.markdown(SIDEBAR_CSS, unsafe_allow_html=True)
+
+        # 1. Informations générales
+        with st.container(border=True, key="lw_side_info"):
+            st.markdown("### ℹ️ Informations générales")
+            if ai_config(bundle) is not None:
+                st.markdown(f"🤖 **Adversaire** : IA — {ai_label(bundle)}")
+            phase = "🛠️ Production" if g["phase"] == "build" else "⚔️ Manœuvres"
+            st.markdown(f"**Tour {g['turn']}** · {phase}")
+            if g["winner"] is None:
+                st.caption(f"Joueur actif : {faction_of(g, g['active'])['name']}")
+            if g.get("victory_mode") == "bases":
+                st.markdown("🏰 **Victoire** : 3 bases ennemies détruites")
+                st.caption(" · ".join(
+                    f"{faction_of(g, owner)['name']} : {g['players'][owner]['bases']}/3" for owner in (0, 1)
+                ))
+            else:
+                st.markdown("⏱️ **Victoire** : meilleur score en PV à la fin du temps")
+                seconds = max(0, math.ceil(g["remaining"]))
+                st.caption(f"Temps restant : {seconds // 60:02d}:{seconds % 60:02d}")
+                st.button("Actualiser le chronomètre", key="refresh_clock")
+            with st.expander("📖 Fiches des factions", expanded=False):
+                render_faction_sheet_menu("sidebar")
+            with st.expander("💾 Sauvegarde et retour à l'accueil", expanded=False):
+                st.download_button(
+                    "Sauvegarder",
+                    data=json.dumps(bundle, ensure_ascii=False, indent=2, allow_nan=False),
+                    file_name="the_four_realms.json",
+                    mime="application/json",
+                    key="download_save",
+                )
+                st.caption("La sauvegarde contient aussi les planifications privées.")
+                confirm = st.checkbox("Confirmer le retour à l'accueil", key="confirm_home")
+                if st.button("Retour à l'accueil", disabled=not confirm, key="go_home"):
+                    reset_session()
+                    st.rerun()
+            render_forfeit(bundle)
+
+        # 2. Actions du joueur
+        with st.container(border=True, key="lw_side_actions"):
+            st.markdown("### 🎮 Actions du joueur")
+            if ai_config(bundle) is not None and not online:
+                stack = ai_undo_stack()
+                if st.button(
+                    "↩️ Annuler mon dernier coup",
+                    disabled=not stack,
+                    width="stretch",
+                    key="ai_undo_button",
+                    help="Revient juste avant ta dernière action (la réponse de l'IA est annulée aussi).",
+                ):
+                    ai_undo_last_move()
+                    st.rerun()
+            # Terminer la phase : même place, en rouge, en production comme en manœuvres.
+            with st.container(key="lw_end_phase"):
+                if g["phase"] == "build":
+                    if st.button(
+                        "✅ Terminer ma phase de production",
+                        disabled=g["winner"] is not None,
+                        width="stretch",
+                        key="sidebar_finish_production",
+                    ):
+                        perform(commit_plan)
+                else:
+                    if st.button(
+                        "🏁 Terminer mes manœuvres",
+                        disabled=g["winner"] is not None or g["curtain"] or g["active"] in g["passed"],
+                        width="stretch",
+                        key="sidebar_finish_maneuvers_always",
+                    ):
+                        perform(game_action, pass_turn)
+            if g["winner"] is None:
+                if g["phase"] == "build":
+                    render_build_controls(g, view, local=True, on_board=False)
+                elif g["phase"] == "move":
+                    render_movement_validation(g)
+                    render_move_controls(g)
+
+        # 3. Pièce sélectionnée
+        with st.container(border=True, key="lw_side_unit"):
+            render_selected_card(g, view)
+
+
+# --- Journal de la partie : en haut du journal de bord (plus en bas de page).
+
+def render_log(view):
+    return None
+
+
+# --- Rappel de la phase en haut à gauche du plateau, qui reste visible quand
+#     on fait défiler la page (ne capte aucun clic).
+
+PHASE_BADGE_CSS = """
+<style>
+/* Streamlit enveloppe le conteneur dans une boîte : c'est elle, enfant
+   direct du bloc du plateau, qui reste collée en haut pendant le défilement. */
+div:has(> .st-key-lw_phase_badge) {
+    position: sticky !important;
+    top: 3.8rem;
+    z-index: 1000;
+    height: 0 !important;
+    min-height: 0 !important;
+    overflow: visible !important;
+    pointer-events: none;
+}
+.st-key-lw_phase_badge {
+    height: 0 !important;
+    min-height: 0 !important;
+    overflow: visible !important;
+    pointer-events: none;
+    gap: 0 !important;
+}
+.st-key-lw_phase_badge > div { height: 0 !important; overflow: visible !important; }
+.lw-phase-badge {
+    display: inline-block;
+    margin: 8px 0 0 10px;
+    padding: 4px 14px;
+    border-radius: 999px;
+    background: rgba(15, 23, 42, 0.62);
+    color: #ffffff;
+    font-weight: 800;
+    font-size: 14px;
+    letter-spacing: 0.2px;
+    box-shadow: 0 2px 8px rgba(0, 0, 0, 0.25);
+    pointer-events: none;
+    white-space: nowrap;
+}
+</style>
+"""
+
+
+def render_phase_badge(g):
+    if g.get("winner") is not None:
+        return
+    label = "🛠️ Phase de production" if g["phase"] == "build" else "⚔️ Phase de manœuvres"
+    with st.container(key="lw_phase_badge"):
+        st.markdown(
+            PHASE_BADGE_CSS + f'<div class="lw-phase-badge">Tour {g["turn"]} · {label}</div>',
+            unsafe_allow_html=True,
+        )
 
 
 # ============================================================
