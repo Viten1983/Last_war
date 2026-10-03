@@ -649,6 +649,7 @@ Prototype âge I : Déferlants contre Exilés.
 - Un tir subit une riposte égale aux PF de la cible (au contact, c'est un corps à corps).
 - Une unité de corps à corps (sans tir) ne riposte jamais contre un tireur, même au contact.
 - Armes de siège (Catapulte, Trébuchet, Catapulte de l'enfer, Golem de pierre) : jamais de riposte contre elles.
+- Catapulte, Trébuchet, Catapulte de l'enfer, Golem de pierre et Rampant ne peuvent pas viser les unités volantes, et leurs dégâts de zone ne les touchent pas.
 - Une unité invisible non détectée attaque sans subir de riposte.
 - Pile d'ouvriers (1 à 3 sur une case) : au corps à corps, ils se défendent ensemble avec leurs PF cumulés ; une attaque victorieuse les détruit tous d'un coup, l'attaquant perd ce total et prend la case.
 - La Catapulte et la Catapulte de l'enfer ne ripostent jamais (ni au corps à corps, ni aux tirs). Seul le Trébuchet tire automatiquement sur les unités qui traversent sa zone.
@@ -18121,6 +18122,67 @@ def ranged_riposte_text(g, attacker, target):
     if attacker.get("name") in SIEGE_WEAPONS:
         return "Arme de siège : aucune riposte."
     return _lw_siegeshot_previous_ranged_riposte_text(g, attacker, target)
+
+
+# ============================================================
+# TIRS AU SOL : PAS D'UNITÉS VOLANTES
+# Catapulte, Trébuchet, Catapulte de l'enfer, Golem de pierre et Rampant
+# ne peuvent pas viser une unité volante, et leurs dégâts de zone ne
+# touchent pas les unités volantes (tir automatique du Trébuchet compris).
+# ============================================================
+
+GROUND_ONLY_SHOOTERS = {CATAPULT, TREBUCHET, HELL_CATAPULT, STONE_GOLEM, RAMPANT}
+
+
+def flying_enemy(piece, owner):
+    return piece.get("kind") == "unit" and piece.get("owner") != owner and is_flying(piece)
+
+
+_lw_ground_previous_ranged_values = ranged_attack_values
+
+
+def ranged_attack_values(g, attacker, target):
+    if attacker.get("name") in GROUND_ONLY_SHOOTERS and flying_enemy(target, attacker["owner"]):
+        raise ValueError(f"{attacker['name']} : impossible de viser une unité volante.")
+    return _lw_ground_previous_ranged_values(g, attacker, target)
+
+
+_lw_ground_previous_ranged_attack = ranged_attack
+
+
+def ranged_attack(g, attacker_id, target_id, *args, **kwargs):
+    attacker = entity(g, attacker_id)
+    if attacker["name"] not in GROUND_ONLY_SHOOTERS:
+        return _lw_ground_previous_ranged_attack(g, attacker_id, target_id, *args, **kwargs)
+    target = entity(g, target_id)
+    if flying_enemy(target, attacker["owner"]):
+        raise ValueError(f"{attacker['name']} : impossible de viser une unité volante.")
+    # Les unités volantes ennemies sont mises de côté pendant le tir : les
+    # dégâts de zone (cases voisines, ligne du Golem) ne les atteignent pas.
+    flyers = [e for e in g["entities"] if flying_enemy(e, attacker["owner"])]
+    g["entities"] = [e for e in g["entities"] if all(e is not f for f in flyers)]
+    try:
+        return _lw_ground_previous_ranged_attack(g, attacker_id, target_id, *args, **kwargs)
+    finally:
+        g["entities"].extend(flyers)
+
+
+_lw_ground_previous_trebuchet_auto_fire = trebuchet_auto_fire
+
+
+def trebuchet_auto_fire(g, mover, route):
+    if is_flying(mover):
+        return  # le Trébuchet ne tire pas sur une unité volante
+    # Ses éclats sur les cases voisines épargnent aussi les unités volantes.
+    flyers = [
+        e for e in g["entities"]
+        if e is not mover and e.get("kind") == "unit" and e["owner"] == mover["owner"] and is_flying(e)
+    ]
+    g["entities"] = [e for e in g["entities"] if all(e is not f for f in flyers)]
+    try:
+        return _lw_ground_previous_trebuchet_auto_fire(g, mover, route)
+    finally:
+        g["entities"].extend(flyers)
 
 
 # ============================================================
