@@ -648,6 +648,7 @@ Prototype âge I : Déferlants contre Exilés.
 - Les unités, bases et bâtiments alliés peuvent être traversés (chaque case traversée compte comme un déplacement), mais pas occupés à l'arrivée.
 - Un tir subit une riposte égale aux PF de la cible (au contact, c'est un corps à corps).
 - Une unité de corps à corps (sans tir) ne riposte jamais contre un tireur, même au contact.
+- Armes de siège (Catapulte, Trébuchet, Catapulte de l'enfer, Golem de pierre) : jamais de riposte contre elles.
 - Une unité invisible non détectée attaque sans subir de riposte.
 - Pile d'ouvriers (1 à 3 sur une case) : au corps à corps, ils se défendent ensemble avec leurs PF cumulés ; une attaque victorieuse les détruit tous d'un coup, l'attaquant perd ce total et prend la case.
 - La Catapulte et la Catapulte de l'enfer ne ripostent jamais (ni au corps à corps, ni aux tirs). Seul le Trébuchet tire automatiquement sur les unités qui traversent sa zone.
@@ -18094,6 +18095,32 @@ def render_board(g, view, readonly=False):
         return _lw_cellcost_previous_render_board(g, view, readonly)
     finally:
         st.session_state.pop("_lw_cell_costs", None)
+
+
+# ============================================================
+# ARMES DE SIÈGE : JAMAIS DE RIPOSTE CONTRE ELLES
+# Catapulte, Trébuchet, Catapulte de l'enfer et Golem de pierre tirent
+# sans subir de dégâts en retour (ni des unités, ni des bases).
+# ============================================================
+
+SIEGE_WEAPONS = set(SIEGE_WEAPONS) | {STONE_GOLEM}
+
+_lw_siegeshot_previous_ranged_riposte = ranged_riposte
+
+
+def ranged_riposte(g, attacker, target):
+    if attacker.get("name") in SIEGE_WEAPONS:
+        return 0.0
+    return _lw_siegeshot_previous_ranged_riposte(g, attacker, target)
+
+
+_lw_siegeshot_previous_ranged_riposte_text = ranged_riposte_text
+
+
+def ranged_riposte_text(g, attacker, target):
+    if attacker.get("name") in SIEGE_WEAPONS:
+        return "Arme de siège : aucune riposte."
+    return _lw_siegeshot_previous_ranged_riposte_text(g, attacker, target)
 
 
 # ============================================================
