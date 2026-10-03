@@ -17621,6 +17621,66 @@ def attack(g, attacker_ids, target_id, occupier_id=None, losses=None, *args, **k
 
 
 # ============================================================
+# ATTAQUE GROUPÉE AU CORPS À CORPS : CHACUN AU CONTACT
+# Les attaquants qui ne prennent pas la case s'arrêtent chacun sur une
+# case libre voisine de la cible (atteignable avec leur mouvement), au
+# lieu de rester à leur case de départ. Les tireurs restent sur place.
+# ============================================================
+
+_lw_group_previous_attack = attack
+
+
+def attack(g, attacker_ids, target_id, occupier_id=None, losses=None, *args, **kwargs):
+    target_pos = tuple(entity(g, target_id)["pos"])
+    plans = {}
+    for eid in attacker_ids:
+        unit = next((e for e in g["entities"] if e["id"] == eid), None)
+        if unit is None or eid == occupier_id or is_shooter(unit):
+            continue
+        origin = tuple(unit["pos"])
+        if distance(origin, target_pos) <= 1:
+            continue  # déjà au contact
+        try:
+            costs, routes = paths(g, unit)
+        except AI_ERRORS:
+            continue
+        options = {
+            tuple(p): (c, [tuple(s) for s in routes.get(p, [origin, p])])
+            for p, c in costs.items()
+            if distance(tuple(p), target_pos) == 1
+        }
+        if options:
+            plans[eid] = (origin, options)
+
+    _lw_group_previous_attack(g, attacker_ids, target_id, occupier_id, losses, *args, **kwargs)
+    if not plans:
+        return
+
+    fx_routes = dict(g.get("_fx_routes") or {})
+    taken = set()
+    for eid in attacker_ids:
+        if eid not in plans:
+            continue
+        unit = next((e for e in g["entities"] if e["id"] == eid), None)
+        origin, options = plans[eid]
+        if unit is None or tuple(unit["pos"]) != origin:
+            continue  # mort au combat, ou déjà déplacé (piétinement…)
+        preferred = tuple(fx_routes.get(eid, [None, None])[-2] or ()) if fx_routes.get(eid) else None
+        free = [
+            p for p in options
+            if p not in taken and at(g, p) is None and not blocked(g, p)
+        ]
+        if not free:
+            continue
+        spot = preferred if preferred in free else min(free, key=lambda p: (options[p][0], p))
+        taken.add(spot)
+        unit["pos"] = list(spot)
+        fx_routes[eid] = [list(p) for p in options[spot][1]] + [list(target_pos)]
+        log(g, f"{unit['name']} #{eid} s'arrête au contact, en {coord(spot)}.")
+    g["_fx_routes"] = fx_routes
+
+
+# ============================================================
 # PSEUDO OBLIGATOIRE
 # Sans pseudo, impossible de lancer, charger ou rejoindre une partie.
 # ============================================================
