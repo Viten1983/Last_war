@@ -13227,12 +13227,47 @@ def online_active_room():
     return online_room(code) if code else None
 
 
+def online_headers():
+    try:
+        return {str(k).lower(): v for k, v in (st.context.headers or {}).items()}
+    except Exception:
+        return {}
+
+
+def online_is_local(address):
+    return (not address) or "localhost" in address or "127.0.0.1" in address
+
+
 def online_base_url():
+    """Adresse publique de l'application, telle que l'ami doit l'ouvrir.
+    Derrière un proxy (Streamlit Cloud), l'URL vue par le serveur est interne :
+    les en-têtes de la requête donnent alors la vraie adresse."""
     try:
         url = str(st.context.url or "")
     except Exception:
         url = ""
-    return url.split("?")[0].rstrip("/") or "http://localhost:8501"
+    headers = online_headers()
+    candidates = [url.split("?")[0]]
+
+    # Origin et Referer portent l'adresse telle que le navigateur l'a ouverte.
+    for name in ("origin", "referer"):
+        candidates.append(str(headers.get(name) or "").split("?")[0])
+
+    host = str(headers.get("x-forwarded-host") or headers.get("host") or "").split(",")[0].strip()
+    if host:
+        proto = (str(headers.get("x-forwarded-proto") or "").split(",")[0].strip()
+                 or ("http" if host.startswith(("localhost", "127.")) else "https"))
+        candidates.append(f"{proto}://{host}")
+
+    for address in candidates:
+        address = address.strip().rstrip("/")
+        if address and not online_is_local(address):
+            return address
+    for address in candidates:
+        address = address.strip().rstrip("/")
+        if address:
+            return address
+    return "http://localhost:8501"
 
 
 # ------------------------------------------------------------
@@ -13431,6 +13466,18 @@ def render_online_lobby(room, seat):
         link = f"{online_base_url()}/?room={room['code']}"
         st.success("Envoie ce lien à ton ami pour qu'il rejoigne la partie :")
         st.code(link, language=None)
+        if online_is_local(link):
+            st.warning(
+                "Cette adresse n'est valable que sur cet ordinateur. "
+                "Donne le code ci-dessous à ton ami : sur la page d'accueil du jeu, "
+                "il le saisit dans « Rejoindre une partie »."
+            )
+        else:
+            st.caption(
+                "Le lien ne s'ouvre pas chez lui ? Donne-lui plutôt ce code : "
+                "sur la page d'accueil, il le saisit dans « Rejoindre une partie »."
+            )
+        st.subheader(f"Code de la partie : {room['code']}")
     else:
         st.info(f"Tu as rejoint la partie {room['code']}.")
 
@@ -13620,6 +13667,25 @@ def render_home():
             st.query_params["room"] = room["code"]
             st.query_params["p"] = room["tokens"][0]
             st.rerun()
+
+        st.markdown("**Rejoindre une partie**")
+        st.caption("Ton ami t'a donné un code ? Saisis-le ici (le lien n'est pas indispensable).")
+        join_col, button_col = st.columns([3, 1])
+        with join_col:
+            code = st.text_input(
+                "Code de la partie", max_chars=12, key="online_join_code",
+                label_visibility="collapsed", placeholder="Code de la partie (ex. 1A2B3C)",
+            ).strip().upper()
+        with button_col:
+            join = st.button("Rejoindre", key="online_join", width="stretch")
+        if join:
+            if not code:
+                st.warning("Saisis d'abord le code de la partie.")
+            elif online_room(code) is None:
+                st.error("Partie introuvable : vérifie le code, ou demande à ton ami d'en recréer une.")
+            else:
+                st.query_params["room"] = code
+                st.rerun()
     _lw_online_previous_render_home()
 
 
@@ -18172,14 +18238,27 @@ def ranged_attack(g, attacker_id, target_id, *args, **kwargs):
     target = entity(g, target_id)
     if flying_enemy(target, attacker["owner"]):
         raise ValueError(f"{attacker['name']} : impossible de viser une unité volante.")
-    # Les unités volantes ennemies sont mises de côté pendant le tir : les
-    # dégâts de zone (cases voisines, ligne du Golem) ne les atteignent pas.
-    flyers = [e for e in g["entities"] if flying_enemy(e, attacker["owner"])]
-    g["entities"] = [e for e in g["entities"] if all(e is not f for f in flyers)]
+    # Les unités volantes ennemies sont à l'abri de ce tir (cible, dégâts de
+    # zone, ligne du Golem). Elles restent sur le plateau : les retirer leur
+    # ferait perdre ce qu'elles apportent pendant le tir, par exemple la
+    # détection d'un Rampant planté par un Dirigeable.
+    g["_lw_shielded_flyers"] = {
+        e["id"] for e in g["entities"] if flying_enemy(e, attacker["owner"])
+    }
     try:
         return _lw_ground_previous_ranged_attack(g, attacker_id, target_id, *args, **kwargs)
     finally:
-        g["entities"].extend(flyers)
+        g.pop("_lw_shielded_flyers", None)
+
+
+_lw_shield_previous_apply_damage = apply_damage
+
+
+def apply_damage(g, victim, damage, source, report, role):
+    # Tir d'une unité au sol : les unités volantes ne reçoivent rien.
+    if victim.get("id") in (g.get("_lw_shielded_flyers") or ()):
+        return
+    return _lw_shield_previous_apply_damage(g, victim, damage, source, report, role)
 
 
 _lw_ground_previous_trebuchet_auto_fire = trebuchet_auto_fire
