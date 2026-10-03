@@ -17418,18 +17418,20 @@ def fx_phase_index(round_number, phase):
 
 
 def fx_deaths(g):
-    """Cases où une pièce est morte, montrées pendant un tour complet :
-    une mort en manœuvres du tour N reste jusqu'à la fin des manœuvres
-    du tour N+1, puis s'efface."""
+    """Case(s) où une pièce est morte lors du DERNIER combat seulement
+    (une seule case rouge avec sa croix), effacée au tour suivant."""
     now = fx_phase_index(g["turn"], g["phase"])
-    deaths = []
-    for e in g.get("journal") or []:
+    for e in reversed(g.get("journal") or []):
         if now - fx_phase_index(e.get("round", 0), e.get("phase")) > 2:
-            continue
-        for hit in e.get("hits") or []:
-            if hit.get("destroyed"):
-                deaths.append({"pos": hit["pos"], "seq": e["seq"]})
-    return deaths
+            break
+        # La cible abattue d'abord ; l'attaquant tué en riposte sinon.
+        dead = sorted(
+            (hit for hit in e.get("hits") or [] if hit.get("destroyed")),
+            key=lambda hit: bool(hit.get("attacker")),
+        )
+        if dead:
+            return [{"pos": dead[0]["pos"], "seq": e["seq"]}]
+    return []
 
 
 def fx_color_pf(text, css):
