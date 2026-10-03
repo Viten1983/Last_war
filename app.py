@@ -15629,7 +15629,18 @@ def ai_marker_value(g, me, hero, cell, need_mana):
     _, _, _, gold, mana = hero_stats(g, hero)
     if kind == "gold":
         return float(gold * mult)
-    return float(mana * mult * (300 if need_mana else 130))
+    return float(mana * mult * ai_mana_rate(g, me, need_mana))
+
+
+def ai_mana_rate(g, me, need_mana):
+    """Valeur d'un mana en or pour la récolte des héros. L'or qui dort ne sert
+    à rien : les unités des âges II et III demandent du mana. Plus l'or
+    s'accumule sans mana, plus le mana vaut cher."""
+    rate = 300.0 if need_mana else 130.0
+    gold, mana = ai_gold(g, me), ai_mana(g, me)
+    if gold >= 800 and mana < 10:
+        rate = max(rate, 400.0 + 0.25 * gold)
+    return rate
 
 
 def ai_hero_danger(g, me, pos):
