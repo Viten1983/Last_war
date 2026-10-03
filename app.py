@@ -5907,13 +5907,10 @@ def main():
   
     with st.container(key="lw_page_phase"):  
         if finished:  
-            if g["winner"] == -1:  
-                st.info("La partie se termine sur une égalité.")  
-            else:  
-                st.success(  
-                    f"Victoire des "  
-                    f"{faction_of(g, g['winner'])['name']} !"  
-                )  
+            if g["winner"] == -1:
+                st.info("La partie se termine sur une égalité.")
+            # Victoire : annoncée une seule fois, par la banderole sur le
+            # plateau puis l'image de victoire de la faction (pas de doublon).
         else:  
             st.subheader(  
                 f"Tour {turn_label(g)} — {phase_label(g)}"  
