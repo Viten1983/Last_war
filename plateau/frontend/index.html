@@ -1154,7 +1154,7 @@
     }
 
     const PF_DEALT = "#dc2626";     // PF infligés par l'attaquant : rouge
-    const PF_TAKEN = "#ea580c";     // PF infligés en riposte par le défenseur : orange
+    const PF_TAKEN = "#facc15";     // PF infligés en riposte par le défenseur : jaune
     const PF_HEAL = "#16a34a";      // PF regagnés (sorts de soutien)
     function pfNumber(value) { return String(Math.round(value * 10) / 10).replace(".", ","); }
     function hitLabel(hit, ev) {
@@ -1172,11 +1172,41 @@
       layer.appendChild(text);
     }
 
+    // Texte flottant en plusieurs couleurs (contour sombre : le jaune reste lisible).
+    function floatSegments(c, segments, delay = 0) {
+      setTimeout(() => {
+        const node = svgNode("text", { x: c.x, y: c.y - 10, "text-anchor": "middle", "font-size": 22, "font-weight": 900, stroke: "#1c1917", "stroke-width": 4, "paint-order": "stroke" });
+        segments.forEach(seg => node.appendChild(svgNode("tspan", { fill: seg.color }, seg.text)));
+        fxLayer.appendChild(node);
+        tween(1600, t => {
+          node.setAttribute("y", String(c.y - 10 - 34 * easeOut(t)));
+          node.setAttribute("opacity", String(t < 0.75 ? 1 : 1 - (t - 0.75) / 0.25));
+        }, () => node.remove());
+      }, delay);
+    }
+
     function hitTexts(ev) {
+      // Corps à corps : une seule ligne sur la case attaquée,
+      // PF infligés par l'attaquant (rouge) | PF infligés par le défenseur (jaune).
+      const dealt = (ev.hits || []).filter(h => h.damage && h.owner !== ev.owner).reduce((a, h) => a + h.damage, 0);
+      const taken = (ev.hits || []).filter(h => h.damage && h.owner === ev.owner).reduce((a, h) => a + h.damage, 0);
+      const combined = ev.kind === "melee" && dealt > 0 && taken > 0;
+      if (combined) {
+        const target = (ev.shots && ev.shots[0] && ev.shots[0].to) || ev.hits.find(h => h.owner !== ev.owner).pos;
+        floatSegments(pt(target), [
+          { text: `−${pfNumber(dealt)} PF`, color: PF_DEALT },
+          { text: "  |  ", color: "#111827" },
+          { text: `−${pfNumber(taken)} PF`, color: PF_TAKEN },
+        ]);
+      }
       (ev.hits || []).forEach((hit, i) => {
         const c = pt(hit.pos);
         if (hit.damage) {
-          floatText(c, hitLabel(hit, ev).text, hitLabel(hit, ev).color, i * 120);
+          if (!combined) {
+            const label = hitLabel(hit, ev);
+            if (label.color === PF_TAKEN) floatSegments(c, [label], i * 120);
+            else floatText(c, label.text, label.color, i * 120);
+          }
           shakeAt(hit.pos);
           if (hit.destroyed) flashHex(c, "#dc2626");
         } else if (hit.heal) {
