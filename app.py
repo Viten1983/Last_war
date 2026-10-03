@@ -656,7 +656,6 @@ Prototype âge I : Déferlants contre Exilés.
 - Les ennemis et les constructions bloquent le déplacement.
 - Entrer sur une montagne coûte 2 mouvements.
 - Tir depuis une montagne : portée +1.
-- Tir depuis une forêt : attaque -1.
 - Pas d'obstruction de ligne de vue.
 - Soutien réservé au corps à corps ; les tirs se font sans déplacement.
 - Un groupe constitué uniquement d'unités à 0,5 PF ne peut pas attaquer.
@@ -2130,8 +2129,6 @@ def ranged_attack_values(g, attacker, target):
             )  
   
         damage = float(attacker["pf"])  
-        if terrain(g, attacker["pos"]) == "forest":  
-            damage = max(0.0, damage - 1.0)  
   
         if damage <= 0:  
             raise ValueError("Ce tir n'inflige aucun dégât.")  
@@ -2172,8 +2169,6 @@ def ranged_attack_values(g, attacker, target):
   
     impacts = golem_impact_cells(attacker, target)  
     damage = float(attacker["pf"])  
-    if terrain(g, attacker["pos"]) == "forest":  
-        damage = max(0.0, damage - 1.0)  
   
     if damage <= 0:  
         raise ValueError("Ce tir n'inflige aucun dégât.")  
@@ -6197,11 +6192,9 @@ def ranged_attack_values(g, attacker, target):
     impacts = golem_impact_cells(attacker, target)  
   
     # Conservation du calcul de dégâts actuel :  
-    # PF restants, et malus de forêt éventuel.  
+    # PF restants (les forêts sont décoratives : aucun malus).  
     damage = float(attacker["pf"])  
   
-    if terrain(g, attacker["pos"]) == "forest":  
-        damage = max(0.0, damage - 1.0)  
   
     if damage <= 0:  
         raise ValueError("Ce tir n'inflige aucun dégât.")  
